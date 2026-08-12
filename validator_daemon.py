@@ -127,7 +127,7 @@ def _read_boltz_affinity(out_dir: Path, mol_id: int, target_id: str) -> dict | N
 
 
 def run_boltz2(smiles: str, target: dict) -> float | None:
-    """Re-score a SMILES via Boltz2 (direct Python API). Returns affinity in kcal/mol or None."""
+    """Re-score a SMILES via Boltz2. Returns affinity in kcal/mol or None."""
     import shutil
     from boltz.main import predict
 
@@ -150,20 +150,23 @@ def run_boltz2(smiles: str, target: dict) -> float | None:
 
     try:
         _write_boltz_input(in_dir, target_id, sequence, smiles, mol_id, msa_path)
-        predict(
-            data=str(in_dir),
-            out_dir=str(out_dir),
-            recycling_steps=_RECYCLING_STEPS,
-            sampling_steps=_SAMPLING_STEPS,
-            diffusion_samples=_DIFFUSION_SAMPLES,
-            sampling_steps_affinity=_SAMPLING_STEPS_AFF,
-            diffusion_samples_affinity=_DIFFUSION_SAMPLES_AFF,
-            output_format="mmcif",
-            seed=68,
-            affinity_mw_correction=True,
-            override=True,
-            num_workers=0,
-        )
+        # predict is a Click command in boltz 2.2.1 — must use .main() not direct call.
+        # Direct call hits Click's Context.__init__(data=...) which fails.
+        predict.main([
+            str(in_dir),
+            "--out_dir",                     str(out_dir),
+            "--recycling_steps",             str(_RECYCLING_STEPS),
+            "--sampling_steps",              str(_SAMPLING_STEPS),
+            "--diffusion_samples",           str(_DIFFUSION_SAMPLES),
+            "--sampling_steps_affinity",     str(_SAMPLING_STEPS_AFF),
+            "--diffusion_samples_affinity",  str(_DIFFUSION_SAMPLES_AFF),
+            "--output_format",               "mmcif",
+            "--seed",                        "68",
+            "--num_workers",                 "0",
+            "--accelerator",                 "gpu",
+            "--affinity_mw_correction",
+            "--override",
+        ], standalone_mode=False)
         metrics = _read_boltz_affinity(out_dir, mol_id, target_id)
         if metrics is None:
             return None
