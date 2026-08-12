@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 def _env(key, default=""):
     return os.environ.get(key, default)
 
-PROGRAM_ID       = _env("PROGRAM_ID",       "3AZnjfvbLCpb1QkvaTYRTY2YafXT3vM32bmBBM3H8FdL")
+PROGRAM_ID       = _env("PROGRAM_ID",       "DzcQHhTPuiqxCxZurDbEAaV1U2JBFXWy6JG1LE6WsKvJ")
 SOLANA_RPC       = _env("SOLANA_RPC",       "https://api.devnet.solana.com")
 VALIDATOR_KEYPAIR = _env("VALIDATOR_KEYPAIR", str(Path.home() / ".life-compute/wallet.json"))
 PAYER_KEYPAIR    = _env("PAYER_KEYPAIR",    str(Path.home() / ".life-compute/wallet.json"))
@@ -141,19 +141,28 @@ def _rpc(method: str, params: list) -> dict:
 
 def fetch_pending_submissions() -> list[dict]:
     """
-    getProgramAccounts filtered to ResultSubmission discriminator.
+    getProgramAccounts filtered to ResultSubmission accounts.
     Returns list of dicts with keys: pubkey, miner, target_id, epoch,
     smiles, claimed_affinity, status.
+
+    Three RPC-side filters (all must pass):
+      1. dataSize=775        — exact account size for ResultSubmission
+      2. memcmp offset=0     — 8-byte Anchor discriminator (base58)
+      3. memcmp offset=575   — is_validated=0x00 (Pending/Validating only)
+         Layout: 8+32+1+8+512+2+4+8 = 575 bytes before the status byte
     """
-    import base64
-    disc_b64 = base64.b64encode(RESULT_DISCRIMINATOR).decode()
+    import base64, base58
+    disc_b58      = base58.b58encode(RESULT_DISCRIMINATOR).decode()
+    unvalidated_b58 = base58.b58encode(bytes([0x00])).decode()   # is_validated=0x00
     try:
         resp = _rpc("getProgramAccounts", [
             PROGRAM_ID,
             {
                 "encoding": "base64",
                 "filters": [
-                    {"memcmp": {"offset": 0, "bytes": base64.b64encode(RESULT_DISCRIMINATOR).decode()}},
+                    {"dataSize": 775},
+                    {"memcmp": {"offset": 0,   "bytes": disc_b58}},
+                    {"memcmp": {"offset": 575, "bytes": unvalidated_b58}},
                 ],
             },
         ])
@@ -184,7 +193,6 @@ def fetch_pending_submissions() -> list[dict]:
             smiles = smiles_raw[:smiles_len].decode("utf-8", errors="replace").strip("\x00")
             if not smiles:
                 continue
-            import base58
             results.append({
                 "pubkey":           pubkey,
                 "miner":            base58.b58encode(miner).decode(),
