@@ -166,6 +166,7 @@ def run_boltz2(smiles: str, target: dict) -> float | None:
             "--accelerator",                 "gpu",
             "--affinity_mw_correction",
             "--override",
+            "--no_kernels",      # disable cuequivariance CUDA kernels (incompatible with CUDA 13 / driver 580)
         ], standalone_mode=False)
         metrics = _read_boltz_affinity(out_dir, mol_id, target_id)
         if metrics is None:
