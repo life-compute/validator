@@ -8,7 +8,7 @@ Three-step loop every POLL_SECONDS:
   3. Call validate_result on-chain — confirm if |rescored - claimed| / |claimed| ≤ 5%
 
 On-chain call uses the same Node.js / Anchor stack as the miner.
-Boltz2 scoring mirrors miner_daemon.py exactly (nova venv subprocess).
+Boltz2 scoring runs directly via the boltz Python API (pip boltz==2.2.1),
 Results logged to output/validator_log.jsonl and stats.json for the dashboard.
 """
 import json, time, logging, os, subprocess, sys, urllib.request, tempfile
@@ -31,10 +31,16 @@ STATS_PATH = WORK_DIR / "stats.json"
 LOG_JSONL  = WORK_DIR / "output" / "validator_log.jsonl"
 (WORK_DIR / "output").mkdir(exist_ok=True)
 
-# ── Boltz2 / nova paths (same as miner) ───────────────────────────────────────
-NOVA_DIR  = Path(_env("NOVA_DIR", "/mnt/minos-drive/nova_subnet"))
-NOVA_VENV = NOVA_DIR / ".venv" / "bin" / "python"
-MSA_DIR   = Path(_env("MSA_DIR", str(WORK_DIR / "data" / "msa_files")))
+# ── Boltz2 / MSA paths ────────────────────────────────────────────────────────
+MSA_DIR    = Path(_env("MSA_DIR", str(WORK_DIR / "data" / "msa_files")))
+_BOLTZ_TMP = Path(tempfile.gettempdir()) / "life-validator-boltz"
+
+# Fast inference settings (match miner)
+_RECYCLING_STEPS       = 1
+_SAMPLING_STEPS        = 25
+_DIFFUSION_SAMPLES     = 1
+_SAMPLING_STEPS_AFF    = 25
+_DIFFUSION_SAMPLES_AFF = 1
 
 # ── Anchor / JS paths ─────────────────────────────────────────────────────────
 ANCHOR_DIR  = Path(_env("ANCHOR_DIR", "/tmp/life-compute/core"))
@@ -56,27 +62,24 @@ logging.basicConfig(
 log = logging.getLogger("life-validator")
 
 
-# ── Boltz2 scoring (mirrors miner_daemon.py exactly) ─────────────────────────
-_BOLTZ_HELPER = """\
-import sys, json
-sys.path.insert(0, "{nova_dir}")
+# ── Boltz2 scoring — self-contained, no nova/miner dependencies ───────────────
 
-from nova_adaptive.nova_pulse_scorer import score_batch
-from pathlib import Path
+def _mol_id(smiles: str) -> int:
+    import hashlib
+    h = hashlib.sha256(smiles.encode()).digest()
+    return (int.from_bytes(h[:8], "little") ^ 68) % (2**31 - 1)
 
-args      = json.loads(sys.argv[1])
-smiles    = args["smiles"]
-target_id = args["target_id"]
-msa_path  = args["msa_path"]
-sequence  = args["sequence"]
 
-scores = score_batch([smiles], target_id, sequence, msa_path)
-print(json.dumps({{"boltz_score": scores.get(smiles), "smiles": smiles, "target_id": target_id}}))
-"""
+def _heavy_atom_count(smiles: str) -> int:
+    from rdkit import Chem
+    mol = Chem.MolFromSmiles(smiles)
+    return mol.GetNumHeavyAtoms() if mol else 0
+
 
 def _msa_path_for(uniprot_id: str) -> str:
     path = MSA_DIR / f"{uniprot_id}.a3m"
     return str(path) if path.exists() else "empty"
+
 
 def _sequence_from_msa(msa_path: str) -> str | None:
     if msa_path == "empty":
@@ -85,46 +88,96 @@ def _sequence_from_msa(msa_path: str) -> str | None:
         with open(msa_path) as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith("#") and not line.startswith(">"):
+                if line and not line.startswith(("#", ">")):
                     return line
     except OSError:
         pass
     return None
 
-def run_boltz2(smiles: str, target: dict) -> float | None:
-    """Re-score a SMILES via Boltz2. Returns affinity in kcal/mol or None."""
-    uniprot  = target["uniprot_id"]
-    msa_path = _msa_path_for(uniprot)
-    sequence = _sequence_from_msa(msa_path) or target["protein_sequence"]
 
-    helper_src = _BOLTZ_HELPER.format(nova_dir=str(NOVA_DIR))
-    args_json  = json.dumps({
-        "smiles": smiles, "target_id": target["id"],
-        "msa_path": msa_path, "sequence": sequence,
-    })
-    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False,
-                                     prefix="hermes-boltz-val-") as f:
-        f.write(helper_src); helper_path = f.name
-    try:
-        r = subprocess.run(
-            [str(NOVA_VENV), helper_path, args_json],
-            capture_output=True, text=True, timeout=300, cwd=str(NOVA_DIR),
-        )
-    finally:
-        os.unlink(helper_path)
+def _write_boltz_input(in_dir: Path, target_id: str, sequence: str,
+                        smiles: str, mol_id: int, msa_path: str) -> None:
+    import yaml
+    data = {
+        "version": 1,
+        "sequences": [
+            {"protein": {"id": "A", "sequence": sequence, "msa": msa_path}},
+            {"ligand":  {"id": "B", "smiles": smiles}},
+        ],
+        "properties": [{"affinity": {"binder": "B"}}],
+    }
+    (in_dir / f"{mol_id}_{target_id}.yaml").write_text(
+        yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+    )
 
-    if r.returncode != 0:
-        log.warning(f"  Boltz2 err: {r.stderr[-300:]}")
+
+def _read_boltz_affinity(out_dir: Path, mol_id: int, target_id: str) -> dict | None:
+    pred_dir = out_dir / "boltz_results_inputs" / "predictions" / f"{mol_id}_{target_id}"
+    if not pred_dir.exists():
+        log.warning(f"  Boltz output dir missing: {pred_dir}")
         return None
-    for line in reversed(r.stdout.strip().splitlines()):
-        try:
-            d = json.loads(line)
-            bs = d.get("boltz_score")
-            if bs is not None:
-                return round(-float(bs) * 30.0, 3)  # same conversion as miner
-        except Exception:
-            continue
-    return None
+    combined = {}
+    for fp in pred_dir.iterdir():
+        if fp.name.startswith(("affinity", "confidence")):
+            try:
+                combined.update(json.loads(fp.read_text()))
+            except Exception as e:
+                log.warning(f"  Could not parse {fp.name}: {e}")
+    return combined or None
+
+
+def run_boltz2(smiles: str, target: dict) -> float | None:
+    """Re-score a SMILES via Boltz2 (direct Python API). Returns affinity in kcal/mol or None."""
+    import shutil
+    from boltz.main import predict
+
+    uniprot   = target["uniprot_id"]
+    target_id = target["id"]
+    msa_path  = _msa_path_for(uniprot)
+    sequence  = _sequence_from_msa(msa_path) or target["protein_sequence"]
+
+    ha = _heavy_atom_count(smiles)
+    if ha == 0:
+        log.warning(f"  Invalid SMILES (0 heavy atoms): {smiles[:60]}")
+        return None
+
+    mol_id  = _mol_id(smiles)
+    batch   = f"batch_{int(time.time()*1000)}"
+    in_dir  = _BOLTZ_TMP / batch / "inputs"
+    out_dir = _BOLTZ_TMP / batch / "outputs"
+    in_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _write_boltz_input(in_dir, target_id, sequence, smiles, mol_id, msa_path)
+        predict(
+            data=str(in_dir),
+            out_dir=str(out_dir),
+            recycling_steps=_RECYCLING_STEPS,
+            sampling_steps=_SAMPLING_STEPS,
+            diffusion_samples=_DIFFUSION_SAMPLES,
+            sampling_steps_affinity=_SAMPLING_STEPS_AFF,
+            diffusion_samples_affinity=_DIFFUSION_SAMPLES_AFF,
+            output_format="mmcif",
+            seed=68,
+            affinity_mw_correction=True,
+            override=True,
+            num_workers=0,
+        )
+        metrics = _read_boltz_affinity(out_dir, mol_id, target_id)
+        if metrics is None:
+            return None
+        prob = metrics.get("affinity_probability_binary")
+        pred = metrics.get("affinity_pred_value")
+        if prob is None or pred is None:
+            log.warning(f"  Boltz affinity fields missing: {list(metrics.keys())}")
+            return None
+        return round(-((prob - pred) / ha) * 30.0, 3)   # same conversion as miner
+    except Exception as e:
+        log.warning(f"  Boltz2 predict() raised: {e}")
+        return None
+    finally:
+        shutil.rmtree(str(_BOLTZ_TMP / batch), ignore_errors=True)
 
 
 # ── Solana RPC helpers ────────────────────────────────────────────────────────

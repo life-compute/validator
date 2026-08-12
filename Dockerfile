@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir \
-    boltz==0.4.2 \
+    boltz==2.2.1 \
+    rdkit-pypi \
+    pyyaml \
     anchorpy==0.20.1 \
     solders==0.21.0 \
     solana==0.34.0 \
