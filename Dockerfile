@@ -13,7 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip3 install --no-cache-dir \
     boltz==2.2.1 \
-    cuequivariance-torch \
+    cuequivariance==0.11.1 \
+    cuequivariance-torch==0.11.1 \
+    cuequivariance-ops-cu12==0.11.1 \
+    cuequivariance-ops-torch-cu12==0.11.1 \
     rdkit-pypi \
     pyyaml \
     anchorpy==0.20.1 \
