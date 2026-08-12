@@ -25,6 +25,7 @@ async function main() {
     { commitment: "confirmed", preflightCommitment: "confirmed" }
   );
   const idl     = JSON.parse(fs.readFileSync(args.idlPath, "utf8"));
+  idl.address   = args.programId;  // always override — prevents stale IDL address after redeployment
   const program  = new anchor.Program(idl, provider);
   const programId = new web3.PublicKey(args.programId);
 
