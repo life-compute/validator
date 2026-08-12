@@ -13,19 +13,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip3 install --no-cache-dir \
     boltz==2.2.1 \
+    cuequivariance-torch \
     rdkit-pypi \
     pyyaml \
     anchorpy==0.20.1 \
     solders==0.21.0 \
     solana==0.34.0 \
     base58==2.1.1 \
-    requests==2.32.0
+    "requests>=2.32.3"
 
 WORKDIR /app
 COPY validator_daemon.py life_validate.js ./
 COPY stats.json.template stats.json
 
-RUN useradd -m validator
+RUN useradd -m validator \
+    && chmod -R 777 /app
+
 USER validator
 
 CMD ["python3", "validator_daemon.py"]
