@@ -5,13 +5,25 @@ LIFE Compute — Validator Daemon (devnet)
 Three-step loop every POLL_SECONDS:
   1. getProgramAccounts → find all ResultSubmission PDAs with status Pending/Validating
   2. For each: re-run Boltz2 on the claimed SMILES against the same target
-  3. Call validate_result on-chain — confirm if |rescored - claimed| / |claimed| ≤ 5%
+  3. Call validate_result on-chain — confirm if |rescored - claimed| / |claimed| ≤ 25%
 
 On-chain call uses the same Node.js / Anchor stack as the miner.
-Boltz2 scoring runs directly via the boltz Python API (pip boltz==2.2.1),
-Results logged to output/validator_log.jsonl and stats.json for the dashboard.
+Boltz2 scoring runs directly via the boltz Python API (pip boltz==2.2.1).
+Results logged to output/validator_log.jsonl and output/validator_audit.jsonl.
+Stats written to stats.json for the dashboard.
+
+Security hardening (2026-08-13):
+  - Pipeline injection prevention: UUID tmpdir per validation (chmod 700),
+    SHA256 SMILES hash verified after write, affinity file mtime verified
+    post-Boltz2 start.
+  - Rate limiting: max 100 validations/hr per instance (rolling window).
+  - Self-validation prevention: miner pubkey ≠ validator pubkey.
+  - Input sanitization: SMILES length < 500 chars, valid chemical chars only.
+  - Audit log: every validation decision → output/validator_audit.jsonl.
 """
-import json, time, logging, os, subprocess, sys, urllib.request, tempfile
+import json, time, logging, os, re, shutil, stat, subprocess, sys
+import urllib.request, hashlib, uuid
+from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -19,21 +31,21 @@ from datetime import datetime, timezone
 def _env(key, default=""):
     return os.environ.get(key, default)
 
-PROGRAM_ID       = _env("PROGRAM_ID",       "74RHjg1zYgN9zuVykde4SK2ERiRgNkouATW9MmQDLRWf")
-SOLANA_RPC       = _env("SOLANA_RPC",       "https://api.devnet.solana.com")
+PROGRAM_ID        = _env("PROGRAM_ID",        "74RHjg1zYgN9zuVykde4SK2ERiRgNkouATW9MmQDLRWf")
+SOLANA_RPC        = _env("SOLANA_RPC",        "https://api.devnet.solana.com")
 VALIDATOR_KEYPAIR = _env("VALIDATOR_KEYPAIR", str(Path.home() / ".life-compute/wallet.json"))
-PAYER_KEYPAIR    = _env("PAYER_KEYPAIR",    str(Path.home() / ".life-compute/wallet.json"))
-TARGETS_URL      = _env("TARGETS_URL",      "https://raw.githubusercontent.com/life-compute/targets/master/targets.json")
-POLL_SECONDS     = int(_env("POLL_SECONDS", "30"))
+PAYER_KEYPAIR     = _env("PAYER_KEYPAIR",     str(Path.home() / ".life-compute/wallet.json"))
+TARGETS_URL       = _env("TARGETS_URL",       "https://raw.githubusercontent.com/life-compute/targets/master/targets.json")
+POLL_SECONDS      = int(_env("POLL_SECONDS", "30"))
 
-WORK_DIR   = Path(__file__).parent
-STATS_PATH = WORK_DIR / "stats.json"
-LOG_JSONL  = WORK_DIR / "output" / "validator_log.jsonl"
+WORK_DIR    = Path(__file__).parent
+STATS_PATH  = WORK_DIR / "stats.json"
+LOG_JSONL   = WORK_DIR / "output" / "validator_log.jsonl"
+AUDIT_JSONL = WORK_DIR / "output" / "validator_audit.jsonl"
 (WORK_DIR / "output").mkdir(exist_ok=True)
 
 # ── Boltz2 / MSA paths ────────────────────────────────────────────────────────
-MSA_DIR    = Path(_env("MSA_DIR", str(WORK_DIR / "data" / "msa_files")))
-_BOLTZ_TMP = Path(tempfile.gettempdir()) / "life-validator-boltz"
+MSA_DIR = Path(_env("MSA_DIR", str(WORK_DIR / "data" / "msa_files")))
 
 # Fast inference settings (match miner)
 _RECYCLING_STEPS       = 1
@@ -41,6 +53,9 @@ _SAMPLING_STEPS        = 25
 _DIFFUSION_SAMPLES     = 1
 _SAMPLING_STEPS_AFF    = 25
 _DIFFUSION_SAMPLES_AFF = 1
+
+BOLTZ_SEED = 68  # must match miner BOLTZ_SEED; used for reproducible Boltz2 rescoring
+VALIDATION_TOLERANCE = 0.25  # DEVNET TESTING TOLERANCE — tighten for mainnet
 
 # ── Anchor / JS paths ─────────────────────────────────────────────────────────
 ANCHOR_DIR  = Path(_env("ANCHOR_DIR", "/tmp/life-compute/core"))
@@ -52,8 +67,18 @@ RESULT_DISCRIMINATOR = bytes([214, 115, 165, 103, 67, 211, 47, 88])
 STATUS_PENDING    = 0   # Pending
 STATUS_VALIDATING = 1   # Validating
 
-BOLTZ_SEED = 68  # must match miner BOLTZ_SEED; used for reproducible Boltz2 rescoring
-VALIDATION_TOLERANCE = 0.25  # DEVNET TESTING TOLERANCE — tighten for mainnet
+# ── Security: input validation limits ─────────────────────────────────────────
+_SMILES_MAX_LEN = 500
+# Valid SMILES characters: element symbols, ring digits, branch/bond/stereo notation
+_SMILES_VALID_RE = re.compile(r'^[A-Za-z0-9\[\]()\-=#:.+/\\@%*\s]+$')
+
+# ── Security: rate limiting ────────────────────────────────────────────────────
+_RATE_LIMIT_MAX   = 100          # max validations per hour per instance
+_RATE_LIMIT_WINDOW = 3600.0      # 1 hour in seconds
+_validation_timestamps: deque = deque()  # stores float epoch of each validation start
+
+# ── Security: validator public key (derived at startup, never from disk again) ─
+_VALIDATOR_PUBKEY: str = ""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,10 +88,97 @@ logging.basicConfig(
 log = logging.getLogger("life-validator")
 
 
+def _load_validator_pubkey() -> str:
+    """Load validator keypair and extract the base58 public key (bytes 32-63)."""
+    import base58
+    try:
+        with open(VALIDATOR_KEYPAIR) as f:
+            kp_bytes = bytes(json.load(f))
+        if len(kp_bytes) < 64:
+            log.warning("Validator keypair too short; self-validation check disabled")
+            return ""
+        return base58.b58encode(kp_bytes[32:64]).decode()
+    except Exception as e:
+        log.warning(f"Could not load validator pubkey: {e}; self-validation check disabled")
+        return ""
+
+
+# ── Security: input sanitization ─────────────────────────────────────────────
+
+def _sanitize_smiles(smiles: str, pubkey: str) -> bool:
+    """
+    Return True if SMILES passes all input validation gates.
+    Logs SECURITY WARNING and returns False on failure.
+    """
+    if len(smiles) >= _SMILES_MAX_LEN:
+        log.warning(
+            f"SECURITY WARNING  pubkey={pubkey[:16]}…  "
+            f"SMILES length {len(smiles)} ≥ {_SMILES_MAX_LEN} — rejected"
+        )
+        return False
+    if not _SMILES_VALID_RE.match(smiles):
+        bad = [c for c in smiles if not re.match(r'[A-Za-z0-9\[\]()\-=#:.+/\\@%*\s]', c)]
+        log.warning(
+            f"SECURITY WARNING  pubkey={pubkey[:16]}…  "
+            f"SMILES contains invalid chars {bad[:5]} — rejected"
+        )
+        return False
+    return True
+
+
+# ── Security: rate limiting ───────────────────────────────────────────────────
+
+def _rate_limit_check() -> bool:
+    """
+    Return True if this validation is permitted under the rolling hourly limit.
+    Prunes expired timestamps on each call.
+    """
+    now = time.time()
+    cutoff = now - _RATE_LIMIT_WINDOW
+    while _validation_timestamps and _validation_timestamps[0] < cutoff:
+        _validation_timestamps.popleft()
+    if len(_validation_timestamps) >= _RATE_LIMIT_MAX:
+        oldest = _validation_timestamps[0]
+        secs_until_free = int(_RATE_LIMIT_WINDOW - (now - oldest)) + 1
+        log.warning(
+            f"Rate limit reached ({_RATE_LIMIT_MAX}/hr) — "
+            f"next slot available in ~{secs_until_free}s"
+        )
+        return False
+    _validation_timestamps.append(now)
+    return True
+
+
+# ── Security: self-validation prevention ─────────────────────────────────────
+
+def _check_self_validation(miner_pubkey: str, submission_pubkey: str) -> bool:
+    """
+    Return True if this validation is permitted (miner ≠ validator).
+    Returns False and logs SECURITY WARNING if the miner is also the validator.
+    """
+    if not _VALIDATOR_PUBKEY:
+        return True   # check disabled (keypair unreadable at startup)
+    if miner_pubkey == _VALIDATOR_PUBKEY:
+        log.warning(
+            f"SECURITY WARNING  submission={submission_pubkey[:16]}…  "
+            f"miner pubkey matches validator pubkey ({miner_pubkey[:16]}…) — rejected"
+        )
+        return False
+    return True
+
+
+# ── Audit log ─────────────────────────────────────────────────────────────────
+
+def append_audit(row: dict) -> None:
+    """Append one validation decision record to the immutable audit log."""
+    row.setdefault("ts", datetime.now(timezone.utc).isoformat())
+    with AUDIT_JSONL.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
 # ── Boltz2 scoring — self-contained, no nova/miner dependencies ───────────────
 
 def _mol_id(smiles: str) -> int:
-    import hashlib
     h = hashlib.sha256(smiles.encode()).digest()
     return (int.from_bytes(h[:8], "little") ^ 68) % (2**31 - 1)
 
@@ -112,25 +224,56 @@ def _write_boltz_input(in_dir: Path, target_id: str, sequence: str,
     )
 
 
-def _read_boltz_affinity(out_dir: Path, mol_id: int, target_id: str) -> dict | None:
+def _read_boltz_affinity(out_dir: Path, mol_id: int, target_id: str,
+                          boltz_start: float) -> dict | None:
+    """
+    Read and return Boltz2 affinity output. Also verifies that every affinity
+    file has a modification time strictly after `boltz_start` (pipeline
+    injection guard).
+    """
     pred_dir = out_dir / "boltz_results_inputs" / "predictions" / f"{mol_id}_{target_id}"
     if not pred_dir.exists():
         log.warning(f"  Boltz output dir missing: {pred_dir}")
         return None
     combined = {}
+    affinity_files_found = False
     for fp in pred_dir.iterdir():
         if fp.name.startswith(("affinity", "confidence")):
+            affinity_files_found = True
+            # ── Mtime integrity check ──────────────────────────────────────
+            file_mtime = fp.stat().st_mtime
+            if file_mtime <= boltz_start:
+                log.warning(
+                    f"SECURITY WARNING  affinity file {fp.name} mtime "
+                    f"{file_mtime:.3f} ≤ boltz_start {boltz_start:.3f} — "
+                    f"file predates current Boltz2 run, rejecting"
+                )
+                return None
+            # ── Parse ──────────────────────────────────────────────────────
             try:
                 combined.update(json.loads(fp.read_text()))
             except Exception as e:
                 log.warning(f"  Could not parse {fp.name}: {e}")
+    if not affinity_files_found:
+        log.warning(f"  No affinity/confidence files found in {pred_dir}")
+        return None
     return combined or None
 
 
 def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | None:
-    """Re-score a SMILES via Boltz2. Returns affinity in kcal/mol or None.
-    seed must match the seed used by the submitting miner for reproducible scores."""
-    import shutil
+    """
+    Re-score a SMILES via Boltz2. Returns affinity in kcal/mol or None.
+
+    Security measures applied inside:
+      - Unique UUID temp directory per call, chmod 700 (process-private).
+      - SHA256 SMILES hash written before Boltz2 runs; re-read from YAML
+        and verified after write to catch TOCTOU / symlink injection.
+      - Output affinity file mtime verified to be strictly after Boltz2 start.
+      - SECURITY WARNING logged and None returned on any check failure.
+
+    seed must match the seed used by the submitting miner for reproducible scores.
+    """
+    import yaml
     from boltz.main import predict
 
     uniprot   = target["uniprot_id"]
@@ -143,17 +286,52 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
         log.warning(f"  Invalid SMILES (0 heavy atoms): {smiles[:60]}")
         return None
 
-    mol_id  = _mol_id(smiles)
-    batch   = f"batch_{int(time.time()*1000)}"
-    in_dir  = _BOLTZ_TMP / batch / "inputs"
-    out_dir = _BOLTZ_TMP / batch / "outputs"
+    mol_id = _mol_id(smiles)
+
+    # ── Create isolated, process-private tmpdir ───────────────────────────────
+    run_uuid = str(uuid.uuid4())
+    run_root = Path(f"/tmp/life-validator-{run_uuid}")
+    in_dir   = run_root / "inputs"
+    out_dir  = run_root / "outputs"
     in_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(run_root, stat.S_IRWXU)  # 700: owner-only
 
     try:
+        # ── Compute SMILES integrity hash before write ────────────────────────
+        smiles_hash_expected = hashlib.sha256(smiles.encode()).hexdigest()
+
+        # ── Write Boltz2 YAML input ───────────────────────────────────────────
+        yaml_path = in_dir / f"{mol_id}_{target_id}.yaml"
         _write_boltz_input(in_dir, target_id, sequence, smiles, mol_id, msa_path)
-        # predict is a Click command in boltz 2.2.1 — must use .main() not direct call.
-        # Direct call hits Click's Context.__init__(data=...) which fails.
+
+        # ── Re-read YAML and verify SMILES hash (injection prevention) ────────
+        try:
+            written_data = yaml.safe_load(yaml_path.read_text())
+            ligand_blocks = [
+                s["ligand"] for s in written_data.get("sequences", [])
+                if "ligand" in s
+            ]
+            if not ligand_blocks:
+                log.warning("SECURITY WARNING  no ligand block found in written YAML — skip")
+                return None
+            smiles_in_file = ligand_blocks[0].get("smiles", "")
+            smiles_hash_actual = hashlib.sha256(smiles_in_file.encode()).hexdigest()
+            if smiles_hash_actual != smiles_hash_expected:
+                log.warning(
+                    f"SECURITY WARNING  SMILES hash mismatch after write "
+                    f"(expected={smiles_hash_expected[:16]}… "
+                    f"actual={smiles_hash_actual[:16]}…) — skip"
+                )
+                return None
+        except Exception as e:
+            log.warning(f"SECURITY WARNING  YAML re-read/verify failed: {e} — skip")
+            return None
+
+        # ── Record strict start time before Boltz2 runs ───────────────────────
+        boltz_start = time.time()
+
+        # ── Run Boltz2 ────────────────────────────────────────────────────────
         predict.main([
             str(in_dir),
             "--out_dir",                     str(out_dir),
@@ -170,20 +348,25 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
             "--override",
             "--no_kernels",      # disable cuequivariance CUDA kernels (incompatible with CUDA 13 / driver 580)
         ], standalone_mode=False)
-        metrics = _read_boltz_affinity(out_dir, mol_id, target_id)
+
+        # ── Read output with mtime verification ───────────────────────────────
+        metrics = _read_boltz_affinity(out_dir, mol_id, target_id, boltz_start)
         if metrics is None:
             return None
+
         prob = metrics.get("affinity_probability_binary")
         pred = metrics.get("affinity_pred_value")
         if prob is None or pred is None:
             log.warning(f"  Boltz affinity fields missing: {list(metrics.keys())}")
             return None
+
         return round(-((prob - pred) / ha) * 30.0, 3)   # same conversion as miner
+
     except Exception as e:
         log.warning(f"  Boltz2 predict() raised: {e}")
         return None
     finally:
-        shutil.rmtree(str(_BOLTZ_TMP / batch), ignore_errors=True)
+        shutil.rmtree(str(run_root), ignore_errors=True)
 
 
 # ── Solana RPC helpers ────────────────────────────────────────────────────────
@@ -211,7 +394,7 @@ def fetch_pending_submissions() -> list[dict]:
          Layout: 8+32+1+8+512+2+4+8 = 575 bytes before the status byte
     """
     import base64, base58
-    disc_b58      = base58.b58encode(RESULT_DISCRIMINATOR).decode()
+    disc_b58        = base58.b58encode(RESULT_DISCRIMINATOR).decode()
     unvalidated_b58 = base58.b58encode(bytes([0x00])).decode()   # is_validated=0x00
     try:
         resp = _rpc("getProgramAccounts", [
@@ -249,12 +432,13 @@ def fetch_pending_submissions() -> list[dict]:
             status     = data[off]
             if status not in (STATUS_PENDING, STATUS_VALIDATING):
                 continue
+            import base58 as _b58
             smiles = smiles_raw[:smiles_len].decode("utf-8", errors="replace").strip("\x00")
             if not smiles:
                 continue
             results.append({
                 "pubkey":           pubkey,
-                "miner":            base58.b58encode(miner).decode(),
+                "miner":            _b58.b58encode(miner).decode(),
                 "target_id":        target_id,
                 "epoch":            epoch,
                 "smiles":           smiles,
@@ -321,10 +505,18 @@ def append_log(row: dict):
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
+    global _VALIDATOR_PUBKEY
     print("\033[96m    L I F E  C O M P U T E  —  V A L I D A T O R  \033[0m\n")
 
+    # Load validator pubkey once at startup (used for self-validation checks)
+    _VALIDATOR_PUBKEY = _load_validator_pubkey()
+    if _VALIDATOR_PUBKEY:
+        log.info(f"Validator pubkey: {_VALIDATOR_PUBKEY[:16]}…")
+    else:
+        log.warning("Self-validation check DISABLED (keypair unreadable)")
+
     targets_by_id: dict[int, dict] = {}
-    last_refresh   = 0.0
+    last_refresh    = 0.0
     validated_today = 0
     accepted        = 0
     rejected        = 0
@@ -359,24 +551,82 @@ def main():
         for sub in submissions:
             pubkey        = sub["pubkey"]
             smiles        = sub["smiles"]
+            miner_wallet  = sub["miner"]
             target_id_int = sub["target_id"]
             claimed       = sub["claimed_affinity"]
+
+            # ── Security gate 1: rate limiting ───────────────────────────────
+            if not _rate_limit_check():
+                append_audit({
+                    "ts":               datetime.now(timezone.utc).isoformat(),
+                    "submission_pubkey": pubkey,
+                    "miner_wallet":     miner_wallet,
+                    "claimed_score":    claimed,
+                    "rescored":         None,
+                    "decision":         "RATE_LIMITED",
+                    "rel_err":          None,
+                })
+                break  # stop processing this poll cycle entirely
+
+            # ── Security gate 2: self-validation prevention ───────────────────
+            if not _check_self_validation(miner_wallet, pubkey):
+                append_audit({
+                    "ts":               datetime.now(timezone.utc).isoformat(),
+                    "submission_pubkey": pubkey,
+                    "miner_wallet":     miner_wallet,
+                    "claimed_score":    claimed,
+                    "rescored":         None,
+                    "decision":         "SELF_VALIDATION_REJECTED",
+                    "rel_err":          None,
+                })
+                continue
+
+            # ── Security gate 3: SMILES input sanitization ────────────────────
+            if not _sanitize_smiles(smiles, pubkey):
+                append_audit({
+                    "ts":               datetime.now(timezone.utc).isoformat(),
+                    "submission_pubkey": pubkey,
+                    "miner_wallet":     miner_wallet,
+                    "claimed_score":    claimed,
+                    "rescored":         None,
+                    "decision":         "SMILES_INVALID",
+                    "rel_err":          None,
+                })
+                continue
 
             target = targets_by_id.get(target_id_int)
             if not target:
                 log.warning(f"  {pubkey[:16]}…: unknown target_id={target_id_int} — skip")
+                append_audit({
+                    "ts":               datetime.now(timezone.utc).isoformat(),
+                    "submission_pubkey": pubkey,
+                    "miner_wallet":     miner_wallet,
+                    "claimed_score":    claimed,
+                    "rescored":         None,
+                    "decision":         "UNKNOWN_TARGET",
+                    "rel_err":          None,
+                })
                 continue
 
             log.info(f"  Validating {pubkey[:16]}…  target={target.get('id','?')}  "
                      f"claimed={claimed:.3f}  smiles={smiles[:40]}")
 
-            # Step 2: Re-run Boltz2
+            # Step 2: Re-run Boltz2 (with pipeline injection hardening inside)
             t0 = time.time()
             rescored = run_boltz2(smiles, target, seed=sub.get("boltz_seed", BOLTZ_SEED))
             elapsed  = time.time() - t0
 
             if rescored is None:
                 log.warning(f"  Boltz2 failed for {pubkey[:16]}… — skip")
+                append_audit({
+                    "ts":               datetime.now(timezone.utc).isoformat(),
+                    "submission_pubkey": pubkey,
+                    "miner_wallet":     miner_wallet,
+                    "claimed_score":    claimed,
+                    "rescored":         None,
+                    "decision":         "BOLTZ2_FAILED",
+                    "rel_err":          None,
+                })
                 continue
 
             # Step 3: Tolerance check (mirrors constants.rs)
@@ -385,12 +635,12 @@ def main():
             else:
                 rel_err = abs(rescored)
             within_tol = rel_err <= VALIDATION_TOLERANCE
-            verdict = "CONFIRM" if within_tol else "REJECT"
+            verdict    = "CONFIRM" if within_tol else "REJECT"
 
             log.info(f"  {verdict}  claimed={claimed:.3f}  rescored={rescored:.3f}  "
                      f"rel_err={rel_err:.3f}  ({elapsed:.1f}s)")
 
-            # Step 3: Submit on-chain
+            # Step 4: Submit on-chain
             result = validate_on_chain(pubkey, rescored)
             tx = result.get("tx") if result else None
             if tx:
@@ -404,6 +654,18 @@ def main():
                 log.warning(f"  validate_on_chain returned no tx")
 
             validated_today += 1
+
+            # ── Audit log (every decision) ────────────────────────────────────
+            append_audit({
+                "ts":               datetime.now(timezone.utc).isoformat(),
+                "submission_pubkey": pubkey,
+                "miner_wallet":     miner_wallet,
+                "claimed_score":    claimed,
+                "rescored":         rescored,
+                "decision":         verdict,
+                "rel_err":          round(rel_err, 4),
+            })
+
             append_log({
                 "ts":               datetime.now(timezone.utc).isoformat(),
                 "pubkey":           pubkey,
