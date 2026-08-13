@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 def _env(key, default=""):
     return os.environ.get(key, default)
 
-PROGRAM_ID       = _env("PROGRAM_ID",       "DzcQHhTPuiqxCxZurDbEAaV1U2JBFXWy6JG1LE6WsKvJ")
+PROGRAM_ID       = _env("PROGRAM_ID",       "74RHjg1zYgN9zuVykde4SK2ERiRgNkouATW9MmQDLRWf")
 SOLANA_RPC       = _env("SOLANA_RPC",       "https://api.devnet.solana.com")
 VALIDATOR_KEYPAIR = _env("VALIDATOR_KEYPAIR", str(Path.home() / ".life-compute/wallet.json"))
 PAYER_KEYPAIR    = _env("PAYER_KEYPAIR",    str(Path.home() / ".life-compute/wallet.json"))
