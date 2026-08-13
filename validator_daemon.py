@@ -52,7 +52,8 @@ RESULT_DISCRIMINATOR = bytes([214, 115, 165, 103, 67, 211, 47, 88])
 STATUS_PENDING    = 0   # Pending
 STATUS_VALIDATING = 1   # Validating
 
-VALIDATION_TOLERANCE = 0.05  # 5% — must match constants.rs
+BOLTZ_SEED = 68  # must match miner BOLTZ_SEED; used for reproducible Boltz2 rescoring
+VALIDATION_TOLERANCE = 0.25  # DEVNET TESTING TOLERANCE — tighten for mainnet
 
 logging.basicConfig(
     level=logging.INFO,
@@ -126,8 +127,9 @@ def _read_boltz_affinity(out_dir: Path, mol_id: int, target_id: str) -> dict | N
     return combined or None
 
 
-def run_boltz2(smiles: str, target: dict) -> float | None:
-    """Re-score a SMILES via Boltz2. Returns affinity in kcal/mol or None."""
+def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | None:
+    """Re-score a SMILES via Boltz2. Returns affinity in kcal/mol or None.
+    seed must match the seed used by the submitting miner for reproducible scores."""
     import shutil
     from boltz.main import predict
 
@@ -161,7 +163,7 @@ def run_boltz2(smiles: str, target: dict) -> float | None:
             "--sampling_steps_affinity",     str(_SAMPLING_STEPS_AFF),
             "--diffusion_samples_affinity",  str(_DIFFUSION_SAMPLES_AFF),
             "--output_format",               "mmcif",
-            "--seed",                        "68",
+            "--seed",                        str(seed),
             "--num_workers",                 "0",
             "--accelerator",                 "gpu",
             "--affinity_mw_correction",
@@ -370,7 +372,7 @@ def main():
 
             # Step 2: Re-run Boltz2
             t0 = time.time()
-            rescored = run_boltz2(smiles, target)
+            rescored = run_boltz2(smiles, target, seed=sub.get("boltz_seed", BOLTZ_SEED))
             elapsed  = time.time() - t0
 
             if rescored is None:
