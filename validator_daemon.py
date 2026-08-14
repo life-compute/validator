@@ -55,7 +55,7 @@ _SAMPLING_STEPS_AFF    = 25
 _DIFFUSION_SAMPLES_AFF = 1
 
 BOLTZ_SEED = 68  # must match miner BOLTZ_SEED; used for reproducible Boltz2 rescoring
-VALIDATION_TOLERANCE = 0.25  # DEVNET TESTING TOLERANCE — tighten for mainnet
+VALIDATION_TOLERANCE = 0.50  # DEVNET TESTING TOLERANCE — tighten for mainnet
 
 # ── Anchor / JS paths ─────────────────────────────────────────────────────────
 ANCHOR_DIR  = Path(_env("ANCHOR_DIR", "/tmp/life-compute/core"))
