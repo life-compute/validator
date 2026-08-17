@@ -424,7 +424,7 @@ def fetch_pending_submissions() -> list[dict]:
     smiles, claimed_affinity, status.
 
     Three RPC-side filters (all must pass):
-      1. dataSize=775        — exact account size for ResultSubmission
+      1. dataSize=938        — exact account size for ResultSubmission
       2. memcmp offset=0     — 8-byte Anchor discriminator (base58)
       3. memcmp offset=575   — is_validated=0x00 (Pending/Validating only)
          Layout: 8+32+1+8+512+2+4+8 = 575 bytes before the status byte
@@ -438,7 +438,7 @@ def fetch_pending_submissions() -> list[dict]:
             {
                 "encoding": "base64",
                 "filters": [
-                    {"dataSize": 775},
+                    {"dataSize": 938},
                     {"memcmp": {"offset": 0,   "bytes": disc_b58}},
                     {"memcmp": {"offset": 575, "bytes": unvalidated_b58}},
                 ],
