@@ -1,45 +1,71 @@
 /**
  * LIFE Compute Validator Dashboard — static server on :3002
- * Serves pre-built dist/ and proxies /stats.json + /log.json
+ *
+ * Routes:
+ *   GET /stats.json  → reads ../stats.json (written by validator_daemon.py)
+ *   GET /log.json    → last 50 entries from ../output/validator_log.jsonl
+ *   GET /*           → serves dist/ (React build); SPA fallback to index.html
+ *
+ * No external deps — stdlib http only.
+ * Port: DASHBOARD_PORT env var (default 3002).
  */
+'use strict';
 const http = require('http');
 const fs   = require('fs');
 const path = require('path');
 
-const PORT   = parseInt(process.env.DASHBOARD_PORT || '3002');
-const DIST   = path.join(__dirname, 'dist');
-const ROOT   = path.join(__dirname, '..');
-const STATS  = path.join(ROOT, 'stats.json');
-const LOG    = path.join(ROOT, 'output', 'validator_log.jsonl');
+const PORT  = parseInt(process.env.DASHBOARD_PORT || '3002', 10);
+const DIST  = path.join(__dirname, 'dist');
+const ROOT  = path.join(__dirname, '..');
+const STATS = path.join(ROOT, 'stats.json');
+const LOG   = path.join(ROOT, 'output', 'validator_log.jsonl');
 
 const MIME = {
-  '.html': 'text/html', '.js': 'application/javascript',
-  '.css':  'text/css',  '.json': 'application/json',
-  '.ico':  'image/x-icon', '.svg': 'image/svg+xml',
+  '.html': 'text/html',
+  '.js':   'application/javascript',
+  '.css':  'text/css',
+  '.json': 'application/json',
+  '.ico':  'image/x-icon',
+  '.svg':  'image/svg+xml',
+  '.png':  'image/png',
+  '.woff2':'font/woff2',
 };
 
-function readJson(p)  { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+const JSON_HEADERS = {
+  'Content-Type': 'application/json',
+  'Access-Control-Allow-Origin': '*',
+  'Cache-Control': 'no-store',
+};
+
+function readJson(p) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
+}
+
 function tailJsonl(p, n = 50) {
   try {
-    return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean)
-      .slice(-n).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    return fs.readFileSync(p, 'utf8')
+      .split('\n').filter(Boolean).slice(-n)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
   } catch { return []; }
 }
 
 http.createServer((req, res) => {
-  if (req.url === '/stats.json') {
-    const d = readJson(STATS) || {};
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  const url = req.url.split('?')[0];
+
+  // ── API routes ───────────────────────────────────────────────
+  if (url === '/stats.json') {
+    const d = readJson(STATS) || { status: 'OFFLINE' };
+    res.writeHead(200, JSON_HEADERS);
     return res.end(JSON.stringify(d));
   }
-  if (req.url === '/log.json') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  if (url === '/log.json') {
+    res.writeHead(200, JSON_HEADERS);
     return res.end(JSON.stringify(tailJsonl(LOG)));
   }
 
-  let urlPath = req.url.split('?')[0];
-  if (urlPath === '/') urlPath = '/index.html';
-  const file = path.join(DIST, urlPath);
+  // ── Static files ─────────────────────────────────────────────
+  const file = path.join(DIST, url === '/' ? '/index.html' : url);
   const ext  = path.extname(file);
 
   fs.readFile(file, (err, data) => {
@@ -55,4 +81,5 @@ http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
     res.end(data);
   });
+
 }).listen(PORT, () => console.log(`LIFE Validator Dashboard → http://localhost:${PORT}`));
