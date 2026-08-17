@@ -347,6 +347,21 @@ function DNAHelix() {
   )
 }
 
+// Target ID → gene name (indices 0-29 match life-compute/targets targets.json)
+const TARGET_NAMES = [
+  'TP53','BRCA1','EGFR','HER2','KRAS','BCL2','CDK4','VEGFR2','PDL1','MDM2',
+  'BRAF','PTEN','MYC','STAT3','PIK3CA','MTOR','FGFR1','RET','AR','NTRK1',
+  'IDH1','FLT3','SMAD4','APC','PARP1','JAK2','ESR1','HDAC1','HDAC2','ABL1',
+]
+const targetName = (id) => TARGET_NAMES[id] ?? (id != null ? String(id) : '—')
+
+// Parse ts field — daemon writes ISO strings, not unix epoch
+const parseTs = (ts) => {
+  if (!ts) return '—'
+  const d = new Date(ts)
+  return isNaN(d) ? String(ts) : d.toLocaleTimeString()
+}
+
 /* ─── Panel wrapper ─────────────────────────────────────────── */
 function Panel({ accent = T.green, style, children }) {
   return (
@@ -450,7 +465,7 @@ function CurrentPanel({ stats, log }) {
       ) : (
         <div style={{ display:'grid', gridTemplateColumns:'100px 1fr 80px 80px 60px', gap:'14px', fontSize:'11px', fontFamily:T.mono }}>
           {[
-            { k:'TARGET',   v: current.target_id ?? '—',                                              c: T.green },
+            { k:'TARGET',   v: targetName(current.target_id),                                      c: T.green },
             { k:'SMILES',   v: (current.smiles ?? '—').slice(0,60)+((current.smiles?.length>60)?'…':''), c: T.cyan },
             { k:'CLAIMED',  v: current.claimed?.toFixed(4) ?? '—',                                   c: T.amber },
             { k:'RESCORED', v: current.rescored?.toFixed(4) ?? 'running…',                           c: T.amber },
@@ -509,7 +524,7 @@ function ScoringFeedPanel({ log }) {
             <span style={{ color:vc, fontWeight:700, textShadow:glow(vc,1) }}>
               {r.verdict ?? (ok ? '✔ CONF' : '✘ REJ')}
             </span>
-            <span style={{ color:T.green }}>{r.target_id ?? '—'}</span>
+            <span style={{ color:T.cyan }}>{targetName(r.target_id)}</span>
             <span style={{ color:T.textDim, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
               {(r.smiles ?? '').slice(0,40)}
             </span>
@@ -543,7 +558,7 @@ function AuditPanel({ log }) {
       ) : last10.map((r, i) => {
         const ok = r.within_tolerance || r.verdict === 'CONFIRMED'
         const vc = ok ? T.green : T.red
-        const ts = r.ts ? new Date(r.ts * 1000).toLocaleTimeString() : '—'
+        const ts = parseTs(r.ts)
         return (
           <div key={i} style={{ display:'flex', gap:'12px', alignItems:'center',
                                 padding:'5px 0', borderBottom:`1px solid ${T.muted}`,
@@ -552,7 +567,7 @@ function AuditPanel({ log }) {
             <span style={{ color:vc, fontWeight:700, textShadow:glow(vc,1), width:80, flexShrink:0 }}>
               {r.verdict ?? (ok ? 'CONFIRMED' : 'REJECTED')}
             </span>
-            <span style={{ color:T.green, width:60, flexShrink:0 }}>{r.target_id ?? '—'}</span>
+            <span style={{ color:T.green, width:60, flexShrink:0 }}>{targetName(r.target_id)}</span>
             <span style={{ color:T.textDim, flex:1, overflow:'hidden',
                            textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
               {r.smiles ?? '—'}
