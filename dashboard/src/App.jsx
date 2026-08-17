@@ -368,8 +368,8 @@ function Cursor() {
 function StatusPanel({ stats }) {
   const online    = stats?.status === 'ONLINE'
   const accent    = online ? T.green : T.red
-  const startedAt = stats?.started_at   ? new Date(stats.started_at).toLocaleString()   : '—'
-  const updatedAt = stats?.last_updated ? new Date(stats.last_updated).toLocaleTimeString() : '—'
+  const startedAt = stats?.started_at      ? new Date(stats.started_at).toLocaleString()      : '—'
+  const updatedAt = stats?.last_heartbeat  ? new Date(stats.last_heartbeat).toLocaleTimeString() : '—'
 
   return (
     <Panel accent={accent}>
@@ -414,9 +414,12 @@ function MetricPanel({ label, value, sub, accent = T.green }) {
 }
 
 /* ─── CURRENT VALIDATION panel ──────────────────────────────── */
-function CurrentPanel({ log }) {
+function CurrentPanel({ stats, log }) {
   const current = log[log.length - 1] ?? null
-  const idle    = !current
+  // Also show in-progress work from stats (written before Boltz2 completes)
+  const activeTarget = stats?.current_target
+  const activeSmiles = stats?.current_smiles
+  const idle = !current && !activeTarget
   return (
     <Panel accent={T.cyan} style={{ gridColumn:'1 / -1' }}>
       <div style={S.panelTitle}>
@@ -429,6 +432,20 @@ function CurrentPanel({ log }) {
       {idle ? (
         <div style={{ color:T.textDim, fontSize:'11px', fontFamily:T.mono }}>
           Polling for pending submissions… <Cursor />
+        </div>
+      ) : activeTarget && !current ? (
+        // In-progress: Boltz2 running, no result yet
+        <div style={{ display:'grid', gridTemplateColumns:'100px 1fr', gap:'14px', fontSize:'11px', fontFamily:T.mono }}>
+          <div>
+            <div style={{ color:T.textDim, fontSize:'9px', letterSpacing:'0.1em', marginBottom:'3px' }}>TARGET</div>
+            <div style={{ color:T.green, fontWeight:700, textShadow:glow(T.green,1) }}>{activeTarget}</div>
+          </div>
+          <div>
+            <div style={{ color:T.textDim, fontSize:'9px', letterSpacing:'0.1em', marginBottom:'3px' }}>SMILES</div>
+            <div style={{ color:T.cyan, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+              {(activeSmiles ?? '').slice(0,80)}{(activeSmiles?.length ?? 0) > 80 ? '…' : ''}
+            </div>
+          </div>
         </div>
       ) : (
         <div style={{ display:'grid', gridTemplateColumns:'100px 1fr 80px 80px 60px', gap:'14px', fontSize:'11px', fontFamily:T.mono }}>
@@ -570,10 +587,10 @@ export default function App() {
 
   const online     = stats?.status      === 'ONLINE'
   const validated  = stats?.validated_today ?? 0
-  const accepted   = stats?.accepted        ?? 0
+  const accepted   = stats?.confirmed       ?? 0
   const rejected   = stats?.rejected        ?? 0
   const acceptRate = stats?.accept_rate     ?? 0
-  const life       = stats?.life_earned     ?? 0
+  const life       = stats?.life_commission ?? 0
   const arColor    = acceptRate >= 90 ? T.green : acceptRate >= 70 ? T.amber : T.red
 
   return (
@@ -656,7 +673,7 @@ export default function App() {
             </div>
 
             {/* Current validation — full width */}
-            <CurrentPanel log={log} />
+            <CurrentPanel stats={stats} log={log} />
 
             {/* Scoring feed — full width */}
             <ScoringFeedPanel log={log} />

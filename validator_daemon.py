@@ -21,7 +21,7 @@ Security hardening (2026-08-13):
   - Input sanitization: SMILES length < 500 chars, valid chemical chars only.
   - Audit log: every validation decision → output/validator_audit.jsonl.
 """
-import json, time, logging, os, re, shutil, stat, subprocess, sys
+import json, time, logging, os, re, shutil, stat, subprocess, sys, threading
 import urllib.request, hashlib, uuid
 from collections import deque
 from pathlib import Path
@@ -496,7 +496,10 @@ def fetch_targets() -> list:
         return []
 
 def write_stats(stats: dict):
-    STATS_PATH.write_text(json.dumps(stats, indent=2))
+    """Atomic write via temp file to avoid partial reads."""
+    tmp = STATS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(stats, indent=2))
+    tmp.replace(STATS_PATH)
 
 def append_log(row: dict):
     with LOG_JSONL.open("a") as f:
@@ -566,14 +569,30 @@ def main():
     life_earned     = 0.0
 
     stats = {
-        "status": "ONLINE",
-        "validated_today": 0, "accepted": 0, "rejected": 0,
-        "accept_rate": 0.0, "life_earned": 0.0,
-        "active_validators": 0,
-        "self_reputation_pct": 100.0,
-        "started_at": datetime.now(timezone.utc).isoformat(), "last_updated": "",
+        "status":          "ONLINE",
+        "validated_today": 0,
+        "confirmed":       0,
+        "rejected":        0,
+        "accept_rate":     0.0,
+        "life_commission": 0.0,
+        "last_heartbeat":  datetime.now(timezone.utc).isoformat(),
+        "current_target":  None,
+        "current_smiles":  None,
+        "active_validators":    0,
+        "self_reputation_pct":  100.0,
+        "started_at":      datetime.now(timezone.utc).isoformat(),
+        "last_updated":    "",
     }
     write_stats(stats)
+
+    # Heartbeat thread — updates last_heartbeat every 30s independent of poll cycle
+    def _heartbeat():
+        while True:
+            time.sleep(30)
+            stats["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
+            stats["last_updated"]   = stats["last_heartbeat"]
+            write_stats(stats)
+    threading.Thread(target=_heartbeat, daemon=True).start()
 
     while True:
         now = time.time()
@@ -656,6 +675,12 @@ def main():
             log.info(f"  Validating {pubkey[:16]}…  target={target.get('id','?')}  "
                      f"claimed={claimed:.3f}  smiles={smiles[:40]}")
 
+            # Expose current work to dashboard
+            stats["current_target"] = target.get("id") or str(target_id_int)
+            stats["current_smiles"] = smiles
+            stats["last_updated"]   = datetime.now(timezone.utc).isoformat()
+            write_stats(stats)
+
             # Step 2: Re-run Boltz2 (with pipeline injection hardening inside)
             t0 = time.time()
             rescored = run_boltz2(smiles, target, seed=sub.get("boltz_seed", BOLTZ_SEED))
@@ -725,18 +750,35 @@ def main():
                 "elapsed_s":        round(elapsed, 1),
             })
 
+            # Write stats immediately after each validation so dashboard is live
+            stats.update({
+                "validated_today": validated_today,
+                "confirmed":       accepted,
+                "rejected":        rejected,
+                "accept_rate":     round(accepted / max(validated_today, 1) * 100, 1),
+                "life_commission": life_earned,
+                "last_heartbeat":  datetime.now(timezone.utc).isoformat(),
+                "current_target":  None,
+                "current_smiles":  None,
+                "last_updated":    datetime.now(timezone.utc).isoformat(),
+            })
+            write_stats(stats)
+
         accept_rate = round(accepted / max(validated_today, 1) * 100, 1)
         net_info = fetch_network_validator_info()
         stats.update({
-            "status": "ONLINE",
+            "status":          "ONLINE",
             "validated_today": validated_today,
-            "accepted": accepted,
-            "rejected": rejected,
-            "accept_rate": accept_rate,
-            "life_earned": life_earned,
-            "active_validators": net_info.get("active_validators", 0),
+            "confirmed":       accepted,
+            "rejected":        rejected,
+            "accept_rate":     accept_rate,
+            "life_commission": life_earned,
+            "last_heartbeat":  datetime.now(timezone.utc).isoformat(),
+            "current_target":  None,
+            "current_smiles":  None,
+            "active_validators":   net_info.get("active_validators", 0),
             "self_reputation_pct": round(net_info.get("self_reputation_bps", 10000) / 100, 1),
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated":    datetime.now(timezone.utc).isoformat(),
         })
         write_stats(stats)
         log.info(f"Validated={validated_today}  Accept={accept_rate}%  $LIFE={life_earned:.1f}  Validators={net_info.get('active_validators',0)}")
