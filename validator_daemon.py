@@ -176,6 +176,42 @@ def append_audit(row: dict) -> None:
         f.write(json.dumps(row) + "\n")
 
 
+# ── Today-counter helpers ──────────────────────────────────────────────────────
+
+def _today_date_utc() -> str:
+    """Return today's date in UTC as YYYY-MM-DD (used for midnight resets)."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+
+def _count_today_from_log() -> tuple:
+    """
+    Scan validator_log.jsonl and count decisions logged since today's midnight UTC.
+    Returns (total_validated, confirmed, rejected).
+    Only rows with verdict == 'CONFIRM' or 'REJECT' are counted (excludes
+    BOLTZ2_FAILED, RATE_LIMITED, SMILES_INVALID, UNKNOWN_TARGET, SELF_VALIDATION_REJECTED).
+    """
+    today = _today_date_utc()
+    total = conf = rej = 0
+    if LOG_JSONL.exists():
+        try:
+            with LOG_JSONL.open() as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                        if row.get("ts", "").startswith(today):
+                            total += 1
+                            v = row.get("verdict", "")
+                            if v == "CONFIRM":
+                                conf += 1
+                            elif v == "REJECT":
+                                rej += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return total, conf, rej
+
+
 # ── Boltz2 scoring — self-contained, no nova/miner dependencies ───────────────
 
 def _mol_id(smiles: str) -> int:
@@ -563,10 +599,13 @@ def main():
 
     targets_by_id: dict[int, dict] = {}
     last_refresh    = 0.0
-    validated_today = 0
-    accepted        = 0
-    rejected        = 0
     life_earned     = 0.0
+
+    # Initialize today-counters from today's log so a restart doesn't zero the display
+    today_date = _today_date_utc()
+    validated_today, accepted, rejected = _count_today_from_log()
+    if validated_today:
+        log.info(f"Restored today's counters from log: total={validated_today} confirmed={accepted} rejected={rejected}")
 
     stats = {
         "status":          "ONLINE",
@@ -596,6 +635,15 @@ def main():
 
     while True:
         now = time.time()
+
+        # Reset today-counters at midnight UTC
+        new_date = _today_date_utc()
+        if new_date != today_date:
+            log.info(f"New UTC day ({new_date}) — resetting today's validation counters")
+            today_date      = new_date
+            validated_today = 0
+            accepted        = 0
+            rejected        = 0
 
         # Refresh target list every 5 min
         if now - last_refresh > 300 or not targets_by_id:
@@ -716,14 +764,16 @@ def main():
             if tx:
                 log.info(f"  ✔ tx: {tx}")
                 if within_tol:
-                    accepted   += 1
                     life_earned += 0.5   # validators earn half the miner reward
-                else:
-                    rejected += 1
             else:
                 log.warning(f"  validate_on_chain returned no tx")
 
+            # Count every verdict (confirm or reject), regardless of tx success
             validated_today += 1
+            if within_tol:
+                accepted += 1
+            else:
+                rejected += 1
 
             # ── Audit log (every decision) ────────────────────────────────────
             append_audit({

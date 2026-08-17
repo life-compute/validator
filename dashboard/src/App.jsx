@@ -429,12 +429,12 @@ function MetricPanel({ label, value, sub, accent = T.green }) {
 }
 
 /* ─── CURRENT VALIDATION panel ──────────────────────────────── */
-function CurrentPanel({ stats, log }) {
-  const current = log[log.length - 1] ?? null
+function CurrentPanel({ stats }) {
   // Also show in-progress work from stats (written before Boltz2 completes)
   const activeTarget = stats?.current_target
   const activeSmiles = stats?.current_smiles
-  const idle = !current && !activeTarget
+  // idle = no active Boltz2 run in progress (current_target cleared after each validation)
+  const idle = !activeTarget
   return (
     <Panel accent={T.cyan} style={{ gridColumn:'1 / -1' }}>
       <div style={S.panelTitle}>
@@ -448,8 +448,8 @@ function CurrentPanel({ stats, log }) {
         <div style={{ color:T.textDim, fontSize:'11px', fontFamily:T.mono }}>
           Polling for pending submissions… <Cursor />
         </div>
-      ) : activeTarget && !current ? (
-        // In-progress: Boltz2 running, no result yet
+      ) : (
+        // Boltz2 in progress
         <div style={{ display:'grid', gridTemplateColumns:'100px 1fr', gap:'14px', fontSize:'11px', fontFamily:T.mono }}>
           <div>
             <div style={{ color:T.textDim, fontSize:'9px', letterSpacing:'0.1em', marginBottom:'3px' }}>TARGET</div>
@@ -461,22 +461,6 @@ function CurrentPanel({ stats, log }) {
               {(activeSmiles ?? '').slice(0,80)}{(activeSmiles?.length ?? 0) > 80 ? '…' : ''}
             </div>
           </div>
-        </div>
-      ) : (
-        <div style={{ display:'grid', gridTemplateColumns:'100px 1fr 80px 80px 60px', gap:'14px', fontSize:'11px', fontFamily:T.mono }}>
-          {[
-            { k:'TARGET',   v: targetName(current.target_id),                                      c: T.green },
-            { k:'SMILES',   v: (current.smiles ?? '—').slice(0,60)+((current.smiles?.length>60)?'…':''), c: T.cyan },
-            { k:'CLAIMED',  v: current.claimed?.toFixed(4) ?? '—',                                   c: T.amber },
-            { k:'RESCORED', v: current.rescored?.toFixed(4) ?? 'running…',                           c: T.amber },
-            { k:'TIME',     v: current.elapsed_s ? `${current.elapsed_s}s` : '—',                    c: T.textDim },
-          ].map(({ k, v, c }) => (
-            <div key={k}>
-              <div style={{ color:T.textDim, fontSize:'9px', letterSpacing:'0.1em', marginBottom:'3px' }}>{k}</div>
-              <div style={{ color:c, fontWeight:700, textShadow:glow(c,1), overflow:'hidden',
-                            textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{v}</div>
-            </div>
-          ))}
         </div>
       )}
     </Panel>
@@ -688,7 +672,7 @@ export default function App() {
             </div>
 
             {/* Current validation — full width */}
-            <CurrentPanel stats={stats} log={log} />
+            <CurrentPanel stats={stats} />
 
             {/* Scoring feed — full width */}
             <ScoringFeedPanel log={log} />
