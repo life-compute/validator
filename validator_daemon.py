@@ -38,6 +38,11 @@ PAYER_KEYPAIR     = _env("PAYER_KEYPAIR",     str(Path.home() / ".life-compute/w
 TARGETS_URL       = _env("TARGETS_URL",       "https://raw.githubusercontent.com/life-compute/targets/master/targets.json")
 POLL_SECONDS      = int(_env("POLL_SECONDS", "30"))
 
+# ── Miner allowlist — only process submissions from this wallet ───────────────
+# Set to empty string to accept all miners (open mode).
+MINER_WALLET  = _env("MINER_WALLET",  "5JtrNEfzVavsRyUxUzh2aSer42tGQUAaPyAaeXStVVLF")
+MINER_ACCOUNT = _env("MINER_ACCOUNT", "8i2QhmTj17gZyujv6GESzb7YZuQeLfAbBbxbGC2NkKsi")
+
 WORK_DIR    = Path(__file__).parent
 STATS_PATH  = WORK_DIR / "stats.json"
 LOG_JSONL   = WORK_DIR / "output" / "validator_log.jsonl"
@@ -426,22 +431,31 @@ def fetch_pending_submissions() -> list[dict]:
     Three RPC-side filters (all must pass):
       1. dataSize=937        — exact account size for ResultSubmission
       2. memcmp offset=0     — 8-byte Anchor discriminator (base58)
-      3. memcmp offset=575   — is_validated=0x00 (Pending/Validating only)
-         Layout: 8+32+1+8+512+2+4+8 = 575 bytes before the status byte
+      3. memcmp offset=576   — is_validated=0x00 (Pending/Validating only)
+         Layout: 8+32+1+8+512+2+4+8+1 = 576 bytes before the status byte
+         (938-byte accounts have 1 extra byte vs legacy 937-byte layout)
     """
     import base64, base58
     disc_b58        = base58.b58encode(RESULT_DISCRIMINATOR).decode()
     unvalidated_b58 = base58.b58encode(bytes([0x00])).decode()   # is_validated=0x00
+    # Build filters list — optionally restrict to a single miner wallet at the RPC level
+    # to avoid fetching/processing corrupt submissions from other (old) wallets.
+    filters = [
+        {"dataSize": 938},
+        {"memcmp": {"offset": 0,   "bytes": disc_b58}},
+        {"memcmp": {"offset": 576, "bytes": unvalidated_b58}},
+    ]
+    if MINER_WALLET:
+        miner_wallet_b58 = base58.b58encode(base58.b58decode(MINER_WALLET)).decode()
+        # miner pubkey sits at offset 8 (after 8-byte discriminator)
+        filters.append({"memcmp": {"offset": 8, "bytes": miner_wallet_b58}})
+        log.debug(f"fetch_pending_submissions: filtering to miner wallet {MINER_WALLET[:16]}…")
     try:
         resp = _rpc("getProgramAccounts", [
             PROGRAM_ID,
             {
                 "encoding": "base64",
-                "filters": [
-                    {"dataSize": 937},
-                    {"memcmp": {"offset": 0,   "bytes": disc_b58}},
-                    {"memcmp": {"offset": 575, "bytes": unvalidated_b58}},
-                ],
+                "filters": filters,
             },
         ])
     except Exception as e:
@@ -454,11 +468,12 @@ def fetch_pending_submissions() -> list[dict]:
             pubkey  = item["pubkey"]
             data    = base64.b64decode(item["account"]["data"][0])
             # Parse ResultSubmission fields after 8-byte discriminator
-            # Layout: [8 disc][32 miner][1 target_id][8 epoch][512 smiles][2 smiles_len]
+            # Layout: [8 disc][32 miner][2 target_id u16][8 epoch][512 smiles][2 smiles_len]
             #         [4 claimed_affinity f32][8 submitted_slot i64][1 status]...
+            # (938-byte accounts: target_id expanded from u8 to u16 vs legacy 937-byte layout)
             off = 8
             miner      = data[off:off+32]; off += 32
-            target_id  = data[off]; off += 1
+            target_id  = int.from_bytes(data[off:off+2], "little"); off += 2
             epoch      = int.from_bytes(data[off:off+8], "little"); off += 8
             smiles_raw = data[off:off+512]; off += 512
             smiles_len = int.from_bytes(data[off:off+2], "little"); off += 2
@@ -668,6 +683,23 @@ def main():
             miner_wallet  = sub["miner"]
             target_id_int = sub["target_id"]
             claimed       = sub["claimed_affinity"]
+
+            # ── Security gate 0: miner wallet allowlist ───────────────────────
+            if MINER_WALLET and miner_wallet != MINER_WALLET:
+                log.warning(
+                    f"  {pubkey[:16]}…: miner wallet {miner_wallet[:16]}… "
+                    f"not in allowlist — skipping (old/unknown wallet)"
+                )
+                append_audit({
+                    "ts":               datetime.now(timezone.utc).isoformat(),
+                    "submission_pubkey": pubkey,
+                    "miner_wallet":     miner_wallet,
+                    "claimed_score":    claimed,
+                    "rescored":         None,
+                    "decision":         "WALLET_NOT_ALLOWED",
+                    "rel_err":          None,
+                })
+                continue
 
             # ── Security gate 1: rate limiting ───────────────────────────────
             if not _rate_limit_check():
