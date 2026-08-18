@@ -505,7 +505,9 @@ def validate_on_chain(submission_pubkey: str, rescored_affinity: float) -> dict 
             cwd=str(ANCHOR_DIR),
         )
         if r.returncode != 0:
-            log.error(f"  validate_result node error: {r.stderr[-400:]}")
+            # life_validate.js writes errors to stdout as JSON {error: "..."}
+            err_detail = r.stdout.strip()[-400:] or r.stderr.strip()[-400:]
+            log.error(f"  validate_result node error: {err_detail}")
             return None
         for line in reversed(r.stdout.strip().splitlines()):
             try:
@@ -693,7 +695,30 @@ def main():
                 })
                 continue
 
-            # ── Security gate 3: SMILES input sanitization ────────────────────
+            # ── Security gate 3: corrupted claimed_score filter ───────────────
+            # Valid Boltz2 affinities are in the range [-15, +5] kcal/mol.
+            # Anything with |claimed_score| > 50 is physically impossible (e.g.
+            # 788604923813036032, -5.732e+33, or 51.456) and signals corrupted
+            # on-chain data.  Skip immediately — Boltz2 would never confirm
+            # these and running the GPU wastes time while the loop stalls.
+            _CLAIMED_SCORE_MAX = 50.0
+            if abs(claimed) > _CLAIMED_SCORE_MAX:
+                log.warning(
+                    f"  {pubkey[:16]}…: claimed_score {claimed:.6g} exceeds "
+                    f"|{_CLAIMED_SCORE_MAX}| — corrupted submission, skipping"
+                )
+                append_audit({
+                    "ts":               datetime.now(timezone.utc).isoformat(),
+                    "submission_pubkey": pubkey,
+                    "miner_wallet":     miner_wallet,
+                    "claimed_score":    claimed,
+                    "rescored":         None,
+                    "decision":         "CORRUPTED_SCORE",
+                    "rel_err":          None,
+                })
+                continue
+
+            # ── Security gate 4: SMILES input sanitization ────────────────────
             if not _sanitize_smiles(smiles, pubkey):
                 append_audit({
                     "ts":               datetime.now(timezone.utc).isoformat(),
