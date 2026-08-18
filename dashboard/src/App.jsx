@@ -603,6 +603,38 @@ export default function App() {
           {/* ── Header ── */}
           <header style={S.header}>
             <div style={S.headerInner}>
+              {/* Logo */}
+              <div style={{
+                width:        '120px',
+                height:       '120px',
+                borderRadius: '4px',
+                overflow:     'hidden',
+                border:       `1px solid ${T.green}55`,
+                boxShadow:    `0 0 18px ${T.green}44, 0 0 40px ${T.green}22, inset 0 0 20px rgba(0,0,0,0.6)`,
+                flexShrink:   0,
+                position:     'relative',
+              }}>
+                <img
+                  src="/logo.jpg"
+                  alt="LIFE Compute"
+                  style={{
+                    width:      '100%',
+                    height:     '100%',
+                    objectFit:  'cover',
+                    objectPosition: 'center top',
+                    filter:     'brightness(1.1) saturate(1.3) contrast(1.05)',
+                    display:    'block',
+                  }}
+                />
+                {/* green scan-line overlay */}
+                <div style={{
+                  position:   'absolute',
+                  inset:      0,
+                  background: `repeating-linear-gradient(0deg,transparent,transparent 3px,${T.green}08 3px,${T.green}08 4px)`,
+                  pointerEvents: 'none',
+                }} />
+              </div>
+
               {/* Title */}
               <div style={S.tagline}>
                 <span style={{ color:T.green, textShadow:`0 0 20px ${T.green},0 0 40px ${T.green}88` }}>
