@@ -568,7 +568,120 @@ function AuditPanel({ log }) {
   )
 }
 
-/* ─── App ───────────────────────────────────────────────────── */
+/* ─── GPU BIAS MONITOR panel ────────────────────────────────── */
+function GpuBiasPanel({ stats }) {
+  const gpuBias   = stats?.gpu_bias   ?? {}
+  const gpuModel  = stats?.gpu_model  ?? '—'
+  const entries   = Object.entries(gpuBias)
+  const hasData   = entries.length > 0
+
+  // Flatten to per-GPU summary rows for the top-level table
+  const gpuRows = entries.map(([gpu, info]) => ({
+    gpu,
+    n:      info.n_total ?? 0,
+    // aggregate bias: weighted mean of family bias factors that are non-null
+    bias:   (() => {
+      const active = (info.families ?? []).filter(f => f.bias_factor != null)
+      if (!active.length) return null
+      const sum = active.reduce((s, f) => s + f.bias_factor * f.n, 0)
+      const tot = active.reduce((s, f) => s + f.n, 0)
+      return tot > 0 ? sum / tot : null
+    })(),
+    families: info.families ?? [],
+  }))
+
+  return (
+    <Panel accent={T.purple} style={{ gridColumn:'1 / -1' }}>
+      <div style={S.panelBar(T.purple)} />
+      <div style={S.panelTitle}>
+        <span style={S.titleAccent(T.purple)}>◈</span>
+        <span>GPU BIAS MONITOR</span>
+        <span style={{ marginLeft:'auto', color:T.textDim, fontSize:'10px', letterSpacing:'0.12em' }}>
+          ACTIVE GPU: <span style={{ color:T.purple, textShadow:glow(T.purple,2) }}>{gpuModel}</span>
+        </span>
+      </div>
+
+      {!hasData ? (
+        <div style={{ color:T.textDim, fontSize:'11px', fontFamily:T.mono }}>
+          Collecting samples… bias model activates after {10} rescorings per GPU · target family <Cursor />
+        </div>
+      ) : (
+        gpuRows.map(({ gpu, n, bias, families }) => {
+          const hasModel = bias != null
+          const biasPct  = hasModel ? (bias * 100).toFixed(1) + '%' : '(learning)'
+          const tolLabel = hasModel ? '35%' : '77.77%'
+          const dotColor = hasModel ? T.green : T.amber
+          return (
+            <div key={gpu} style={{ marginBottom:'14px' }}>
+              {/* GPU header row */}
+              <div style={{
+                display:'flex', alignItems:'center', gap:'10px',
+                padding:'6px 0', borderBottom:`1px solid ${T.purple}33`,
+                fontSize:'11px', fontFamily:T.mono,
+              }}>
+                <div style={{ width:'8px', height:'8px', borderRadius:'50%',
+                              background:dotColor, boxShadow:glow(dotColor,3), flexShrink:0 }} />
+                <span style={{ color:T.purple, fontWeight:700, textShadow:glow(T.purple,2), minWidth:'120px' }}>
+                  {gpu}
+                </span>
+                <span style={{ color:T.textDim, fontSize:'10px' }}>
+                  n=<span style={{ color:T.cyan }}>{n}</span>
+                </span>
+                <span style={{ color:T.textDim, fontSize:'10px' }}>
+                  · bias=<span style={{ color: hasModel ? T.green : T.amber }}>{biasPct}</span>
+                </span>
+                <span style={{ color:T.textDim, fontSize:'10px' }}>
+                  · tolerance=<span style={{ color: hasModel ? T.green : T.amber }}>{tolLabel}</span>
+                </span>
+                <span style={{ marginLeft:'auto', ...S.pill(hasModel ? T.green : T.amber) }}>
+                  {hasModel ? 'MODEL ACTIVE' : 'LEARNING'}
+                </span>
+              </div>
+
+              {/* Per-family breakdown (collapsed if empty) */}
+              {families.length > 0 && (
+                <div style={{
+                  display:'grid',
+                  gridTemplateColumns:'repeat(auto-fill,minmax(220px,1fr))',
+                  gap:'6px', paddingTop:'6px',
+                }}>
+                  {families.map(f => {
+                    const fHasModel = f.bias_factor != null
+                    const fc = fHasModel ? T.green : T.textDim
+                    return (
+                      <div key={f.family} style={{
+                        background:'#010603',
+                        border:`1px solid ${T.purple}22`,
+                        padding:'5px 8px',
+                        fontSize:'10px', fontFamily:T.mono,
+                        display:'flex', gap:'6px', alignItems:'center',
+                      }}>
+                        <span style={{ color:T.purple, minWidth:'38px' }}>{f.family}</span>
+                        <span style={{ color:T.textDim }}>n=</span>
+                        <span style={{ color:T.cyan }}>{f.n}</span>
+                        {fHasModel && (
+                          <>
+                            <span style={{ color:T.textDim }}>·</span>
+                            <span style={{ color:fc }}>bias={f.bias_factor?.toFixed(4)}</span>
+                          </>
+                        )}
+                        {!fHasModel && (
+                          <span style={{ color:T.amber, fontSize:'9px' }}>({10-f.n} more needed)</span>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )
+        })
+      )}
+    </Panel>
+  )
+}
+
+
 export default function App() {
   const [stats, setStats] = useState(null)
   const [log,   setLog]   = useState([])
@@ -717,6 +830,15 @@ export default function App() {
 
             {/* Audit log — full width */}
             <AuditPanel log={log} />
+
+            {/* Section: GPU bias */}
+            <div style={S.sectionLabel}>
+              <div style={S.sectionTick} />
+              GPU BIAS // FINGERPRINT CORRECTION MODEL
+            </div>
+
+            {/* GPU Bias Monitor — full width */}
+            <GpuBiasPanel stats={stats} />
 
           </div>
 

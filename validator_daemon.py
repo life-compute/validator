@@ -70,6 +70,11 @@ _DIFFUSION_SAMPLES_AFF = 1
 
 BOLTZ_SEED = 68  # must match miner BOLTZ_SEED; used for reproducible Boltz2 rescoring
 VALIDATION_TOLERANCE = 0.7777  # DEVNET TESTING TOLERANCE — tighten for mainnet
+TIGHTENED_TOLERANCE  = 0.35   # used when GPU bias model exists (≥10 samples)
+GPU_BIAS_PATH = WORK_DIR / "output" / "gpu_bias_models.json"
+
+# Minimum samples per GPU·target-family before bias model activates
+GPU_BIAS_MIN_SAMPLES = 10
 
 # ── Anchor / JS paths ─────────────────────────────────────────────────────────
 ANCHOR_DIR  = Path(_env("ANCHOR_DIR", "/tmp/life-compute/core"))
@@ -260,6 +265,185 @@ def _load_seen_from_audit() -> None:
                     pass
     except Exception:
         pass
+
+
+# ── GPU detection ─────────────────────────────────────────────────────────────
+
+def detect_gpu_model() -> str:
+    """
+    Query nvidia-smi for the GPU name and normalise to short form.
+    e.g. "NVIDIA GeForce RTX 5060" → "RTX 5060"
+    Falls back to MINER_GPU_MODEL env var, then "UNKNOWN".
+    Also writes MINER_GPU_MODEL to .env so the miner picks it up at next start.
+    """
+    # 1. Try env override first
+    env_val = _env("MINER_GPU_MODEL", "")
+    if env_val:
+        log.info(f"GPU model from env: {env_val}")
+        return env_val
+
+    # 2. Query nvidia-smi
+    gpu_name = ""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            raw = result.stdout.strip().splitlines()[0].strip()
+            # Normalise: strip known prefixes
+            for prefix in ("NVIDIA GeForce ", "NVIDIA ", "GeForce "):
+                if raw.startswith(prefix):
+                    raw = raw[len(prefix):]
+            gpu_name = raw
+    except Exception as e:
+        log.warning(f"nvidia-smi query failed: {e}")
+
+    if not gpu_name:
+        gpu_name = "UNKNOWN"
+
+    log.info(f"GPU model detected: {gpu_name}")
+
+    # 3. Persist to .env so miner uses it too
+    _write_gpu_to_env(gpu_name)
+    return gpu_name
+
+
+def _write_gpu_to_env(gpu_model: str) -> None:
+    """Write/update MINER_GPU_MODEL=... in the local .env file."""
+    env_path = WORK_DIR / ".env"
+    try:
+        lines = env_path.read_text().splitlines() if env_path.exists() else []
+        updated = False
+        for i, line in enumerate(lines):
+            if line.startswith("MINER_GPU_MODEL="):
+                lines[i] = f"MINER_GPU_MODEL={gpu_model}"
+                updated = True
+                break
+        if not updated:
+            lines.append(f"MINER_GPU_MODEL={gpu_model}")
+        env_path.write_text("\n".join(lines) + "\n")
+        log.debug(f"MINER_GPU_MODEL={gpu_model} written to .env")
+    except Exception as e:
+        log.warning(f"Could not write MINER_GPU_MODEL to .env: {e}")
+
+
+# ── GPU Bias Tracker ──────────────────────────────────────────────────────────
+
+def _target_family(target_name: str) -> str:
+    """Return a short target-family key (first 4 uppercase chars of the name)."""
+    return (target_name.upper()[:4]) if target_name else "UNKN"
+
+
+class GpuBiasTracker:
+    """
+    Per-GPU, per-target-family bias correction model.
+
+    JSON structure on disk:
+    {
+      "RTX 5060": {
+        "EGFR": {"n": 12, "samples": [1.02, 0.98, ...], "bias_factor": 1.00},
+        ...
+      },
+      ...
+    }
+
+    Usage:
+        tracker = GpuBiasTracker()
+        tracker.record("RTX 5060", "EGFR", claimed=-3.1, rescored=-3.2)
+        factor = tracker.get_bias_factor("RTX 5060", "EGFR")   # None if <10 samples
+        summary = tracker.summary()   # for stats.json
+    """
+
+    def __init__(self):
+        self._data: dict = {}
+        self._load()
+
+    def _load(self):
+        try:
+            if GPU_BIAS_PATH.exists():
+                self._data = json.loads(GPU_BIAS_PATH.read_text())
+                log.info(
+                    f"GPU bias model loaded: "
+                    f"{sum(len(v) for v in self._data.values())} GPU·family pairs"
+                )
+        except Exception as e:
+            log.warning(f"Could not load gpu_bias_models.json: {e}")
+            self._data = {}
+
+    def _save(self):
+        try:
+            GPU_BIAS_PATH.parent.mkdir(exist_ok=True)
+            tmp = GPU_BIAS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._data, indent=2))
+            tmp.replace(GPU_BIAS_PATH)
+        except Exception as e:
+            log.warning(f"Could not save gpu_bias_models.json: {e}")
+
+    def record(self, gpu_model: str, family: str,
+               claimed: float, rescored: float) -> None:
+        """Record a rescoring observation for bias learning."""
+        if not gpu_model or gpu_model == "UNKNOWN":
+            return
+        if claimed == 0.0:
+            return   # avoid division by zero in ratio
+        ratio = rescored / claimed
+        gpu_entry = self._data.setdefault(gpu_model, {})
+        fam_entry = gpu_entry.setdefault(family, {"n": 0, "samples": [], "bias_factor": None})
+        fam_entry["samples"].append(round(ratio, 6))
+        fam_entry["n"] = len(fam_entry["samples"])
+        # Rebuild bias factor whenever we have enough samples
+        if fam_entry["n"] >= GPU_BIAS_MIN_SAMPLES:
+            fam_entry["bias_factor"] = round(
+                sum(fam_entry["samples"]) / fam_entry["n"], 6
+            )
+        log.debug(
+            f"[GPU-BIAS] record gpu={gpu_model} family={family} "
+            f"ratio={ratio:.4f} n={fam_entry['n']} "
+            f"bias={fam_entry['bias_factor']}"
+        )
+        self._save()
+
+    def get_bias_factor(self, gpu_model: str, family: str) -> float | None:
+        """
+        Return bias_factor if ≥ GPU_BIAS_MIN_SAMPLES collected, else None.
+        """
+        try:
+            return self._data[gpu_model][family]["bias_factor"]
+        except KeyError:
+            return None
+
+    def get_n(self, gpu_model: str, family: str) -> int:
+        """Return sample count for this GPU·family pair."""
+        try:
+            return self._data[gpu_model][family]["n"]
+        except KeyError:
+            return 0
+
+    def summary(self) -> dict:
+        """
+        Return a dict suitable for stats.json GPU_BIAS section.
+        {gpu_model: {n_total, families: [{family, n, bias_factor, tolerance}]}}
+        """
+        out = {}
+        for gpu, families in self._data.items():
+            total_n = sum(v["n"] for v in families.values())
+            fam_list = []
+            for fam, v in sorted(families.items()):
+                bf = v["bias_factor"]
+                fam_list.append({
+                    "family":      fam,
+                    "n":           v["n"],
+                    "bias_factor": round(bf, 4) if bf is not None else None,
+                    "tolerance":   TIGHTENED_TOLERANCE if bf is not None else VALIDATION_TOLERANCE,
+                })
+            out[gpu] = {"n_total": total_n, "families": fam_list}
+        return out
+
+
+# Module-level singleton (initialised in main())
+_gpu_bias_tracker: GpuBiasTracker | None = None
+_miner_gpu_model: str = "UNKNOWN"
 
 
 # ── Boltz2 scoring — self-contained, no nova/miner dependencies ───────────────
@@ -649,7 +833,7 @@ def fetch_network_validator_info() -> dict:
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
-    global _VALIDATOR_PUBKEY
+    global _VALIDATOR_PUBKEY, _gpu_bias_tracker, _miner_gpu_model
     print("\033[96m    L I F E  C O M P U T E  —  V A L I D A T O R  \033[0m\n")
 
     # Load validator pubkey once at startup (used for self-validation checks)
@@ -658,6 +842,12 @@ def main():
         log.info(f"Validator pubkey: {_VALIDATOR_PUBKEY[:16]}…")
     else:
         log.warning("Self-validation check DISABLED (keypair unreadable)")
+
+    # Detect GPU model at startup — written to .env for miner reuse
+    _miner_gpu_model = detect_gpu_model()
+
+    # Initialise GPU bias tracker (loads existing model from disk)
+    _gpu_bias_tracker = GpuBiasTracker()
 
     targets_by_id: dict[int, dict] = {}
     last_refresh    = 0.0
@@ -689,6 +879,8 @@ def main():
         "self_reputation_pct":  100.0,
         "started_at":      datetime.now(timezone.utc).isoformat(),
         "last_updated":    "",
+        "gpu_model":       _miner_gpu_model,
+        "gpu_bias":        {},
     }
     write_stats(stats)
 
@@ -864,13 +1056,46 @@ def main():
                 })
                 continue
 
-            # Step 3: Tolerance check (mirrors constants.rs)
-            if claimed != 0.0:
-                rel_err = abs(rescored - claimed) / abs(claimed)
+            # Step 3: GPU-bias corrected tolerance check
+            # ── Determine target family for bias lookup ─────────────────────────
+            target_name   = target.get("id") or str(target_id_int)
+            family        = _target_family(target_name)
+
+            # ── Look up bias factor for this miner's GPU + target family ────────
+            bias_factor = None
+            if _gpu_bias_tracker is not None:
+                bias_factor = _gpu_bias_tracker.get_bias_factor(_miner_gpu_model, family)
+
+            if bias_factor is not None:
+                # Apply GPU-specific correction to the claimed score
+                adjusted_claimed = claimed * bias_factor
+                tol = TIGHTENED_TOLERANCE
+                if adjusted_claimed != 0.0:
+                    rel_err = abs(rescored - adjusted_claimed) / abs(adjusted_claimed)
+                else:
+                    rel_err = abs(rescored)
+                within_tol = rel_err <= tol
+                verdict    = "CONFIRM" if within_tol else "REJECT"
+                log.info(
+                    f"  [GPU-BIAS] {_miner_gpu_model} correction factor {bias_factor:.4f} applied"
+                    f" → adjusted {adjusted_claimed:.3f}"
+                    f" → tolerance check {'passed' if within_tol else 'failed'}"
+                    f"  (tol={tol:.4f})"
+                )
             else:
-                rel_err = abs(rescored)
-            within_tol = rel_err <= VALIDATION_TOLERANCE
-            verdict    = "CONFIRM" if within_tol else "REJECT"
+                # No bias model yet — use default tolerance on raw claimed value
+                adjusted_claimed = claimed
+                tol = VALIDATION_TOLERANCE
+                if claimed != 0.0:
+                    rel_err = abs(rescored - claimed) / abs(claimed)
+                else:
+                    rel_err = abs(rescored)
+                within_tol = rel_err <= tol
+                verdict    = "CONFIRM" if within_tol else "REJECT"
+
+            # ── Record this rescoring for future bias learning ──────────────────
+            if _gpu_bias_tracker is not None and _miner_gpu_model != "UNKNOWN":
+                _gpu_bias_tracker.record(_miner_gpu_model, family, claimed, rescored)
 
             log.info(f"  {verdict}  claimed={claimed:.3f}  rescored={rescored:.3f}  "
                      f"rel_err={rel_err:.3f}  ({elapsed:.1f}s)")
@@ -919,10 +1144,14 @@ def main():
                 "ts":               datetime.now(timezone.utc).isoformat(),
                 "submission_pubkey": pubkey,
                 "miner_wallet":     miner_wallet,
+                "miner_gpu":        _miner_gpu_model,
                 "claimed_score":    claimed,
+                "adjusted_claimed": round(adjusted_claimed, 4),
+                "bias_factor":      round(bias_factor, 4) if bias_factor is not None else None,
                 "rescored":         rescored,
                 "decision":         verdict,
                 "rel_err":          round(rel_err, 4),
+                "tolerance_used":   round(tol, 4),
                 "difficulty_tier":  difficulty,
                 "life_earned":      tier_reward if (within_tol and tx) else 0,
             })
@@ -954,6 +1183,8 @@ def main():
                 "current_target":  None,
                 "current_smiles":  None,
                 "last_updated":    datetime.now(timezone.utc).isoformat(),
+                "gpu_model":       _miner_gpu_model,
+                "gpu_bias":        _gpu_bias_tracker.summary() if _gpu_bias_tracker else {},
             })
             write_stats(stats)
 
@@ -972,6 +1203,8 @@ def main():
             "active_validators":   net_info.get("active_validators", 0),
             "self_reputation_pct": round(net_info.get("self_reputation_bps", 10000) / 100, 1),
             "last_updated":    datetime.now(timezone.utc).isoformat(),
+            "gpu_model":       _miner_gpu_model,
+            "gpu_bias":        _gpu_bias_tracker.summary() if _gpu_bias_tracker else {},
         })
         write_stats(stats)
         log.info(f"Validated={validated_today}  Accept={accept_rate}%  $LIFE={life_earned:.1f}  Validators={net_info.get('active_validators',0)}")
