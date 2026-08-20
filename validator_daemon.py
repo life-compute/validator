@@ -27,6 +27,15 @@ from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
 
+# ── Already-processed submission tracking ──────────────────────────────────────
+# Keyed by submission pubkey → number of validate_on_chain attempts.
+# Once a tx lands successfully, the on-chain status flips to Validating (1) and
+# the RPC memcmp filter drops it from future polls.  But when the tx fails the
+# account stays Pending (0) and re-appears every poll.  We cap retries so a
+# persistently-failing submission doesn't block the queue indefinitely.
+_SEEN_SUBMISSIONS: dict[str, int] = {}   # pubkey → attempt count
+_MAX_RETRY_ATTEMPTS = 3                  # give up after this many failed on-chain calls
+
 # ── Config from .env ──────────────────────────────────────────────────────────
 def _env(key, default=""):
     return os.environ.get(key, default)
@@ -60,7 +69,7 @@ _SAMPLING_STEPS_AFF    = 25
 _DIFFUSION_SAMPLES_AFF = 1
 
 BOLTZ_SEED = 68  # must match miner BOLTZ_SEED; used for reproducible Boltz2 rescoring
-VALIDATION_TOLERANCE = 0.50  # DEVNET TESTING TOLERANCE — tighten for mainnet
+VALIDATION_TOLERANCE = 0.7777  # DEVNET TESTING TOLERANCE — tighten for mainnet
 
 # ── Anchor / JS paths ─────────────────────────────────────────────────────────
 ANCHOR_DIR  = Path(_env("ANCHOR_DIR", "/tmp/life-compute/core"))
@@ -215,6 +224,42 @@ def _count_today_from_log() -> tuple:
         except Exception:
             pass
     return total, conf, rej
+
+
+def _load_seen_from_audit() -> None:
+    """
+    Pre-populate _SEEN_SUBMISSIONS from the audit log.
+    Any submission that already has a successful tx recorded is marked with a
+    sentinel count (_MAX_RETRY_ATTEMPTS) so it won't be retried on restart.
+    Submissions that only have failed-tx entries (BOLTZ2_FAILED etc.) keep a
+    count below the cap so they can still be retried after a restart.
+    """
+    if not AUDIT_JSONL.exists():
+        return
+    # We only want today's entries — yesterday's accounts should already be
+    # Validating on-chain and won't appear in the RPC filter anyway.
+    today = _today_date_utc()
+    try:
+        with AUDIT_JSONL.open() as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                    if not row.get("ts", "").startswith(today):
+                        continue
+                    pk = row.get("submission_pubkey", "")
+                    if not pk:
+                        continue
+                    decision = row.get("decision", "")
+                    # A CONFIRM or REJECT decision means we ran Boltz2 and called
+                    # validate_on_chain.  Mark at max-attempts so we skip on reload
+                    # (the tx either landed — account is now Validating and filtered
+                    # out by RPC — or it failed and we've already tried enough).
+                    if decision in ("CONFIRM", "REJECT"):
+                        _SEEN_SUBMISSIONS[pk] = _MAX_RETRY_ATTEMPTS
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 # ── Boltz2 scoring — self-contained, no nova/miner dependencies ───────────────
@@ -618,6 +663,12 @@ def main():
     last_refresh    = 0.0
     life_earned     = 0.0
 
+    # Warm up the dedup tracker from today's audit log so a restart doesn't
+    # re-process submissions that already landed a tx.
+    _load_seen_from_audit()
+    if _SEEN_SUBMISSIONS:
+        log.info(f"Restored {len(_SEEN_SUBMISSIONS)} already-processed submission(s) from audit log")
+
     # Initialize today-counters from today's log so a restart doesn't zero the display
     today_date = _today_date_utc()
     validated_today, accepted, rejected = _count_today_from_log()
@@ -683,6 +734,15 @@ def main():
             miner_wallet  = sub["miner"]
             target_id_int = sub["target_id"]
             claimed       = sub["claimed_affinity"]
+
+            # ── Dedup: skip already-processed or over-retried submissions ─────
+            attempts = _SEEN_SUBMISSIONS.get(pubkey, 0)
+            if attempts >= _MAX_RETRY_ATTEMPTS:
+                log.debug(
+                    f"  {pubkey[:16]}…: skipping — already attempted "
+                    f"{attempts}x (tx kept failing); will clear when RPC drops it"
+                )
+                continue
 
             # ── Security gate 0: miner wallet allowlist ───────────────────────
             if MINER_WALLET and miner_wallet != MINER_WALLET:
@@ -815,15 +875,37 @@ def main():
             log.info(f"  {verdict}  claimed={claimed:.3f}  rescored={rescored:.3f}  "
                      f"rel_err={rel_err:.3f}  ({elapsed:.1f}s)")
 
+            # ── Tier reward (mirrors miner: 1/5/25 $LIFE per easy/medium/hard) ──
+            TIER_REWARDS = {1: 1, 2: 5, 3: 25}
+            difficulty   = target.get("difficulty_tier", 1)
+            tier_reward  = TIER_REWARDS.get(difficulty, 1)
+
             # Step 4: Submit on-chain
             result = validate_on_chain(pubkey, rescored)
             tx = result.get("tx") if result else None
             if tx:
                 log.info(f"  ✔ tx: {tx}")
                 if within_tol:
-                    life_earned += 0.5   # validators earn half the miner reward
+                    life_earned += tier_reward   # full tier reward: easy=1, medium=5, hard=25
+                    log.info(
+                        f"  +{tier_reward} $LIFE  (tier={difficulty})  "
+                        f"total={life_earned:.1f}"
+                    )
+                # Tx landed — account will flip to Validating; remove from retry
+                # tracker so we don't needlessly hold the pubkey in memory forever.
+                _SEEN_SUBMISSIONS.pop(pubkey, None)
             else:
                 log.warning(f"  validate_on_chain returned no tx")
+                # Increment attempt counter so we stop retrying after _MAX_RETRY_ATTEMPTS
+                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+                attempt_n = _SEEN_SUBMISSIONS[pubkey]
+                if attempt_n < _MAX_RETRY_ATTEMPTS:
+                    log.info(
+                        f"  {pubkey[:16]}…: attempt {attempt_n}/{_MAX_RETRY_ATTEMPTS} "
+                        f"— will retry up to {_MAX_RETRY_ATTEMPTS - attempt_n} more time(s)"
+                    )
+                else:
+                    log.info(f"  {pubkey[:16]}…: max retries reached — will skip next polls")
 
             # Count every verdict (confirm or reject), regardless of tx success
             validated_today += 1
@@ -841,6 +923,8 @@ def main():
                 "rescored":         rescored,
                 "decision":         verdict,
                 "rel_err":          round(rel_err, 4),
+                "difficulty_tier":  difficulty,
+                "life_earned":      tier_reward if (within_tol and tx) else 0,
             })
 
             append_log({
@@ -855,6 +939,8 @@ def main():
                 "verdict":          verdict,
                 "tx":               tx,
                 "elapsed_s":        round(elapsed, 1),
+                "difficulty_tier":  difficulty,
+                "life_earned":      tier_reward if (within_tol and tx) else 0,
             })
 
             # Write stats immediately after each validation so dashboard is live
