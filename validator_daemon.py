@@ -331,8 +331,42 @@ def _write_gpu_to_env(gpu_model: str) -> None:
 # ── GPU Bias Tracker ──────────────────────────────────────────────────────────
 
 def _target_family(target_name: str) -> str:
-    """Return a short target-family key (first 4 uppercase chars of the name)."""
-    return (target_name.upper()[:4]) if target_name else "UNKN"
+    """Return a short target-family key.
+    mRNA targets get the 'mRNA_' prefix family so the GPU bias tracker
+    keeps their learning separated from protein targets with the same gene name.
+    Protein targets use the first 4 uppercase chars as before.
+
+    Handles both naming conventions:
+      - mRNA_ prefix:  mRNA_KRAS → "mRNA_KRAS"
+      - _mRNA suffix:  KRAS_mRNA → "mRNA_KRAS"
+    """
+    if not target_name:
+        return "UNKN"
+    if target_name.startswith("mRNA_"):
+        return "mRNA_" + target_name[5:].upper()[:4]
+    if target_name.endswith("_mRNA"):
+        return "mRNA_" + target_name[:-5].upper()[:4]
+    return target_name.upper()[:4]
+
+
+def _is_mrna_target(target: dict) -> bool:
+    """Return True if this target is an mRNA target.
+
+    Detects either:
+      - target_type == "mRNA" field (used by life-compute/targets _mRNA suffix convention)
+      - id starts with "mRNA_"
+      - id ends with "_mRNA"
+      - scoring_metric starts with "rna_"
+    """
+    if target.get("target_type") == "mRNA":
+        return True
+    tid = str(target.get("id", ""))
+    if tid.startswith("mRNA_") or tid.endswith("_mRNA"):
+        return True
+    metric = str(target.get("scoring_metric", ""))
+    if metric.startswith("rna_"):
+        return True
+    return False
 
 
 class GpuBiasTracker:
@@ -479,16 +513,28 @@ def _sequence_from_msa(msa_path: str) -> str | None:
 
 
 def _write_boltz_input(in_dir: Path, target_id: str, sequence: str,
-                        smiles: str, mol_id: int, msa_path: str) -> None:
+                        smiles: str, mol_id: int, msa_path: str,
+                        rna_mode: bool = False) -> None:
     import yaml
-    data = {
-        "version": 1,
-        "sequences": [
-            {"protein": {"id": "A", "sequence": sequence, "msa": msa_path}},
-            {"ligand":  {"id": "B", "smiles": smiles}},
-        ],
-        "properties": [{"affinity": {"binder": "B"}}],
-    }
+    if rna_mode:
+        # RNA sequence mode — use Boltz2 RNA chain type; no MSA required
+        data = {
+            "version": 1,
+            "sequences": [
+                {"rna": {"id": "A", "sequence": sequence}},
+                {"ligand": {"id": "B", "smiles": smiles}},
+            ],
+            "properties": [{"affinity": {"binder": "B"}}],
+        }
+    else:
+        data = {
+            "version": 1,
+            "sequences": [
+                {"protein": {"id": "A", "sequence": sequence, "msa": msa_path}},
+                {"ligand":  {"id": "B", "smiles": smiles}},
+            ],
+            "properties": [{"affinity": {"binder": "B"}}],
+        }
     (in_dir / f"{mol_id}_{target_id}.yaml").write_text(
         yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
     )
@@ -534,6 +580,11 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
     """
     Re-score a SMILES via Boltz2. Returns affinity in kcal/mol or None.
 
+    For protein targets: uses protein sequence + MSA (existing behaviour).
+    For mRNA targets (id starts with mRNA_): uses RNA sequence mode — the
+    `rna_sequence` field from the target dict is passed as an RNA chain to
+    Boltz2 instead of a protein chain; no MSA is required or used.
+
     Security measures applied inside:
       - Unique UUID temp directory per call, chmod 700 (process-private).
       - SHA256 SMILES hash written before Boltz2 runs; re-read from YAML
@@ -546,10 +597,23 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
     import yaml
     from boltz.main import predict
 
-    uniprot   = target["uniprot_id"]
     target_id = target["id"]
-    msa_path  = _msa_path_for(uniprot)
-    sequence  = _sequence_from_msa(msa_path) or target["protein_sequence"]
+    is_mrna   = _is_mrna_target(target)
+
+    if is_mrna:
+        # ── RNA mode ─────────────────────────────────────────────────────────
+        rna_seq = target.get("rna_sequence", "")
+        if not rna_seq:
+            log.warning(f"  mRNA target {target_id} missing rna_sequence — skip")
+            return None
+        sequence = rna_seq
+        msa_path = "empty"   # not used in RNA mode
+        log.info(f"  [RNA-MODE] mRNA target {target_id} ({target.get('mrna_region','RNA')}) — {len(rna_seq)} nt")
+    else:
+        # ── Protein mode (existing behaviour) ────────────────────────────────
+        uniprot  = target["uniprot_id"]
+        msa_path = _msa_path_for(uniprot)
+        sequence = _sequence_from_msa(msa_path) or target["protein_sequence"]
 
     ha = _heavy_atom_count(smiles)
     if ha == 0:
@@ -571,9 +635,10 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
         # ── Compute SMILES integrity hash before write ────────────────────────
         smiles_hash_expected = hashlib.sha256(smiles.encode()).hexdigest()
 
-        # ── Write Boltz2 YAML input ───────────────────────────────────────────
+        # ── Write Boltz2 YAML input (RNA or protein mode) ─────────────────────
         yaml_path = in_dir / f"{mol_id}_{target_id}.yaml"
-        _write_boltz_input(in_dir, target_id, sequence, smiles, mol_id, msa_path)
+        _write_boltz_input(in_dir, target_id, sequence, smiles, mol_id, msa_path,
+                           rna_mode=is_mrna)
 
         # ── Re-read YAML and verify SMILES hash (injection prevention) ────────
         try:
@@ -1032,6 +1097,13 @@ def main():
             log.info(f"  Validating {pubkey[:16]}…  target={target.get('id','?')}  "
                      f"claimed={claimed:.3f}  smiles={smiles[:40]}")
 
+            # ── mRNA target: enforce tier 3 regardless of what the on-chain record says
+            is_mrna = _is_mrna_target(target)
+            if is_mrna and target.get("difficulty_tier") != 3:
+                # Safety override — all mRNA_ targets are hard (25 $LIFE commission)
+                target = dict(target)
+                target["difficulty_tier"] = 3
+
             # Expose current work to dashboard
             stats["current_target"] = target.get("id") or str(target_id_int)
             stats["current_smiles"] = smiles
@@ -1153,6 +1225,7 @@ def main():
                 "rel_err":          round(rel_err, 4),
                 "tolerance_used":   round(tol, 4),
                 "difficulty_tier":  difficulty,
+                "target_type":      "RNA" if is_mrna else "PROTEIN",
                 "life_earned":      tier_reward if (within_tol and tx) else 0,
             })
 
@@ -1169,6 +1242,7 @@ def main():
                 "tx":               tx,
                 "elapsed_s":        round(elapsed, 1),
                 "difficulty_tier":  difficulty,
+                "target_type":      "RNA" if is_mrna else "PROTEIN",
                 "life_earned":      tier_reward if (within_tol and tx) else 0,
             })
 

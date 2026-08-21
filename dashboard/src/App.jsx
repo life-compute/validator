@@ -347,13 +347,22 @@ function DNAHelix() {
   )
 }
 
-// Target ID → gene name (indices 0-29 match life-compute/targets targets.json)
+// Target ID → gene name (indices 0-59 match life-compute/targets targets.json)
+// Indices 0-29: protein targets; indices 30-59: mRNA targets (GENE_mRNA suffix)
 const TARGET_NAMES = [
   'TP53','BRCA1','EGFR','HER2','KRAS','BCL2','CDK4','VEGFR2','PDL1','MDM2',
   'BRAF','PTEN','MYC','STAT3','PIK3CA','MTOR','FGFR1','RET','AR','NTRK1',
   'IDH1','FLT3','SMAD4','APC','PARP1','JAK2','ESR1','HDAC1','HDAC2','ABL1',
+  'MYC_mRNA','KRAS_mRNA','BCL2_mRNA','EGFR_mRNA','HER2_mRNA','BRAF_mRNA',
+  'MDM2_mRNA','CDK4_mRNA','CCND1_mRNA','SURVIVIN_mRNA','PDL1_mRNA','VEGF_mRNA',
+  'HIF1A_mRNA','IL6_mRNA','TNF_mRNA','TGFb1_mRNA','CSF1R_mRNA','CCL2_mRNA',
+  'CXCL12_mRNA','MMP9_mRNA','LDHA_mRNA','PKM2_mRNA','GLUT1_mRNA','HK2_mRNA',
+  'FASN_mRNA','TERT_mRNA','PARP1_mRNA','RAD51_mRNA','BRCA2_mRNA','ATM_mRNA',
 ]
 const targetName = (id) => TARGET_NAMES[id] ?? (id != null ? String(id) : '—')
+// Detect mRNA targets: _mRNA suffix, mRNA_ prefix, or log entry has target_type=RNA
+const isRnaTarget = (name) =>
+  typeof name === 'string' && (name.endsWith('_mRNA') || name.startsWith('mRNA_'))
 
 // Parse ts field — daemon writes ISO strings, not unix epoch
 const parseTs = (ts) => {
@@ -500,6 +509,8 @@ function ScoringFeedPanel({ log }) {
         const delta = r.claimed != null && r.rescored != null
           ? ((r.rescored - r.claimed) / Math.abs(r.claimed || 1) * 100).toFixed(1) + '%'
           : '—'
+        const tName = targetName(r.target_id)
+        const rna   = r.target_type === 'RNA' || isRnaTarget(tName)
         return (
           <div key={i} style={{ display:'grid', gridTemplateColumns:cols, gap:'8px',
                                 padding:'5px 0', borderBottom:`1px solid ${T.muted}`,
@@ -508,7 +519,17 @@ function ScoringFeedPanel({ log }) {
             <span style={{ color:vc, fontWeight:700, textShadow:glow(vc,1) }}>
               {r.verdict ?? (ok ? '✔ CONF' : '✘ REJ')}
             </span>
-            <span style={{ color:T.cyan }}>{targetName(r.target_id)}</span>
+            <span style={{ color:T.cyan, display:'flex', alignItems:'center', gap:'4px' }}>
+              {tName}
+              {rna && (
+                <span style={{
+                  fontSize:'8px', padding:'1px 4px', borderRadius:'2px',
+                  background:'#00ffff18', border:`1px solid ${T.cyan}44`,
+                  color:T.cyan, letterSpacing:'0.08em', lineHeight:'1.2',
+                  flexShrink:0,
+                }}>RNA</span>
+              )}
+            </span>
             <span style={{ color:T.textDim, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
               {(r.smiles ?? '').slice(0,40)}
             </span>
@@ -543,6 +564,8 @@ function AuditPanel({ log }) {
         const ok = r.within_tolerance || r.verdict === 'CONFIRMED'
         const vc = ok ? T.green : T.red
         const ts = parseTs(r.ts)
+        const tName = targetName(r.target_id)
+        const rna   = r.target_type === 'RNA' || isRnaTarget(tName)
         return (
           <div key={i} style={{ display:'flex', gap:'12px', alignItems:'center',
                                 padding:'5px 0', borderBottom:`1px solid ${T.muted}`,
@@ -551,7 +574,17 @@ function AuditPanel({ log }) {
             <span style={{ color:vc, fontWeight:700, textShadow:glow(vc,1), width:80, flexShrink:0 }}>
               {r.verdict ?? (ok ? 'CONFIRMED' : 'REJECTED')}
             </span>
-            <span style={{ color:T.green, width:60, flexShrink:0 }}>{targetName(r.target_id)}</span>
+            <span style={{ color:T.green, display:'flex', alignItems:'center', gap:'4px', width:80, flexShrink:0 }}>
+              {tName}
+              {rna && (
+                <span style={{
+                  fontSize:'8px', padding:'1px 4px', borderRadius:'2px',
+                  background:'#00ffff18', border:`1px solid ${T.cyan}44`,
+                  color:T.cyan, letterSpacing:'0.08em', lineHeight:'1.2',
+                  flexShrink:0,
+                }}>RNA</span>
+              )}
+            </span>
             <span style={{ color:T.textDim, flex:1, overflow:'hidden',
                            textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
               {r.smiles ?? '—'}
@@ -766,7 +799,7 @@ export default function App() {
 
               {/* Subtitle */}
               <div style={S.subtitle}>
-                SECURING CANCER DRUG DISCOVERY · BOLTZ2 RESCORING · SOLANA BLOCKCHAIN
+                SECURING CANCER DRUG DISCOVERY · BOLTZ2 RESCORING · RNA TARGETS · SOLANA BLOCKCHAIN
               </div>
             </div>
 
