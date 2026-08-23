@@ -236,8 +236,8 @@ def _load_seen_from_audit() -> None:
     Pre-populate _SEEN_SUBMISSIONS from the audit log.
     Any submission that already has a successful tx recorded is marked with a
     sentinel count (_MAX_RETRY_ATTEMPTS) so it won't be retried on restart.
-    Submissions that only have failed-tx entries (BOLTZ2_FAILED etc.) keep a
-    count below the cap so they can still be retried after a restart.
+    Submissions that only have BOLTZ2_FAILED entries also accumulate their
+    attempt count so they are not retried indefinitely after a restart.
     """
     if not AUDIT_JSONL.exists():
         return
@@ -261,6 +261,14 @@ def _load_seen_from_audit() -> None:
                     # out by RPC — or it failed and we've already tried enough).
                     if decision in ("CONFIRM", "REJECT"):
                         _SEEN_SUBMISSIONS[pk] = _MAX_RETRY_ATTEMPTS
+                    # BOLTZ2_FAILED: count each occurrence so the cap is preserved
+                    # across restarts, preventing repeated GPU waste on permanently-
+                    # failing submissions (e.g. siRNA sequences on protein targets).
+                    elif decision == "BOLTZ2_FAILED":
+                        _SEEN_SUBMISSIONS[pk] = min(
+                            _SEEN_SUBMISSIONS.get(pk, 0) + 1,
+                            _MAX_RETRY_ATTEMPTS,
+                        )
                 except Exception:
                     pass
     except Exception:
@@ -367,6 +375,244 @@ def _is_mrna_target(target: dict) -> bool:
     if metric.startswith("rna_"):
         return True
     return False
+
+
+def _is_crispr_target(target: dict) -> bool:
+    """Return True if this target is a CRISPR target.
+
+    Detects either:
+      - target_type == "CRISPR" field
+      - id starts with "CRISPR_"
+      - on-chain id is in the CRISPR range 3000-3009
+    """
+    if target.get("target_type") == "CRISPR":
+        return True
+    tid = str(target.get("id", ""))
+    if tid.startswith("CRISPR_"):
+        return True
+    return False
+
+
+# ── CRISPR gRNA three-score analytical validation ─────────────────────────────
+# Mirrors life_crispr.py from the miner (adaptive/life_crispr.py).
+# No GPU required — runs in microseconds on CPU.
+# Combined score = on_target × off_target × delivery
+# Affinity encoding: −6.0 − 2.5 × combined + ε (ε deterministic from SHA-256)
+# Validator confirms if:
+#   (a) validator combined >= CRISPR_MIN_COMBINED_VALIDATOR (0.75), AND
+#   (b) |validator_affinity − claimed_affinity| / |claimed_affinity| ≤ 0.25
+
+CRISPR_MIN_COMBINED_VALIDATOR = 0.75   # minimum combined score to confirm
+
+# Nucleotide complement map
+_CRISPR_COMP = str.maketrans("ACGTacgt", "TGCAtgca")
+
+
+def _crispr_complement(seq: str) -> str:
+    return seq.translate(_CRISPR_COMP)
+
+
+def _crispr_revcomp(seq: str) -> str:
+    return _crispr_complement(seq)[::-1]
+
+
+def _crispr_hamming(a: str, b: str) -> int:
+    return sum(x != y for x, y in zip(a, b))
+
+
+def _crispr_gc_content(seq: str) -> float:
+    seq = seq.upper()
+    gc = seq.count("G") + seq.count("C")
+    return gc / len(seq) if seq else 0.0
+
+
+# Repeat-element seed blacklist (12-mers from Alu, LINE-1, SINE-R, telomeric,
+# centromeric repeats) — identical to the miner's _REPEAT_SEEDS set.
+_CRISPR_REPEAT_SEEDS: set[str] = {
+    "AGGACGCGTGGG", "GCTTGCACCGTG", "GGCCGGGCGCGG",
+    "CTCGCCCTTAGT", "AGCCGGGCGCGG", "GCCCGAGTTCTG",
+    "TTTTTTTTTTAG", "AAAAAAAAAATG", "TTTTTTGAGACG",
+    "GAGGCGGAGCTT", "GCAGTGAGCCGA",
+    "TTAGGGTTAGGG", "CCCTAACCCTAA",
+    "AACGTCGAAATG", "CATATTCAGTTC", "GAAATTTCGTTC",
+    "CACACACACACA", "ATATATATATATAT"[:12], "GCGCGCGCGCGC",
+    "GCACCAGCACCA", "TGGCCTCGAGGA",
+}
+
+
+def _crispr_count_seed_hits(seq: str) -> int:
+    seq = seq.upper()
+    return sum(1 for i in range(len(seq) - 11)
+               if seq[i:i+12] in _CRISPR_REPEAT_SEEDS)
+
+
+def _crispr_has_stem_loop(seq: str) -> bool:
+    if len(seq) < 20:
+        return False
+    arm1 = seq[:8].upper()
+    arm2 = seq[12:20].upper()
+    rc2  = _crispr_revcomp(arm2)
+    return sum(a == b for a, b in zip(arm1, rc2)) >= 4
+
+
+def _crispr_has_pam_context(seq: str) -> bool:
+    tail = seq[-3:].upper()
+    return not (tail[1] == "G" and tail[2] == "G")
+
+
+# Known hotspot gRNA windows for each CRISPR target — identical to miner's
+# HOTSPOT_GRNAS dict so validator scores align with miner scores.
+_CRISPR_HOTSPOT_GRNAS: dict[str, list[str]] = {
+    "TP53_CRISPR": [
+        "CGTGAGCGCTTCGAGATGTT", "TCCTCAGCATCTTATCCGAG",
+        "GCCCCCAGGGAGCACCCGCG", "GCCCTGGAGCCCTTCCTCTT",
+        "AGGCCCCGGCCTGGGAGCAG", "CTACCTGGAGTCTTTCCACG",
+        "GCAGGTACTGCCGTCGTGTG", "CACCAGCCTGTGTGTACTCG",
+    ],
+    "KRAS_CRISPR": [
+        "TTATGTGTGACATGTTCTAA", "GTATTTCTGTGAATTAGCTG",
+        "GTGAGTATTTCTGTGAATTA", "AAACTTGTGGTAGTTGGAGC",
+        "TATAAACTTGTGGTAGTTGG", "GTAGTTGGAGCTGGTGGCGT",
+        "CTTGTGGTAGTTGGAGCTGG", "TAGTTGGAGCTGGTGGCGTA",
+    ],
+    "BCL2_CRISPR": [
+        "GCTGCACCTGACGCCCTTCA", "CCCAGAGTTTGAGACAGAAG",
+        "TGGTCATCCCTGCCGCAGGT", "ATCCCAGCCTCCGTTATCCT",
+        "GGAGTTTGATCCCCATGAAG", "GCACTTCAGGGAAATGCCTG",
+        "TGTGGATGACTGAGTACCTG", "CTGACCAGAGACATGCCCAG",
+    ],
+    "MYC_CRISPR": [
+        "GCAGCGGGCGCGCAGCGCAG", "CCGCCGCCTCGCTGCAGGGC",
+        "TGCCGCCTCCTGTCGAAGTG", "AGCCGCCTCCTCGTCGAAGT",
+        "GCACCCGCGTCGAGGGCAGT", "GCCCGCCGCCTCCTGTCGAA",
+        "CGCCTCCTGTCGAAGTGTTC", "GGGCATCGTCGCGGTCCCTG",
+    ],
+    "EGFR_CRISPR": [
+        "GCATGTGGAGGTGGAGATCA", "TTCCCGTCGCTATCAAGGAA",
+        "GAAGACCCAGTTCCTTACGG", "CAGCATGTCAAGATCACAGA",
+        "CGCATGAGCTCCTTCAGGCA", "CTCATGAGCTCCTTCAGGCA",
+        "CGAGGATTTCCTTGTTGGCT", "GAGCAGCATCTCCGAAAGCC",
+    ],
+    "HER2_CRISPR": [
+        "CGAGGGCTTCTGGCTCGCCA", "TCTACAGAGCCCACCTTGGC",
+        "GCAGCTCATCTCCCGCAAAG", "AGGCACCTGCCTACGGGATC",
+        "TGCAGCAGCCTAAGTGCCAT", "CGAGGAGAACCCGCTGTGGC",
+        "TTCACAGGGACTTGGCTTCC", "CAGAAGGAGGTCTTCCTCCA",
+    ],
+    "BRCA1_CRISPR": [
+        "GCTGCAAAGCTTGCTTGAAT", "CATGATGGTTTGATCCCAGG",
+        "TAAATACCGCCTGAAATCGT", "CGTAAGGAGGTCAAGCCAGG",
+        "GTATCCTGAGCAGAGCATGG", "AGGAACCGCATCGAGCGAAG",
+        "CAGCCTCATTTTGTTAAATG", "GAAGCCTGAGCAGAAGATGA",
+    ],
+    "PDL1_CRISPR": [
+        "TGCATGACCAGATCGAGAGC", "CGAGGTCCAGATGACATTCG",
+        "AAGGTCCAGCTGCAGCAGTG", "GCCGTCGTACTGGCCGTCGT",
+        "GTTCAGTGCACAGGGCAGCA", "CTCCAAGGACTATGTGCTGG",
+        "GCAGTGGCACAGCCAGGAGA", "GCAGTCACAGTCTCCAGCCA",
+    ],
+    "TERT_CRISPR": [
+        "CCCCCACCCCGCCCTAGCCC", "GCCCTTCCCCGCCCGCCCAG",
+        "GCCCTAGCCCCAGGGCCCAG", "TCAGGGAGCCGCGAGCCCGC",
+        "CGCGTCTTCAAGTCCTACGT", "ACATGTCCTGTGACCCAGGT",
+        "GCCTTCAAGAGCAACAAGCC", "TGCTGTGGCTGCAGCCCAGG",
+    ],
+    "CDK4_CRISPR": [
+        "AAGTTCATGGCCTTGGAGTT", "CGCTAAAGCAGTTCGAGTTG",
+        "ATCCAGAAACGCAAACGCAA", "GCAAATGCGAGCTTCGAGTT",
+        "AGGCCTGTGCGGCCCGCGCG", "GCCTTGGGCTACTTCTTCAG",
+        "GTCCGCAGACCTCCAAATGG", "CCTCAGAGACCTCCAAATGG",
+    ],
+}
+
+
+def score_grna(seq: str, target_id: str) -> dict:
+    """
+    Score a 20-mer gRNA with the same three-score algorithm as the miner.
+
+    Returns dict with on_target, off_target, delivery, combined, affinity.
+    The affinity is deterministic for a given sequence (SHA-256 seeded ε).
+    """
+    import math
+    seq = seq.upper().strip()
+    if len(seq) != 20 or not all(c in "ACGT" for c in seq):
+        return {"on_target": 0.0, "off_target": 0.0, "delivery": 0.0,
+                "combined": 0.0, "affinity": -6.0}
+
+    hotspots = _CRISPR_HOTSPOT_GRNAS.get(target_id, [])
+
+    # ── Score 1: on-target efficiency ────────────────────────────────────────
+    if hotspots:
+        min_dist  = min(_crispr_hamming(seq, h) for h in hotspots)
+        on_target = math.exp(-min_dist / 8.0)
+    else:
+        on_target = 0.5
+    if _crispr_has_pam_context(seq):
+        on_target = min(1.0, on_target * 1.05)
+
+    # ── Score 2: off-target risk ──────────────────────────────────────────────
+    n_off      = _crispr_count_seed_hits(seq)
+    off_target = 1.0 / (1.0 + n_off)
+
+    # ── Score 3: delivery compatibility ──────────────────────────────────────
+    gc = _crispr_gc_content(seq)
+    if 0.40 <= gc <= 0.70:
+        delivery = 1.0
+    elif 0.30 <= gc < 0.40 or 0.70 < gc <= 0.80:
+        delivery = 0.7
+    else:
+        delivery = 0.4
+    if _crispr_has_stem_loop(seq):
+        delivery = min(1.1, delivery + 0.1)
+
+    combined = on_target * off_target * delivery
+
+    # Deterministic ε — SHA-256 of the sequence, same as miner
+    import random
+    _h   = int(hashlib.sha256(seq.encode()).hexdigest()[:8], 16)
+    _rng = random.Random(_h)
+    eps  = max(-0.4, min(0.4, _rng.gauss(0.0, 0.15)))
+    affinity = -6.0 - 2.5 * combined + eps
+
+    return {
+        "on_target":  round(on_target,  4),
+        "off_target": round(off_target, 4),
+        "delivery":   round(delivery,   4),
+        "combined":   round(combined,   4),
+        "affinity":   round(affinity,   4),
+    }
+
+
+def run_crispr_validation(grna_seq: str, target: dict) -> tuple[float | None, dict]:
+    """
+    Validate a CRISPR gRNA submission using the three-score analytical method.
+
+    Returns (rescored_affinity, grna_scores_dict).
+    rescored_affinity is None if the sequence is invalid (not a 20-mer ACGT).
+    The caller checks combined >= CRISPR_MIN_COMBINED_VALIDATOR to decide
+    whether to CONFIRM or REJECT (rescored_affinity is always passed on-chain
+    so the chain has the validator's own score, not just the miner's claim).
+    """
+    target_id = str(target.get("id", ""))
+    grna_seq  = grna_seq.upper().strip()
+
+    # Accept both DNA (ACGT) and RNA (with U→T) notation
+    grna_seq = grna_seq.replace("U", "T")
+
+    if len(grna_seq) != 20 or not all(c in "ACGT" for c in grna_seq):
+        log.warning(f"  [CRISPR] Invalid gRNA length/alphabet: {grna_seq[:24]} — skip")
+        return None, {}
+
+    scores = score_grna(grna_seq, target_id)
+    log.info(
+        f"  [CRISPR] {target_id}  gRNA={grna_seq[:16]}…"
+        f"  on={scores['on_target']:.3f}"
+        f"  off={scores['off_target']:.3f}"
+        f"  del={scores['delivery']:.3f}"
+        f"  combined={scores['combined']:.3f}"
+        f"  affinity={scores['affinity']:.3f}"
+    )
+    return scores["affinity"], scores
 
 
 class GpuBiasTracker:
@@ -517,7 +763,10 @@ def _write_boltz_input(in_dir: Path, target_id: str, sequence: str,
                         rna_mode: bool = False) -> None:
     import yaml
     if rna_mode:
-        # RNA sequence mode — use Boltz2 RNA chain type; no MSA required
+        # RNA sequence mode — use Boltz2 RNA chain type; no MSA required.
+        # siRNA/nucleotide sequences in the smiles field cannot be scored as
+        # small-molecule ligands; the caller already gates on _smiles_is_sirna
+        # and returns None before reaching _write_boltz_input.
         data = {
             "version": 1,
             "sequences": [
@@ -611,9 +860,24 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
         log.info(f"  [RNA-MODE] mRNA target {target_id} ({target.get('mrna_region','RNA')}) — {len(rna_seq)} nt")
     else:
         # ── Protein mode (existing behaviour) ────────────────────────────────
-        uniprot  = target["uniprot_id"]
-        msa_path = _msa_path_for(uniprot)
-        sequence = _sequence_from_msa(msa_path) or target["protein_sequence"]
+        uniprot  = target.get("uniprot_id", "")
+        msa_path = _msa_path_for(uniprot) if uniprot else "empty"
+        sequence = _sequence_from_msa(msa_path) or target.get("protein_sequence", "")
+        if not sequence:
+            log.warning(f"  Target {target_id} has no protein_sequence and no usable MSA — skip")
+            return None
+
+    # mRNA targets where the "smiles" field is a nucleotide sequence (siRNA strand):
+    # Boltz2 only supports affinity for small-molecule ligands, not RNA–RNA.
+    # Return None immediately — the caller's BOLTZ2_FAILED path will cap retries.
+    _nuc_re_b = re.compile(r'^[ACGTUacgtu]{10,}$')
+    _smiles_is_sirna = bool(_nuc_re_b.match(smiles.strip()))
+    if is_mrna and _smiles_is_sirna:
+        log.warning(
+            f"  mRNA target {target_id} has nucleotide sequence in smiles field "
+            f"({smiles[:20]}…) — Boltz2 ligand affinity unsupported for siRNA — skip"
+        )
+        return None
 
     ha = _heavy_atom_count(smiles)
     if ha == 0:
@@ -695,6 +959,7 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
             log.warning(f"  Boltz affinity fields missing: {list(metrics.keys())}")
             return None
 
+        # Normalization factor: heavy-atom count (siRNA path returns None before this line)
         return round(-((prob - pred) / ha) * 30.0, 3)   # same conversion as miner
 
     except Exception as e:
@@ -930,13 +1195,31 @@ def main():
     if validated_today:
         log.info(f"Restored today's counters from log: total={validated_today} confirmed={accepted} rejected={rejected}")
 
+    # Restore life_commission from today's audit log
+    _today = _today_date_utc()
+    life_earned = 0.0
+    if AUDIT_JSONL.exists():
+        try:
+            with AUDIT_JSONL.open() as _af:
+                for _line in _af:
+                    try:
+                        _r = json.loads(_line)
+                        if _r.get("ts", "").startswith(_today):
+                            life_earned += float(_r.get("life_earned", 0) or 0)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    if life_earned:
+        log.info(f"Restored life_commission from audit log: ${life_earned:.1f} $LIFE")
+
     stats = {
         "status":          "ONLINE",
-        "validated_today": 0,
-        "confirmed":       0,
-        "rejected":        0,
-        "accept_rate":     0.0,
-        "life_commission": 0.0,
+        "validated_today": validated_today,
+        "confirmed":       accepted,
+        "rejected":        rejected,
+        "accept_rate":     round(accepted / max(validated_today, 1) * 100, 1) if validated_today else 0.0,
+        "life_commission": life_earned,
         "last_heartbeat":  datetime.now(timezone.utc).isoformat(),
         "current_target":  None,
         "current_smiles":  None,
@@ -977,7 +1260,39 @@ def main():
             # Also index by target_id integer from on-chain (0-indexed per TARGET_ID_MAP)
             for i, t in enumerate(targets):
                 targets_by_id.setdefault(i, t)
-            log.info(f"Targets loaded: {len(targets)}")
+            # mRNA targets occupy on-chain IDs 2000-2029, mapping to list indices 30-59.
+            # Register each mRNA target under its on-chain ID so submissions with
+            # target_id_int in [2000, 2029] resolve correctly instead of being skipped.
+            _mrna_base_onchain = 2000
+            _mrna_base_list    = 30
+            _mrna_count        = 30
+            for _j in range(_mrna_count):
+                _list_idx   = _mrna_base_list + _j
+                _onchain_id = _mrna_base_onchain + _j
+                _t = targets[_list_idx] if _list_idx < len(targets) else None
+                if _t is not None and _is_mrna_target(_t):
+                    targets_by_id.setdefault(_onchain_id, _t)
+            _mrna_registered = sum(
+                1 for k in range(_mrna_base_onchain, _mrna_base_onchain + _mrna_count)
+                if k in targets_by_id
+            )
+            # CRISPR targets occupy on-chain IDs 3000-3009, mapping to list indices 60-69.
+            # Register each CRISPR target under its on-chain ID so submissions with
+            # target_id_int in [3000, 3009] resolve correctly instead of being skipped.
+            _crispr_base_onchain = 3000
+            _crispr_base_list    = 60
+            _crispr_count        = 10
+            for _j in range(_crispr_count):
+                _list_idx   = _crispr_base_list + _j
+                _onchain_id = _crispr_base_onchain + _j
+                _t = targets[_list_idx] if _list_idx < len(targets) else None
+                if _t is not None:
+                    targets_by_id.setdefault(_onchain_id, _t)
+            _crispr_registered = sum(
+                1 for k in range(_crispr_base_onchain, _crispr_base_onchain + _crispr_count)
+                if k in targets_by_id
+            )
+            log.info(f"Targets loaded: {len(targets)}  (mRNA on-chain IDs registered: {_mrna_registered})  (CRISPR on-chain IDs registered: {_crispr_registered})")
             last_refresh = now
 
         # Step 1: Poll for pending submissions
@@ -1104,11 +1419,127 @@ def main():
                 target = dict(target)
                 target["difficulty_tier"] = 3
 
+            # ── CRISPR target: enforce tier 3 regardless of what the on-chain record says
+            is_crispr = _is_crispr_target(target) or (3000 <= target_id_int <= 3009)
+            if is_crispr and target.get("difficulty_tier") != 3:
+                # Safety override — all CRISPR targets are hard (25 $LIFE commission)
+                target = dict(target)
+                target["difficulty_tier"] = 3
+
             # Expose current work to dashboard
             stats["current_target"] = target.get("id") or str(target_id_int)
             stats["current_smiles"] = smiles
             stats["last_updated"]   = datetime.now(timezone.utc).isoformat()
             write_stats(stats)
+
+            # ── CRISPR path: three-score analytical validation (no Boltz2) ───
+            if is_crispr:
+                t0 = time.time()
+                rescored, grna_scores = run_crispr_validation(smiles, target)
+                elapsed = time.time() - t0
+
+                if rescored is None:
+                    # Invalid gRNA sequence — skip and cap retries
+                    log.warning(f"  [CRISPR] Invalid gRNA for {pubkey[:16]}… — skip")
+                    append_audit({
+                        "ts":               datetime.now(timezone.utc).isoformat(),
+                        "submission_pubkey": pubkey,
+                        "miner_wallet":     miner_wallet,
+                        "claimed_score":    claimed,
+                        "rescored":         None,
+                        "decision":         "BOLTZ2_FAILED",
+                        "rel_err":          None,
+                    })
+                    _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+                    continue
+
+                combined   = grna_scores.get("combined", 0.0)
+                # Tolerance check: validator affinity within 25% of claimed
+                CRISPR_AFFINITY_TOL = 0.25
+                if claimed != 0.0:
+                    rel_err = abs(rescored - claimed) / abs(claimed)
+                else:
+                    rel_err = abs(rescored)
+                quality_ok  = combined >= CRISPR_MIN_COMBINED_VALIDATOR
+                within_tol  = quality_ok and (rel_err <= CRISPR_AFFINITY_TOL)
+                verdict     = "CONFIRM" if within_tol else "REJECT"
+
+                log.info(
+                    f"  [CRISPR] {verdict}  combined={combined:.3f}"
+                    f"  claimed={claimed:.3f}  rescored={rescored:.3f}"
+                    f"  rel_err={rel_err:.3f}  quality_ok={quality_ok}  ({elapsed*1000:.0f}ms)"
+                )
+
+                TIER_REWARDS = {1: 1, 2: 5, 3: 25}
+                difficulty   = target.get("difficulty_tier", 3)
+                tier_reward  = TIER_REWARDS.get(difficulty, 25)
+
+                result = validate_on_chain(pubkey, rescored)
+                tx = result.get("tx") if result else None
+                if tx:
+                    log.info(f"  ✔ tx: {tx}")
+                    if within_tol:
+                        life_earned += tier_reward
+                        log.info(f"  +{tier_reward} $LIFE  (tier={difficulty})  total={life_earned:.1f}")
+                    _SEEN_SUBMISSIONS.pop(pubkey, None)
+                else:
+                    log.warning(f"  validate_on_chain returned no tx")
+                    _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+
+                validated_today += 1
+                if within_tol:
+                    accepted += 1
+                else:
+                    rejected += 1
+
+                append_audit({
+                    "ts":               datetime.now(timezone.utc).isoformat(),
+                    "submission_pubkey": pubkey,
+                    "miner_wallet":     miner_wallet,
+                    "claimed_score":    claimed,
+                    "rescored":         rescored,
+                    "decision":         verdict,
+                    "rel_err":          round(rel_err, 4),
+                    "tolerance_used":   CRISPR_AFFINITY_TOL,
+                    "difficulty_tier":  difficulty,
+                    "target_type":      "CRISPR",
+                    "life_earned":      tier_reward if (within_tol and tx) else 0,
+                    "grna_on_target":   grna_scores.get("on_target"),
+                    "grna_off_target":  grna_scores.get("off_target"),
+                    "grna_delivery":    grna_scores.get("delivery"),
+                    "grna_combined":    combined,
+                })
+                append_log({
+                    "ts":               datetime.now(timezone.utc).isoformat(),
+                    "pubkey":           pubkey,
+                    "smiles":           smiles,
+                    "target_id":        target_id_int,
+                    "claimed":          claimed,
+                    "rescored":         rescored,
+                    "rel_err":          round(rel_err, 4),
+                    "within_tolerance": within_tol,
+                    "verdict":          verdict,
+                    "tx":               tx,
+                    "elapsed_s":        round(elapsed, 3),
+                    "difficulty_tier":  difficulty,
+                    "target_type":      "CRISPR",
+                    "life_earned":      tier_reward if (within_tol and tx) else 0,
+                })
+                stats.update({
+                    "validated_today": validated_today,
+                    "confirmed":       accepted,
+                    "rejected":        rejected,
+                    "accept_rate":     round(accepted / max(validated_today, 1) * 100, 1),
+                    "life_commission": life_earned,
+                    "last_heartbeat":  datetime.now(timezone.utc).isoformat(),
+                    "current_target":  None,
+                    "current_smiles":  None,
+                    "last_updated":    datetime.now(timezone.utc).isoformat(),
+                    "gpu_model":       _miner_gpu_model,
+                    "gpu_bias":        _gpu_bias_tracker.summary() if _gpu_bias_tracker else {},
+                })
+                write_stats(stats)
+                continue   # done with this CRISPR submission — skip Boltz2 path
 
             # Step 2: Re-run Boltz2 (with pipeline injection hardening inside)
             t0 = time.time()
@@ -1126,6 +1557,14 @@ def main():
                     "decision":         "BOLTZ2_FAILED",
                     "rel_err":          None,
                 })
+                # Count this as an attempt so the submission doesn't loop forever if
+                # Boltz2 keeps failing on it.  Same cap as failed on-chain tx calls.
+                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+                attempt_n = _SEEN_SUBMISSIONS[pubkey]
+                if attempt_n < _MAX_RETRY_ATTEMPTS:
+                    log.debug(f"  {pubkey[:16]}…: Boltz2 fail attempt {attempt_n}/{_MAX_RETRY_ATTEMPTS}")
+                else:
+                    log.info(f"  {pubkey[:16]}…: Boltz2 failed {attempt_n}x — giving up, skipping future polls")
                 continue
 
             # Step 3: GPU-bias corrected tolerance check
@@ -1225,7 +1664,7 @@ def main():
                 "rel_err":          round(rel_err, 4),
                 "tolerance_used":   round(tol, 4),
                 "difficulty_tier":  difficulty,
-                "target_type":      "RNA" if is_mrna else "PROTEIN",
+                "target_type":      "CRISPR" if is_crispr else ("RNA" if is_mrna else "PROTEIN"),
                 "life_earned":      tier_reward if (within_tol and tx) else 0,
             })
 
@@ -1242,7 +1681,7 @@ def main():
                 "tx":               tx,
                 "elapsed_s":        round(elapsed, 1),
                 "difficulty_tier":  difficulty,
-                "target_type":      "RNA" if is_mrna else "PROTEIN",
+                "target_type":      "CRISPR" if is_crispr else ("RNA" if is_mrna else "PROTEIN"),
                 "life_earned":      tier_reward if (within_tol and tx) else 0,
             })
 
