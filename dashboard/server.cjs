@@ -68,6 +68,19 @@ http.createServer((req, res) => {
     res.writeHead(200, JSON_HEADERS);
     return res.end(JSON.stringify(tailJsonl(AUDIT, 200)));
   }
+  if (url === '/crispr-log.json') {
+    // All CRISPR entries from the full log file (not capped to last 50)
+    const all = (() => {
+      try {
+        return fs.readFileSync(LOG, 'utf8')
+          .split('\n').filter(Boolean)
+          .map(l => { try { return JSON.parse(l); } catch { return null; } })
+          .filter(l => l && l.target_type === 'CRISPR');
+      } catch { return []; }
+    })();
+    res.writeHead(200, JSON_HEADERS);
+    return res.end(JSON.stringify(all));
+  }
 
   // ── Static files ─────────────────────────────────────────────
   const file = path.join(DIST, url === '/' ? '/index.html' : url);

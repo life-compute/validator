@@ -641,12 +641,29 @@ function AuditPanel({ log }) {
 }
 
 /* ─── CRISPR VALIDATION STREAM panel ───────────────────────── */
-function CrisprPanel({ audit }) {
+function CrisprPanel({ audit, crisprLog }) {
+  // Build pubkey→log entry map from the dedicated CRISPR log endpoint
+  // (full history, not capped to last 50). Log entries have 'pubkey', 'smiles',
+  // 'target_id'; audit entries have 'submission_pubkey' but lack those fields.
+  const logByPubkey = {}
+  for (const r of crisprLog) {
+    if (r.pubkey) logByPubkey[r.pubkey] = r
+  }
+
   // Filter audit entries with target_type CRISPR, take last 10
   const crisprEntries = [...audit]
-    .filter(r => r.target_type === 'CRISPR' || (r.submission_pubkey && r.grna_combined != null))
+    .filter(r => r.target_type === 'CRISPR')
     .reverse()
     .slice(0, 10)
+    .map(r => {
+      // Enrich from log entry matching by submission_pubkey
+      const logRow = logByPubkey[r.submission_pubkey] ?? {}
+      return {
+        ...r,
+        smiles:    r.smiles    ?? logRow.smiles    ?? null,
+        target_id: r.target_id ?? logRow.target_id ?? null,
+      }
+    })
 
   const cols = '70px 120px 1fr 80px 80px 70px'
 
@@ -826,16 +843,18 @@ function GpuBiasPanel({ stats }) {
 
 
 export default function App() {
-  const [stats,  setStats]  = useState(null)
-  const [log,    setLog]    = useState([])
-  const [audit,  setAudit]  = useState([])
-  const [tick,   setTick]   = useState(null)
+  const [stats,     setStats]     = useState(null)
+  const [log,       setLog]       = useState([])
+  const [audit,     setAudit]     = useState([])
+  const [crisprLog, setCrisprLog] = useState([])
+  const [tick,      setTick]      = useState(null)
 
   useEffect(() => {
     const poll = () => {
-      fetch('/stats.json?' + Date.now()).then(r=>r.json()).then(d=>{setStats(d);setTick(new Date())}).catch(()=>{})
-      fetch('/log.json?'   + Date.now()).then(r=>r.json()).then(setLog).catch(()=>{})
-      fetch('/audit.json?' + Date.now()).then(r=>r.json()).then(setAudit).catch(()=>{})
+      fetch('/stats.json?'     + Date.now()).then(r=>r.json()).then(d=>{setStats(d);setTick(new Date())}).catch(()=>{})
+      fetch('/log.json?'       + Date.now()).then(r=>r.json()).then(setLog).catch(()=>{})
+      fetch('/audit.json?'     + Date.now()).then(r=>r.json()).then(setAudit).catch(()=>{})
+      fetch('/crispr-log.json?'+ Date.now()).then(r=>r.json()).then(setCrisprLog).catch(()=>{})
     }
     poll()
     const id = setInterval(poll, 5000)
@@ -974,7 +993,7 @@ export default function App() {
             </div>
 
             {/* CRISPR panel — full width */}
-            <CrisprPanel audit={audit} />
+            <CrisprPanel audit={audit} crisprLog={crisprLog} />
 
             {/* Section: audit */}
             <div style={S.sectionLabel}>
