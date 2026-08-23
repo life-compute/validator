@@ -76,6 +76,16 @@ GPU_BIAS_PATH = WORK_DIR / "output" / "gpu_bias_models.json"
 # Minimum samples per GPU·target-family before bias model activates
 GPU_BIAS_MIN_SAMPLES = 10
 
+# ── Tokenomics: base rewards and halving schedule ──────────────────────────────
+# Base tier rewards (pre-halving).  CRISPR submissions are tier 3.
+# Updated 2026-08-23: CRISPR tier-3 reward reduced from 25 → 7 $LIFE.
+BASE_TIER_REWARDS: dict[int, int] = {1: 1, 2: 5, 3: 7}
+
+# Halving schedule: every 210,000 on-chain epochs the reward halves.
+# multiplier = 0.5 ** (current_epoch // HALVING_INTERVAL)
+# Integer arithmetic: reward >> halvings (floor division, minimum 1 if >0).
+HALVING_INTERVAL = 210_000
+
 # ── Anchor / JS paths ─────────────────────────────────────────────────────────
 ANCHOR_DIR  = Path(_env("ANCHOR_DIR", "/tmp/life-compute/core"))
 IDL_PATH    = ANCHOR_DIR / "target/idl/life_core.json"
@@ -981,6 +991,34 @@ def _rpc(method: str, params: list) -> dict:
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
 
+
+def fetch_current_epoch() -> int:
+    """
+    Return the current Solana epoch via getEpochInfo.
+    Falls back to 0 on any RPC failure (safe: no halving applied).
+    """
+    try:
+        resp = _rpc("getEpochInfo", [])
+        return int(resp["result"]["epoch"])
+    except Exception as e:
+        log.debug(f"fetch_current_epoch failed: {e}")
+        return 0
+
+
+def _halved_reward(base: int, epoch: int) -> int:
+    """
+    Apply the halving schedule to a base reward.
+
+    halvings = epoch // HALVING_INTERVAL
+    result   = base >> halvings   (integer right-shift = floor-divide by 2^halvings)
+    Minimum reward is 1 if base > 0, so validators always earn something.
+    """
+    halvings = epoch // HALVING_INTERVAL
+    if halvings == 0:
+        return base
+    result = base >> halvings   # equivalent to base // (2 ** halvings)
+    return max(1, result) if base > 0 else 0
+
 def fetch_pending_submissions() -> list[dict]:
     """
     getProgramAccounts filtered to ResultSubmission accounts.
@@ -1470,9 +1508,11 @@ def main():
                     f"  rel_err={rel_err:.3f}  quality_ok={quality_ok}  ({elapsed*1000:.0f}ms)"
                 )
 
-                TIER_REWARDS = {1: 1, 2: 5, 3: 25}
+                TIER_REWARDS = BASE_TIER_REWARDS
                 difficulty   = target.get("difficulty_tier", 3)
-                tier_reward  = TIER_REWARDS.get(difficulty, 25)
+                current_epoch = fetch_current_epoch()
+                tier_reward  = _halved_reward(TIER_REWARDS.get(difficulty, 7), current_epoch)
+                log.info(f"  [CRISPR] reward: base={TIER_REWARDS.get(difficulty,7)} epoch={current_epoch} halvings={current_epoch//HALVING_INTERVAL} → {tier_reward} $LIFE")
 
                 result = validate_on_chain(pubkey, rescored)
                 tx = result.get("tx") if result else None
@@ -1611,10 +1651,11 @@ def main():
             log.info(f"  {verdict}  claimed={claimed:.3f}  rescored={rescored:.3f}  "
                      f"rel_err={rel_err:.3f}  ({elapsed:.1f}s)")
 
-            # ── Tier reward (mirrors miner: 1/5/25 $LIFE per easy/medium/hard) ──
-            TIER_REWARDS = {1: 1, 2: 5, 3: 25}
-            difficulty   = target.get("difficulty_tier", 1)
-            tier_reward  = TIER_REWARDS.get(difficulty, 1)
+            # ── Tier reward (mirrors miner tokenomics: halved every 210k epochs) ──
+            difficulty    = target.get("difficulty_tier", 1)
+            current_epoch = fetch_current_epoch()
+            tier_reward   = _halved_reward(BASE_TIER_REWARDS.get(difficulty, 1), current_epoch)
+            log.info(f"  reward: base={BASE_TIER_REWARDS.get(difficulty,1)} epoch={current_epoch} halvings={current_epoch//HALVING_INTERVAL} → {tier_reward} $LIFE")
 
             # Step 4: Submit on-chain
             result = validate_on_chain(pubkey, rescored)
@@ -1622,7 +1663,7 @@ def main():
             if tx:
                 log.info(f"  ✔ tx: {tx}")
                 if within_tol:
-                    life_earned += tier_reward   # full tier reward: easy=1, medium=5, hard=25
+                    life_earned += tier_reward   # halving-adjusted tier reward
                     log.info(
                         f"  +{tier_reward} $LIFE  (tier={difficulty})  "
                         f"total={life_earned:.1f}"
