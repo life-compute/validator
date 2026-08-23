@@ -1548,6 +1548,8 @@ def main():
                     "grna_off_target":  grna_scores.get("off_target"),
                     "grna_delivery":    grna_scores.get("delivery"),
                     "grna_combined":    combined,
+                    "smiles":           smiles,        # gRNA sequence stored in smiles field
+                    "target_id":        target_id_int,
                 })
                 append_log({
                     "ts":               datetime.now(timezone.utc).isoformat(),
