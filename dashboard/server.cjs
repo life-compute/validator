@@ -19,6 +19,7 @@ const DIST  = path.join(__dirname, 'dist');
 const ROOT  = path.join(__dirname, '..');
 const STATS = path.join(ROOT, 'stats.json');
 const LOG   = path.join(ROOT, 'output', 'validator_log.jsonl');
+const AUDIT = path.join(ROOT, 'output', 'validator_audit.jsonl');
 
 const MIME = {
   '.html': 'text/html',
@@ -62,6 +63,10 @@ http.createServer((req, res) => {
   if (url === '/log.json') {
     res.writeHead(200, JSON_HEADERS);
     return res.end(JSON.stringify(tailJsonl(LOG)));
+  }
+  if (url === '/audit.json') {
+    res.writeHead(200, JSON_HEADERS);
+    return res.end(JSON.stringify(tailJsonl(AUDIT, 200)));
   }
 
   // ── Static files ─────────────────────────────────────────────

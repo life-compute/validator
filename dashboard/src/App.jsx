@@ -19,6 +19,8 @@ const T = {
   red:          '#ff3366',
   redDim:       '#cc0033',
   purple:       '#b060ff',
+  blue:         '#00bfff',
+  blueDim:      '#0099cc',
   text:         '#c8ffd4',
   textBright:   '#e8ffe8',
   textDim:      '#3a5c44',
@@ -349,6 +351,7 @@ function DNAHelix() {
 
 // Target ID → gene name (indices 0-59 match life-compute/targets targets.json)
 // Indices 0-29: protein targets; indices 30-59: mRNA targets (GENE_mRNA suffix)
+// Indices 60-69: CRISPR targets (on-chain IDs 3000-3009)
 const TARGET_NAMES = [
   'TP53','BRCA1','EGFR','HER2','KRAS','BCL2','CDK4','VEGFR2','PDL1','MDM2',
   'BRAF','PTEN','MYC','STAT3','PIK3CA','MTOR','FGFR1','RET','AR','NTRK1',
@@ -358,11 +361,23 @@ const TARGET_NAMES = [
   'HIF1A_mRNA','IL6_mRNA','TNF_mRNA','TGFb1_mRNA','CSF1R_mRNA','CCL2_mRNA',
   'CXCL12_mRNA','MMP9_mRNA','LDHA_mRNA','PKM2_mRNA','GLUT1_mRNA','HK2_mRNA',
   'FASN_mRNA','TERT_mRNA','PARP1_mRNA','RAD51_mRNA','BRCA2_mRNA','ATM_mRNA',
+  'TP53_CRISPR','KRAS_CRISPR','BCL2_CRISPR','MYC_CRISPR','EGFR_CRISPR',
+  'HER2_CRISPR','BRCA1_CRISPR','PDL1_CRISPR','TERT_CRISPR','CDK4_CRISPR',
 ]
-const targetName = (id) => TARGET_NAMES[id] ?? (id != null ? String(id) : '—')
+const CRISPR_ONCHAIN_BASE = 3000
+const targetName = (id) => {
+  if (id != null && id >= CRISPR_ONCHAIN_BASE && id < CRISPR_ONCHAIN_BASE + 10) {
+    return TARGET_NAMES[60 + (id - CRISPR_ONCHAIN_BASE)] ?? String(id)
+  }
+  return TARGET_NAMES[id] ?? (id != null ? String(id) : '—')
+}
 // Detect mRNA targets: _mRNA suffix, mRNA_ prefix, or log entry has target_type=RNA
 const isRnaTarget = (name) =>
   typeof name === 'string' && (name.endsWith('_mRNA') || name.startsWith('mRNA_'))
+// Detect CRISPR targets
+const isCrisprTarget = (entry, name) =>
+  entry?.target_type === 'CRISPR' ||
+  (typeof name === 'string' && name.endsWith('_CRISPR'))
 
 // Parse ts field — daemon writes ISO strings, not unix epoch
 const parseTs = (ts) => {
@@ -509,19 +524,25 @@ function ScoringFeedPanel({ log }) {
         const delta = r.claimed != null && r.rescored != null
           ? ((r.rescored - r.claimed) / Math.abs(r.claimed || 1) * 100).toFixed(1) + '%'
           : '—'
-        const tName = targetName(r.target_id)
-        const rna   = r.target_type === 'RNA' || isRnaTarget(tName)
+        const tName  = targetName(r.target_id)
+        const rna    = r.target_type === 'RNA' || isRnaTarget(tName)
+        const crispr = isCrisprTarget(r, tName)
+        // For CRISPR: show gRNA seq in smiles column; delta is always 0.0% (analytical scoring)
+        const smileDisplay = crispr
+          ? (r.grna_seq ?? r.smiles ?? '').slice(0, 20)
+          : (r.smiles ?? '').slice(0, 40)
+        const deltaDisplay = crispr ? '0.0%' : delta
         return (
           <div key={i} style={{ display:'grid', gridTemplateColumns:cols, gap:'8px',
                                 padding:'5px 0', borderBottom:`1px solid ${T.muted}`,
                                 fontSize:'10px', fontFamily:T.mono,
-                                background: i === 0 ? '#00ff4106' : 'transparent' }}>
+                                background: i === 0 ? (crispr ? '#00bfff06' : '#00ff4106') : 'transparent' }}>
             <span style={{ color:vc, fontWeight:700, textShadow:glow(vc,1) }}>
               {r.verdict ?? (ok ? '✔ CONF' : '✘ REJ')}
             </span>
-            <span style={{ color:T.cyan, display:'flex', alignItems:'center', gap:'4px' }}>
+            <span style={{ color: crispr ? T.blue : T.cyan, display:'flex', alignItems:'center', gap:'4px' }}>
               {tName}
-              {rna && (
+              {rna && !crispr && (
                 <span style={{
                   fontSize:'8px', padding:'1px 4px', borderRadius:'2px',
                   background:'#00ffff18', border:`1px solid ${T.cyan}44`,
@@ -529,13 +550,22 @@ function ScoringFeedPanel({ log }) {
                   flexShrink:0,
                 }}>RNA</span>
               )}
+              {crispr && (
+                <span style={{
+                  fontSize:'8px', padding:'1px 4px', borderRadius:'2px',
+                  background:'#00bfff18', border:`1px solid ${T.blue}55`,
+                  color:T.blue, letterSpacing:'0.08em', lineHeight:'1.2',
+                  flexShrink:0, textShadow:glow(T.blue,2),
+                }}>CRISPR</span>
+              )}
             </span>
-            <span style={{ color:T.textDim, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
-              {(r.smiles ?? '').slice(0,40)}
+            <span style={{ color: crispr ? T.blue : T.textDim, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
+                           fontWeight: crispr ? 700 : 400, letterSpacing: crispr ? '0.06em' : 'normal' }}>
+              {smileDisplay}
             </span>
             <span style={{ color:T.cyan }}>{r.claimed?.toFixed(4)  ?? '—'}</span>
             <span style={{ color:T.cyan }}>{r.rescored?.toFixed(4) ?? '—'}</span>
-            <span style={{ color:Math.abs(parseFloat(delta))>10 ? T.red : T.amber }}>{delta}</span>
+            <span style={{ color: crispr ? T.blue : (Math.abs(parseFloat(delta))>10 ? T.red : T.amber) }}>{deltaDisplay}</span>
             <span style={{ color:T.textDim }}>{r.elapsed_s ? `${r.elapsed_s}s` : '—'}</span>
           </div>
         )
@@ -564,8 +594,9 @@ function AuditPanel({ log }) {
         const ok = r.within_tolerance || r.verdict === 'CONFIRMED'
         const vc = ok ? T.green : T.red
         const ts = parseTs(r.ts)
-        const tName = targetName(r.target_id)
-        const rna   = r.target_type === 'RNA' || isRnaTarget(tName)
+        const tName  = targetName(r.target_id)
+        const rna    = r.target_type === 'RNA' || isRnaTarget(tName)
+        const crispr = isCrisprTarget(r, tName)
         return (
           <div key={i} style={{ display:'flex', gap:'12px', alignItems:'center',
                                 padding:'5px 0', borderBottom:`1px solid ${T.muted}`,
@@ -574,15 +605,23 @@ function AuditPanel({ log }) {
             <span style={{ color:vc, fontWeight:700, textShadow:glow(vc,1), width:80, flexShrink:0 }}>
               {r.verdict ?? (ok ? 'CONFIRMED' : 'REJECTED')}
             </span>
-            <span style={{ color:T.green, display:'flex', alignItems:'center', gap:'4px', width:80, flexShrink:0 }}>
+            <span style={{ color: crispr ? T.blue : T.green, display:'flex', alignItems:'center', gap:'4px', width:80, flexShrink:0 }}>
               {tName}
-              {rna && (
+              {rna && !crispr && (
                 <span style={{
                   fontSize:'8px', padding:'1px 4px', borderRadius:'2px',
                   background:'#00ffff18', border:`1px solid ${T.cyan}44`,
                   color:T.cyan, letterSpacing:'0.08em', lineHeight:'1.2',
                   flexShrink:0,
                 }}>RNA</span>
+              )}
+              {crispr && (
+                <span style={{
+                  fontSize:'8px', padding:'1px 4px', borderRadius:'2px',
+                  background:'#00bfff18', border:`1px solid ${T.blue}55`,
+                  color:T.blue, letterSpacing:'0.08em', lineHeight:'1.2',
+                  flexShrink:0, textShadow:glow(T.blue,2),
+                }}>CRISPR</span>
               )}
             </span>
             <span style={{ color:T.textDim, flex:1, overflow:'hidden',
@@ -594,6 +633,77 @@ function AuditPanel({ log }) {
               {' → '}
               {r.rescored != null ? r.rescored.toFixed(4) : '—'}
             </span>
+          </div>
+        )
+      })}
+    </Panel>
+  )
+}
+
+/* ─── CRISPR VALIDATION STREAM panel ───────────────────────── */
+function CrisprPanel({ audit }) {
+  // Filter audit entries with target_type CRISPR, take last 10
+  const crisprEntries = [...audit]
+    .filter(r => r.target_type === 'CRISPR' || (r.submission_pubkey && r.grna_combined != null))
+    .reverse()
+    .slice(0, 10)
+
+  const cols = '70px 120px 1fr 80px 80px 70px'
+
+  return (
+    <Panel accent={T.blue} style={{ gridColumn:'1 / -1' }}>
+      <div style={S.panelTitle}>
+        <span style={{ color:T.blue, textShadow:glow(T.blue,3) }}>⬡</span>
+        <span>CRISPR</span>
+        <span style={{ color:T.blue, textShadow:glow(T.blue,2) }}> // VALIDATION STREAM</span>
+        <span style={{ marginLeft:'auto', color:T.textDim, fontSize:'10px', letterSpacing:'0.12em' }}>
+          LAST {Math.min(crisprEntries.length,10)} / {audit.filter(r=>r.target_type==='CRISPR').length} TOTAL
+        </span>
+      </div>
+
+      {/* header row */}
+      <div style={{ display:'grid', gridTemplateColumns:cols, gap:'8px',
+                    padding:'4px 0 6px', borderBottom:`1px solid ${T.blue}33`,
+                    fontSize:'9px', color:T.textDim, letterSpacing:'0.12em', fontWeight:700, fontFamily:T.mono }}>
+        {['VERDICT','TARGET','gRNA (20-MER)','COMBINED','AFFINITY','TIME'].map(h=>(
+          <span key={h}>{h}</span>
+        ))}
+      </div>
+
+      {crisprEntries.length === 0 ? (
+        <div style={{ color:T.blue, fontSize:'11px', padding:'12px 0', fontFamily:T.mono, opacity:0.7 }}>
+          No CRISPR validations yet — waiting for gRNA submissions… <Cursor />
+        </div>
+      ) : crisprEntries.map((r, i) => {
+        const confirmed = r.decision === 'CONFIRM' || r.verdict === 'CONFIRM' || r.within_tolerance
+        const vc        = confirmed ? T.green : T.red
+        const tName     = r.target_name ?? targetName(r.target_id)
+        const grna      = r.smiles ?? r.grna_seq ?? '—'
+        const combined  = r.grna_combined ?? r.combined_score
+        const affinity  = r.rescored ?? r.claimed_score
+        const ts        = parseTs(r.ts)
+        return (
+          <div key={i} style={{ display:'grid', gridTemplateColumns:cols, gap:'8px',
+                                padding:'5px 0', borderBottom:`1px solid ${T.muted}`,
+                                fontSize:'10px', fontFamily:T.mono,
+                                background: i === 0 ? '#00bfff08' : 'transparent' }}>
+            <span style={{ color:vc, fontWeight:700, textShadow:glow(vc,1), display:'flex', alignItems:'center', gap:'5px' }}>
+              {confirmed ? '✔ CONFIRM' : '✘ REJECT'}
+            </span>
+            <span style={{ color:T.blue, fontWeight:700, textShadow:glow(T.blue,1), overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+              {tName}
+            </span>
+            <span style={{ color:T.blue, fontFamily:T.mono, letterSpacing:'0.08em', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
+                           fontWeight:700, opacity:0.9 }}>
+              {typeof grna === 'string' ? grna.slice(0,20) : '—'}
+            </span>
+            <span style={{ color: combined != null ? (combined >= 0.75 ? T.green : T.amber) : T.textDim }}>
+              {combined != null ? combined.toFixed(3) : '—'}
+            </span>
+            <span style={{ color:T.cyan }}>
+              {affinity != null ? affinity.toFixed(4) : '—'}
+            </span>
+            <span style={{ color:T.textDim }}>{ts}</span>
           </div>
         )
       })}
@@ -716,14 +826,16 @@ function GpuBiasPanel({ stats }) {
 
 
 export default function App() {
-  const [stats, setStats] = useState(null)
-  const [log,   setLog]   = useState([])
-  const [tick,  setTick]  = useState(null)
+  const [stats,  setStats]  = useState(null)
+  const [log,    setLog]    = useState([])
+  const [audit,  setAudit]  = useState([])
+  const [tick,   setTick]   = useState(null)
 
   useEffect(() => {
     const poll = () => {
       fetch('/stats.json?' + Date.now()).then(r=>r.json()).then(d=>{setStats(d);setTick(new Date())}).catch(()=>{})
       fetch('/log.json?'   + Date.now()).then(r=>r.json()).then(setLog).catch(()=>{})
+      fetch('/audit.json?' + Date.now()).then(r=>r.json()).then(setAudit).catch(()=>{})
     }
     poll()
     const id = setInterval(poll, 5000)
@@ -799,7 +911,7 @@ export default function App() {
 
               {/* Subtitle */}
               <div style={S.subtitle}>
-                SECURING CANCER DRUG DISCOVERY · BOLTZ2 RESCORING · RNA TARGETS · SOLANA BLOCKCHAIN
+                SECURING CANCER DRUG DISCOVERY · BOLTZ2 RESCORING · RNA TARGETS · CRISPR gRNA · SOLANA BLOCKCHAIN
               </div>
             </div>
 
@@ -854,6 +966,15 @@ export default function App() {
 
             {/* Scoring feed — full width */}
             <ScoringFeedPanel log={log} />
+
+            {/* Section: CRISPR */}
+            <div style={S.sectionLabel}>
+              <div style={{ ...S.sectionTick, background:T.blue, boxShadow:glow(T.blue,3) }} />
+              <span style={{ color:T.blue, textShadow:glow(T.blue,2) }}>CRISPR // VALIDATION STREAM</span>
+            </div>
+
+            {/* CRISPR panel — full width */}
+            <CrisprPanel audit={audit} />
 
             {/* Section: audit */}
             <div style={S.sectionLabel}>

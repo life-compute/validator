@@ -1553,6 +1553,7 @@ def main():
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "pubkey":           pubkey,
                     "smiles":           smiles,
+                    "grna_seq":         smiles,            # gRNA sequence is stored in smiles field
                     "target_id":        target_id_int,
                     "claimed":          claimed,
                     "rescored":         rescored,
@@ -1563,6 +1564,7 @@ def main():
                     "elapsed_s":        round(elapsed, 3),
                     "difficulty_tier":  difficulty,
                     "target_type":      "CRISPR",
+                    "grna_combined":    combined,
                     "life_earned":      tier_reward if (within_tol and tx) else 0,
                 })
                 stats.update({
