@@ -1532,13 +1532,14 @@ def main():
                 else:
                     rejected += 1
 
+                crispr_audit_decision = verdict if tx else f"{verdict}_TX_FAILED"
                 append_audit({
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
                     "miner_wallet":     miner_wallet,
                     "claimed_score":    claimed,
                     "rescored":         rescored,
-                    "decision":         verdict,
+                    "decision":         crispr_audit_decision,
                     "rel_err":          round(rel_err, 4),
                     "tolerance_used":   CRISPR_AFFINITY_TOL,
                     "difficulty_tier":  difficulty,
@@ -1696,6 +1697,12 @@ def main():
                 rejected += 1
 
             # ── Audit log (every decision) ────────────────────────────────────
+            # Use CONFIRM/REJECT only when the tx actually landed on-chain.
+            # When the on-chain call fails the account stays Pending and will
+            # re-appear in future polls; recording CONFIRM/REJECT here would
+            # cause _load_seen_from_audit() on restart to mark the submission
+            # at max-attempts and block it permanently despite no tx landing.
+            audit_decision = verdict if tx else f"{verdict}_TX_FAILED"
             append_audit({
                 "ts":               datetime.now(timezone.utc).isoformat(),
                 "submission_pubkey": pubkey,
@@ -1705,7 +1712,7 @@ def main():
                 "adjusted_claimed": round(adjusted_claimed, 4),
                 "bias_factor":      round(bias_factor, 4) if bias_factor is not None else None,
                 "rescored":         rescored,
-                "decision":         verdict,
+                "decision":         audit_decision,
                 "rel_err":          round(rel_err, 4),
                 "tolerance_used":   round(tol, 4),
                 "difficulty_tier":  difficulty,
