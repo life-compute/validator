@@ -1347,7 +1347,7 @@ def main():
 
             # ── Dedup: skip already-processed or over-retried submissions ─────
             attempts = _SEEN_SUBMISSIONS.get(pubkey, 0)
-            if attempts >= _MAX_RETRY_ATTEMPTS:
+            if attempts > _MAX_RETRY_ATTEMPTS:
                 log.debug(
                     f"  {pubkey[:16]}…: skipping — already attempted "
                     f"{attempts}x (tx kept failing); will clear when RPC drops it"
@@ -1479,16 +1479,37 @@ def main():
                 if rescored is None:
                     # Invalid gRNA sequence — skip and cap retries
                     log.warning(f"  [CRISPR] Invalid gRNA for {pubkey[:16]}… — skip")
-                    append_audit({
-                        "ts":               datetime.now(timezone.utc).isoformat(),
-                        "submission_pubkey": pubkey,
-                        "miner_wallet":     miner_wallet,
-                        "claimed_score":    claimed,
-                        "rescored":         None,
-                        "decision":         "BOLTZ2_FAILED",
-                        "rel_err":          None,
-                    })
                     _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+                    attempt_n = _SEEN_SUBMISSIONS[pubkey]
+                    if attempt_n < _MAX_RETRY_ATTEMPTS:
+                        append_audit({
+                            "ts":               datetime.now(timezone.utc).isoformat(),
+                            "submission_pubkey": pubkey,
+                            "miner_wallet":     miner_wallet,
+                            "claimed_score":    claimed,
+                            "rescored":         None,
+                            "decision":         "BOLTZ2_FAILED",
+                            "rel_err":          None,
+                        })
+                    else:
+                        log.info(f"  [CRISPR] {pubkey[:16]}…: failed {attempt_n}x — submitting on-chain REJECT to clear from queue")
+                        result = validate_on_chain(pubkey, 0.0)
+                        tx = result.get("tx") if result else None
+                        if tx:
+                            log.info(f"  ✔ CRISPR BOLTZ2_REJECT tx: {tx}")
+                            _SEEN_SUBMISSIONS.pop(pubkey, None)
+                        else:
+                            log.warning(f"  CRISPR BOLTZ2_REJECT on-chain call failed — will retry next poll")
+                        append_audit({
+                            "ts":               datetime.now(timezone.utc).isoformat(),
+                            "submission_pubkey": pubkey,
+                            "miner_wallet":     miner_wallet,
+                            "claimed_score":    claimed,
+                            "rescored":         None,
+                            "decision":         "BOLTZ2_FAILED" if not tx else "BOLTZ2_REJECT",
+                            "rel_err":          None,
+                            "tx":               tx,
+                        })
                     continue
 
                 combined   = grna_scores.get("combined", 0.0)
@@ -1593,23 +1614,40 @@ def main():
 
             if rescored is None:
                 log.warning(f"  Boltz2 failed for {pubkey[:16]}… — skip")
-                append_audit({
-                    "ts":               datetime.now(timezone.utc).isoformat(),
-                    "submission_pubkey": pubkey,
-                    "miner_wallet":     miner_wallet,
-                    "claimed_score":    claimed,
-                    "rescored":         None,
-                    "decision":         "BOLTZ2_FAILED",
-                    "rel_err":          None,
-                })
-                # Count this as an attempt so the submission doesn't loop forever if
-                # Boltz2 keeps failing on it.  Same cap as failed on-chain tx calls.
                 _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
                 attempt_n = _SEEN_SUBMISSIONS[pubkey]
                 if attempt_n < _MAX_RETRY_ATTEMPTS:
                     log.debug(f"  {pubkey[:16]}…: Boltz2 fail attempt {attempt_n}/{_MAX_RETRY_ATTEMPTS}")
+                    append_audit({
+                        "ts":               datetime.now(timezone.utc).isoformat(),
+                        "submission_pubkey": pubkey,
+                        "miner_wallet":     miner_wallet,
+                        "claimed_score":    claimed,
+                        "rescored":         None,
+                        "decision":         "BOLTZ2_FAILED",
+                        "rel_err":          None,
+                    })
                 else:
-                    log.info(f"  {pubkey[:16]}…: Boltz2 failed {attempt_n}x — giving up, skipping future polls")
+                    # Final attempt exhausted — submit a reject on-chain so the account
+                    # flips out of Pending and stops appearing in future RPC polls.
+                    log.info(f"  {pubkey[:16]}…: Boltz2 failed {attempt_n}x — submitting on-chain REJECT to clear from queue")
+                    result = validate_on_chain(pubkey, 0.0)
+                    tx = result.get("tx") if result else None
+                    if tx:
+                        log.info(f"  ✔ BOLTZ2_REJECT tx: {tx}")
+                        _SEEN_SUBMISSIONS.pop(pubkey, None)
+                    else:
+                        log.warning(f"  BOLTZ2_REJECT on-chain call failed — will retry next poll")
+                    append_audit({
+                        "ts":               datetime.now(timezone.utc).isoformat(),
+                        "submission_pubkey": pubkey,
+                        "miner_wallet":     miner_wallet,
+                        "claimed_score":    claimed,
+                        "rescored":         None,
+                        "decision":         "BOLTZ2_FAILED" if not tx else "BOLTZ2_REJECT",
+                        "rel_err":          None,
+                        "tx":               tx,
+                    })
                 continue
 
             # Step 3: GPU-bias corrected tolerance check
