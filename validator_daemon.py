@@ -603,7 +603,30 @@ def run_crispr_validation(grna_seq: str, target: dict) -> tuple[float | None, di
     whether to CONFIRM or REJECT (rescored_affinity is always passed on-chain
     so the chain has the validator's own score, not just the miner's claim).
     """
-    target_id = str(target.get("id", ""))
+    # Map on-chain integer IDs (3000-3009) → string keys used in _CRISPR_HOTSPOT_GRNAS.
+    # The target["id"] field for CRISPR targets is the raw on-chain integer (e.g. 3000),
+    # NOT the human-readable string "BRCA1_CRISPR".  Without this mapping score_grna()
+    # receives "3000" and falls back to on_target=0.5 (no hotspot match), producing
+    # affinity ≈ -7.25 instead of the miner's ≈ -8.5 — causing systematic rejection.
+    _CRISPR_ONCHAIN_TO_NAME: dict[int, str] = {
+        3000: "TP53_CRISPR",
+        3001: "KRAS_CRISPR",
+        3002: "BCL2_CRISPR",
+        3003: "MYC_CRISPR",
+        3004: "EGFR_CRISPR",
+        3005: "HER2_CRISPR",
+        3006: "BRCA1_CRISPR",
+        3007: "PDL1_CRISPR",
+        3008: "TERT_CRISPR",
+        3009: "CDK4_CRISPR",
+    }
+    raw_id = target.get("id", "")
+    try:
+        raw_int = int(raw_id)
+        target_id = _CRISPR_ONCHAIN_TO_NAME.get(raw_int, str(raw_id))
+    except (ValueError, TypeError):
+        # Already a string like "BRCA1_CRISPR" — use as-is
+        target_id = str(raw_id)
     grna_seq  = grna_seq.upper().strip()
 
     # Accept both DNA (ACGT) and RNA (with U→T) notation

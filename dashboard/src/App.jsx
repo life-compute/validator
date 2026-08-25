@@ -527,11 +527,11 @@ function ScoringFeedPanel({ log }) {
         const tName  = targetName(r.target_id)
         const rna    = r.target_type === 'RNA' || isRnaTarget(tName)
         const crispr = isCrisprTarget(r, tName)
-        // For CRISPR: show gRNA seq in smiles column; delta is always 0.0% (analytical scoring)
+        // For CRISPR: show gRNA seq in smiles column; show real delta (validator rescores analytically)
         const smileDisplay = crispr
           ? (r.grna_seq ?? r.smiles ?? '').slice(0, 20)
           : (r.smiles ?? '').slice(0, 40)
-        const deltaDisplay = crispr ? '0.0%' : delta
+        const deltaDisplay = delta
         return (
           <div key={i} style={{ display:'grid', gridTemplateColumns:cols, gap:'8px',
                                 padding:'5px 0', borderBottom:`1px solid ${T.muted}`,
