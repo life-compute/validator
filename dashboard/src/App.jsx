@@ -728,6 +728,340 @@ function CrisprPanel({ audit, crisprLog }) {
   )
 }
 
+/* ─── LIFE AGENT — VALIDATOR ASSISTANT panel ────────────────── */
+function LifeAgentPanel() {
+  const LS_KEY = 'lifeagent_apikey'
+  const [open,     setOpen]     = useState(false)
+  const [apiKey,   setApiKey]   = useState(() => {
+    try { return localStorage.getItem(LS_KEY) || '' } catch { return '' }
+  })
+  const [messages, setMessages] = useState([])   // { role: 'user'|'assistant', content }
+  const [input,    setInput]    = useState('')
+  const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState('')
+  const chatRef  = useRef()
+
+  // Persist API key to localStorage on change
+  const handleKeyChange = (v) => {
+    setApiKey(v)
+    try { localStorage.setItem(LS_KEY, v) } catch {}
+  }
+
+  // Auto-scroll chat on new messages
+  useEffect(() => {
+    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight
+  }, [messages, loading])
+
+  const fetchContext = async () => {
+    try {
+      const r = await fetch('/api/agent-context?' + Date.now())
+      return await r.json()
+    } catch { return {} }
+  }
+
+  const sendMessage = async (text, prefillHistory) => {
+    const msg = text ?? input.trim()
+    if (!msg) return
+    if (!apiKey.startsWith('sk-')) {
+      setError('Enter your Anthropic API key above first.')
+      return
+    }
+    setError('')
+    const userMsg = { role: 'user', content: msg }
+    const history = prefillHistory ?? messages
+    setMessages(prev => [...prev, userMsg])
+    setInput('')
+    setLoading(true)
+    const context = await fetchContext()
+    try {
+      const res = await fetch('/api/agent', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ apiKey, message: msg, history, context }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setError(data.error || `HTTP ${res.status}`)
+      } else {
+        const reply = data?.content?.[0]?.text ?? '(no response)'
+        setMessages(prev => [...prev, { role: 'assistant', content: reply }])
+      }
+    } catch (e) {
+      setError('Network error: ' + e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const diagnoseLogs = async () => {
+    const ctx = await fetchContext()
+    const errors = ctx.recent_errors ?? []
+    const lines  = errors.length
+      ? errors.map(l => `[${l.level ?? 'LOG'}] ${l.msg ?? JSON.stringify(l)}`).join('\n')
+      : (ctx.recent_log ?? []).slice(-10).map(l => JSON.stringify(l)).join('\n')
+    const prompt = `Diagnose the following recent validator log output. Identify the root cause and recommend next steps.\n\n\`\`\`\n${lines || '(no recent errors)'}\n\`\`\``
+    await sendMessage(prompt, messages)
+  }
+
+  const suggestFix = async () => {
+    const ctx    = await fetchContext()
+    const errors = ctx.recent_errors ?? []
+    const daemon = ctx.daemon_head   ?? ''
+    const errStr = errors.length
+      ? errors.map(l => `[${l.level ?? 'LOG'}] ${l.msg ?? JSON.stringify(l)}`).join('\n')
+      : '(no errors detected)'
+    const prompt = `Based on the recent errors below and the validator_daemon.py code, suggest a fix as a unified diff that the operator can apply manually.\n\n--- recent errors ---\n${errStr}\n\n--- validator_daemon.py (first 200 lines) ---\n${daemon}`
+    await sendMessage(prompt, messages)
+  }
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
+  }
+
+  const accent = T.pink
+
+  return (
+    <Panel accent={accent} style={{ gridColumn: '1 / -1' }}>
+      {/* Collapsible header */}
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: '10px',
+          cursor: 'pointer', userSelect: 'none',
+          paddingBottom: open ? '16px' : 0,
+          borderBottom: open ? `1px solid ${accent}33` : 'none',
+        }}
+      >
+        <span style={{ color: accent, textShadow: glow(accent, 3), fontSize: '14px' }}>
+          {open ? '▼' : '▶'}
+        </span>
+        <span style={{ ...S.panelTitle, marginBottom: 0 }}>
+          <span style={S.titleAccent(accent)}>◈</span>
+          <span style={{ color: T.textBright, letterSpacing: '0.18em' }}>LIFE AGENT</span>
+          <span style={{ color: accent, textShadow: glow(accent, 2) }}> — VALIDATOR ASSISTANT</span>
+        </span>
+        <span style={{ marginLeft: 'auto', ...S.pill(accent) }}>BYOK · AI DIAGNOSTICS</span>
+      </div>
+
+      {open && (
+        <div style={{ marginTop: '14px' }}>
+
+          {/* BYOK notice */}
+          <div style={{
+            padding:      '8px 12px',
+            background:   '#ff69b408',
+            border:       `1px solid ${accent}33`,
+            fontSize:     '11px',
+            color:        T.textDim,
+            marginBottom: '14px',
+            letterSpacing:'0.04em',
+            lineHeight:   1.6,
+            fontFamily:   T.mono,
+          }}>
+            <span style={{ color: accent, fontWeight: 700 }}>⚠ LIFE AGENT</span> requires your own Anthropic API key.
+            Your key is stored in your browser only and is never sent to our servers.
+            {' '}<a
+              href="https://console.anthropic.com"
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: T.cyan, textShadow: glow(T.cyan, 1), textDecoration: 'underline' }}
+            >Get your key at console.anthropic.com</a>
+          </div>
+
+          {/* API key input */}
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '14px' }}>
+            <span style={{ ...S.label, minWidth: '80px' }}>ANTHROPIC KEY</span>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={e => handleKeyChange(e.target.value)}
+              placeholder="sk-ant-..."
+              style={{
+                flex:        1,
+                background:  '#010603',
+                border:      `1px solid ${apiKey.startsWith('sk-') ? accent + '55' : T.border}`,
+                color:       T.text,
+                fontFamily:  T.mono,
+                fontSize:    '12px',
+                padding:     '6px 10px',
+                outline:     'none',
+                letterSpacing: '0.04em',
+              }}
+            />
+            <span style={{
+              ...S.pill(apiKey.startsWith('sk-') ? T.green : T.textDim),
+              fontSize: '9px',
+            }}>
+              {apiKey.startsWith('sk-') ? '✔ KEY SET' : '○ NO KEY'}
+            </span>
+          </div>
+
+          {/* Quick action buttons */}
+          <div style={{ display: 'flex', gap: '10px', marginBottom: '14px' }}>
+            {[
+              { label: '⬡ DIAGNOSE ISSUE',   action: diagnoseLogs, color: T.amber },
+              { label: '⬡ SUGGEST FIX',       action: suggestFix,   color: T.green },
+            ].map(({ label, action, color }) => (
+              <button
+                key={label}
+                onClick={action}
+                disabled={loading || !apiKey.startsWith('sk-')}
+                style={{
+                  background:    `${color}0e`,
+                  border:        `1px solid ${color}55`,
+                  color:         color,
+                  fontFamily:    T.mono,
+                  fontSize:      '10px',
+                  letterSpacing: '0.12em',
+                  padding:       '6px 14px',
+                  cursor:        loading || !apiKey.startsWith('sk-') ? 'not-allowed' : 'pointer',
+                  opacity:       loading || !apiKey.startsWith('sk-') ? 0.5 : 1,
+                  textShadow:    glow(color, 2),
+                  transition:    'opacity 0.15s',
+                }}
+              >{label}</button>
+            ))}
+            {messages.length > 0 && (
+              <button
+                onClick={() => setMessages([])}
+                style={{
+                  background:    'transparent',
+                  border:        `1px solid ${T.textDim}44`,
+                  color:         T.textDim,
+                  fontFamily:    T.mono,
+                  fontSize:      '10px',
+                  letterSpacing: '0.12em',
+                  padding:       '6px 14px',
+                  cursor:        'pointer',
+                  marginLeft:    'auto',
+                }}
+              >✕ CLEAR</button>
+            )}
+          </div>
+
+          {/* Chat history */}
+          <div
+            ref={chatRef}
+            style={{
+              minHeight:    '120px',
+              maxHeight:    '360px',
+              overflowY:    'auto',
+              background:   '#010603',
+              border:       `1px solid ${T.border}`,
+              padding:      '10px 12px',
+              marginBottom: '10px',
+              display:      'flex',
+              flexDirection:'column',
+              gap:          '10px',
+            }}
+          >
+            {messages.length === 0 && !loading && (
+              <div style={{ color: T.textDim, fontSize: '11px', fontFamily: T.mono }}>
+                LIFE AGENT ready. Use the quick-action buttons or type a question below. <Cursor />
+              </div>
+            )}
+            {messages.map((m, i) => (
+              <div key={i} style={{
+                display:      'flex',
+                flexDirection:'column',
+                alignItems:   m.role === 'user' ? 'flex-end' : 'flex-start',
+              }}>
+                <span style={{
+                  fontSize:      '9px',
+                  color:         T.textDim,
+                  letterSpacing: '0.1em',
+                  marginBottom:  '3px',
+                }}>
+                  {m.role === 'user' ? 'OPERATOR' : '◈ LIFE AGENT'}
+                </span>
+                <div style={{
+                  maxWidth:     '92%',
+                  padding:      '8px 12px',
+                  background:   m.role === 'user' ? '#00ff4108' : '#ff69b408',
+                  border:       `1px solid ${m.role === 'user' ? T.green : accent}33`,
+                  fontSize:     '11px',
+                  color:        m.role === 'user' ? T.green : T.text,
+                  fontFamily:   T.mono,
+                  lineHeight:   1.7,
+                  whiteSpace:   'pre-wrap',
+                  wordBreak:    'break-word',
+                  textShadow:   m.role === 'user' ? glow(T.green, 1) : 'none',
+                }}>
+                  {m.content}
+                </div>
+              </div>
+            ))}
+            {loading && (
+              <div style={{ color: accent, fontSize: '11px', fontFamily: T.mono, display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ animation: 'pulse 0.8s ease-in-out infinite' }}>◈</span>
+                LIFE AGENT PROCESSING… <Cursor />
+              </div>
+            )}
+          </div>
+
+          {/* Error display */}
+          {error && (
+            <div style={{
+              padding:      '6px 10px',
+              background:   '#ff336608',
+              border:       `1px solid ${T.red}44`,
+              color:        T.red,
+              fontSize:     '10px',
+              marginBottom: '8px',
+              fontFamily:   T.mono,
+              letterSpacing:'0.04em',
+            }}>
+              ✘ {error}
+            </div>
+          )}
+
+          {/* Input row */}
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <textarea
+              rows={2}
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="Ask LIFE AGENT to diagnose, explain, or diff… (Enter to send, Shift+Enter for newline)"
+              style={{
+                flex:        1,
+                background:  '#010603',
+                border:      `1px solid ${T.border}`,
+                color:       T.text,
+                fontFamily:  T.mono,
+                fontSize:    '11px',
+                padding:     '8px 10px',
+                outline:     'none',
+                resize:      'vertical',
+                letterSpacing:'0.03em',
+                lineHeight:  1.5,
+              }}
+            />
+            <button
+              onClick={() => sendMessage()}
+              disabled={loading || !input.trim() || !apiKey.startsWith('sk-')}
+              style={{
+                background:    `${accent}0e`,
+                border:        `1px solid ${accent}55`,
+                color:         accent,
+                fontFamily:    T.mono,
+                fontSize:      '10px',
+                letterSpacing: '0.15em',
+                padding:       '0 18px',
+                cursor:        loading || !input.trim() || !apiKey.startsWith('sk-') ? 'not-allowed' : 'pointer',
+                opacity:       loading || !input.trim() || !apiKey.startsWith('sk-') ? 0.4 : 1,
+                textShadow:    glow(accent, 2),
+                flexShrink:    0,
+              }}
+            >SEND</button>
+          </div>
+
+        </div>
+      )}
+    </Panel>
+  )
+}
+
 /* ─── GPU BIAS MONITOR panel ────────────────────────────────── */
 function GpuBiasPanel({ stats }) {
   const gpuBias   = stats?.gpu_bias   ?? {}
@@ -1012,6 +1346,15 @@ export default function App() {
 
             {/* GPU Bias Monitor — full width */}
             <GpuBiasPanel stats={stats} />
+
+            {/* Section: LIFE AGENT */}
+            <div style={S.sectionLabel}>
+              <div style={{ ...S.sectionTick, background: T.pink, boxShadow: glow(T.pink, 3) }} />
+              <span style={{ color: T.pink, textShadow: glow(T.pink, 2) }}>LIFE AGENT // AI VALIDATOR ASSISTANT</span>
+            </div>
+
+            {/* LIFE AGENT panel — full width */}
+            <LifeAgentPanel />
 
           </div>
 
