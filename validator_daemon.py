@@ -1034,12 +1034,37 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
 
         prob = metrics.get("affinity_probability_binary")
         pred = metrics.get("affinity_pred_value")
-        if prob is None or pred is None:
-            log.warning(f"  Boltz affinity fields missing: {list(metrics.keys())}")
+        if prob is not None and pred is not None:
+            # Primary affinity path — same formula as miner's _boltz_score_to_affinity()
+            score = round(-((prob - pred) / ha) * 30.0, 3)
+            log.info(
+                f"  [mRNA-SCORE-SOURCE] affinity path"
+                f"  prob={prob:.4f} pred={pred:.4f} ha={ha} → {score:.3f} kcal/mol"
+            )
+            return score
+        if is_mrna:
+            # iptm fallback path — mirrors miner's parse_mrna_boltz_affinity() exactly:
+            # when Boltz2 skips the affinity JSON for an RNA receptor the miner falls back
+            # to affinity_kcal = -6.0 - 3.0 × iptm.  The validator must use the same
+            # formula so it rescores on the same scale as the claimed value.
+            # _read_boltz_affinity() already reads confidence_* files into metrics,
+            # so iptm is available here without any additional I/O.
+            iptm = metrics.get("iptm")
+            if iptm is not None:
+                score = round(-6.0 - 3.0 * float(iptm), 3)
+                log.info(
+                    f"  [mRNA-SCORE-SOURCE] iptm_fallback path"
+                    f"  iptm={iptm:.4f} → {score:.3f} kcal/mol"
+                )
+                return score
+            log.warning(
+                f"  mRNA Boltz affinity fields missing and no iptm in confidence output:"
+                f" {list(metrics.keys())}"
+            )
             return None
-
-        # Normalization factor: heavy-atom count (siRNA path returns None before this line)
-        return round(-((prob - pred) / ha) * 30.0, 3)   # same conversion as miner
+        # Protein path: affinity fields are mandatory — no iptm fallback
+        log.warning(f"  Boltz affinity fields missing: {list(metrics.keys())}")
+        return None
 
     except Exception as e:
         log.warning(f"  Boltz2 predict() raised: {e}")
