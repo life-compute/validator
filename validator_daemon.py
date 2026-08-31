@@ -349,14 +349,12 @@ def _write_gpu_to_env(gpu_model: str) -> None:
 # ── GPU Bias Tracker ──────────────────────────────────────────────────────────
 
 def _target_family(target_name: str) -> str:
-    """Return a short target-family key.
-    mRNA targets get the 'mRNA_' prefix family so the GPU bias tracker
-    keeps their learning separated from protein targets with the same gene name.
-    Protein targets use the first 4 uppercase chars as before.
+    """Return a short target-family key used as the bias-tracker bucket.
 
-    Handles both naming conventions:
-      - mRNA_ prefix:  mRNA_KRAS → "mRNA_KRAS"
-      - _mRNA suffix:  KRAS_mRNA → "mRNA_KRAS"
+    Namespacing rules (kept isolated so each modality trains its own model):
+      - mRNA targets:   mRNA_KRAS → "mRNA_KRAS",  KRAS_mRNA → "mRNA_KRAS"
+      - CRISPR targets: TP53_CRISPR → "TP53_CRISPR"  (full name, already unique)
+      - Protein:        KRAS → "KRAS"  (first 4 uppercase chars)
     """
     if not target_name:
         return "UNKN"
@@ -364,6 +362,8 @@ def _target_family(target_name: str) -> str:
         return "mRNA_" + target_name[5:].upper()[:4]
     if target_name.endswith("_mRNA"):
         return "mRNA_" + target_name[:-5].upper()[:4]
+    if target_name.upper().endswith("_CRISPR"):
+        return target_name.upper()   # e.g. "TP53_CRISPR" — full name, already unique
     return target_name.upper()[:4]
 
 
@@ -1408,11 +1408,38 @@ def main():
                     _crispr_tgt_name = _CRISPR_ID_TO_NAME.get(target_id_int, target.get("id", "") or "")
                     _crispr_min      = _crispr_threshold(_crispr_tgt_name)
                     quality_ok  = grna_scores.get("combined", 0.0) >= _crispr_min
-                    rel_err     = abs(rescored - claimed) / abs(claimed) if claimed else abs(rescored)
-                    # Mirror the CRISPR_AFFINITY_TOL logic from the main loop:
-                    # combined >= per-target threshold required for CONFIRM; tolerance 0.25 on affinity rel_err
+
+                    # ── GPU-bias correction (CRISPR) ─────────────────────────────
+                    # Use the same bias-tracker architecture as protein/mRNA.
+                    # family key = full CRISPR target name, e.g. "TP53_CRISPR".
+                    # Fall back to raw claimed + CRISPR_AFFINITY_TOL if < GPU_BIAS_MIN_SAMPLES.
                     CRISPR_AFFINITY_TOL = 0.25
-                    within_tol  = quality_ok and rel_err <= CRISPR_AFFINITY_TOL
+                    _crispr_family   = _target_family(_crispr_tgt_name)  # e.g. "TP53_CRISPR"
+                    _crispr_bias     = None
+                    if _gpu_bias_tracker is not None:
+                        _crispr_bias = _gpu_bias_tracker.get_bias_factor(_miner_gpu_model, _crispr_family)
+
+                    if _crispr_bias is not None:
+                        adjusted_claimed = claimed * _crispr_bias
+                        _crispr_tol      = TIGHTENED_TOLERANCE
+                        rel_err = (abs(rescored - adjusted_claimed) / abs(adjusted_claimed)
+                                   if adjusted_claimed else abs(rescored))
+                        log.info(
+                            f"  [GPU-BIAS-CRISPR] {_crispr_family} correction factor {_crispr_bias:.4f} applied"
+                            f" → adjusted {adjusted_claimed:.3f}"
+                            f" → tolerance check {'passed' if (quality_ok and rel_err <= _crispr_tol) else 'failed'}"
+                            f"  (tol={_crispr_tol:.4f})"
+                        )
+                    else:
+                        adjusted_claimed = claimed
+                        _crispr_tol      = CRISPR_AFFINITY_TOL
+                        rel_err = abs(rescored - claimed) / abs(claimed) if claimed else abs(rescored)
+
+                    within_tol = quality_ok and rel_err <= _crispr_tol
+
+                    # ── Record for future bias learning ──────────────────────────
+                    if _gpu_bias_tracker is not None and _miner_gpu_model != "UNKNOWN":
+                        _gpu_bias_tracker.record(_miner_gpu_model, _crispr_family, claimed, rescored)
 
                     verdict = "CONFIRM" if within_tol else "REJECT"
                     log.info(
@@ -1445,7 +1472,9 @@ def main():
                             "rescored":         rescored,
                             "decision":         "CONFIRM" if within_tol else "REJECT",
                             "rel_err":          round(rel_err, 4),
-                            "tolerance_used":   CRISPR_AFFINITY_TOL,
+                            "tolerance_used":   _crispr_tol,
+                            "bias_factor_used": round(_crispr_bias, 6) if _crispr_bias is not None else None,
+                            "adjusted_claimed": round(adjusted_claimed, 4),
                             "tx":               tx,
                             "target_id":        target_id_int,
                             "target_type":      "CRISPR",
@@ -1717,17 +1746,43 @@ def main():
                     continue
 
                 combined   = grna_scores.get("combined", 0.0)
-                # Tolerance check: validator affinity within 25% of claimed
-                CRISPR_AFFINITY_TOL = 0.25
-                if claimed != 0.0:
-                    rel_err = abs(rescored - claimed) / abs(claimed)
-                else:
-                    rel_err = abs(rescored)
+                # Tolerance check: GPU-bias corrected, mirroring the CRISPR thread exactly.
                 _crispr_tgt_name = _CRISPR_ID_TO_NAME.get(target_id_int, target.get("id", "") or "")
                 _crispr_min      = _crispr_threshold(_crispr_tgt_name)
                 quality_ok  = combined >= _crispr_min
-                within_tol  = quality_ok and (rel_err <= CRISPR_AFFINITY_TOL)
+
+                # ── GPU-bias correction (CRISPR, main loop) ──────────────────────
+                CRISPR_AFFINITY_TOL = 0.25
+                _crispr_family   = _target_family(_crispr_tgt_name)  # e.g. "TP53_CRISPR"
+                _crispr_bias     = None
+                if _gpu_bias_tracker is not None:
+                    _crispr_bias = _gpu_bias_tracker.get_bias_factor(_miner_gpu_model, _crispr_family)
+
+                if _crispr_bias is not None:
+                    adjusted_claimed = claimed * _crispr_bias
+                    _crispr_tol      = TIGHTENED_TOLERANCE
+                    rel_err = (abs(rescored - adjusted_claimed) / abs(adjusted_claimed)
+                               if adjusted_claimed else abs(rescored))
+                    log.info(
+                        f"  [GPU-BIAS-CRISPR] {_crispr_family} correction factor {_crispr_bias:.4f} applied"
+                        f" → adjusted {adjusted_claimed:.3f}"
+                        f" → tolerance check {'passed' if (quality_ok and rel_err <= _crispr_tol) else 'failed'}"
+                        f"  (tol={_crispr_tol:.4f})"
+                    )
+                else:
+                    adjusted_claimed = claimed
+                    _crispr_tol      = CRISPR_AFFINITY_TOL
+                    if claimed != 0.0:
+                        rel_err = abs(rescored - claimed) / abs(claimed)
+                    else:
+                        rel_err = abs(rescored)
+
+                within_tol  = quality_ok and (rel_err <= _crispr_tol)
                 verdict     = "CONFIRM" if within_tol else "REJECT"
+
+                # ── Record for future bias learning ──────────────────────────────
+                if _gpu_bias_tracker is not None and _miner_gpu_model != "UNKNOWN":
+                    _gpu_bias_tracker.record(_miner_gpu_model, _crispr_family, claimed, rescored)
 
                 log.info(
                     f"  [CRISPR] {verdict}  combined={combined:.3f}"
@@ -1768,7 +1823,9 @@ def main():
                     "rescored":         rescored,
                     "decision":         crispr_audit_decision,
                     "rel_err":          round(rel_err, 4),
-                    "tolerance_used":   CRISPR_AFFINITY_TOL,
+                    "tolerance_used":   _crispr_tol,
+                    "bias_factor_used": round(_crispr_bias, 6) if _crispr_bias is not None else None,
+                    "adjusted_claimed": round(adjusted_claimed, 4),
                     "difficulty_tier":  difficulty,
                     "target_type":      "CRISPR",
                     "life_earned":      tier_reward if (within_tol and tx) else 0,
