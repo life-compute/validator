@@ -1421,6 +1421,12 @@ def main():
 
                     log.info(f"  [CRISPR-THREAD] Validating {pubkey[:16]}…  target={target.get('id','?')}  claimed={claimed:.3f}")
 
+                    # Expose current CRISPR work to dashboard (mirrors main loop lines 1725-1729)
+                    stats["current_target"] = target.get("id") or str(target_id_int)
+                    stats["current_smiles"]  = smiles
+                    stats["last_updated"]    = datetime.now(timezone.utc).isoformat()
+                    write_stats(stats)
+
                     t0 = time.time()
                     rescored, grna_scores = run_crispr_validation(smiles, target)
                     elapsed = time.time() - t0
