@@ -49,8 +49,8 @@ POLL_SECONDS      = int(_env("POLL_SECONDS", "30"))
 
 # ── Miner allowlist — only process submissions from this wallet ───────────────
 # Set to empty string to accept all miners (open mode).
-MINER_WALLET  = _env("MINER_WALLET",  "5JtrNEfzVavsRyUxUzh2aSer42tGQUAaPyAaeXStVVLF")
-MINER_ACCOUNT = _env("MINER_ACCOUNT", "8i2QhmTj17gZyujv6GESzb7YZuQeLfAbBbxbGC2NkKsi")
+MINER_WALLET  = _env("MINER_WALLET",  "")   # empty = open mode, accept all miners
+MINER_ACCOUNT = _env("MINER_ACCOUNT", "BaMnTDYP1T4kZVwUbv9ZyppgUHeSRKNo9bMDRvFNN2iX")
 
 WORK_DIR    = Path(__file__).parent
 STATS_PATH  = WORK_DIR / "stats.json"
@@ -406,13 +406,46 @@ def _is_crispr_target(target: dict) -> bool:
 # ── CRISPR gRNA three-score analytical validation ─────────────────────────────
 # Mirrors life_crispr.py from the miner (adaptive/life_crispr.py).
 # No GPU required — runs in microseconds on CPU.
-# Combined score = on_target × off_target × delivery
+# Combined score = iptm × delivery  (Option B — off_target removed)
 # Affinity encoding: −6.0 − 2.5 × combined + ε (ε deterministic from SHA-256)
-# Validator confirms if:
-#   (a) validator combined >= CRISPR_MIN_COMBINED_VALIDATOR (0.75), AND
+# CRISPR submissions are confirmed when BOTH:
+#   (a) validator combined >= CRISPR_MIN_COMBINED_VALIDATOR (0.45), AND
 #   (b) |validator_affinity − claimed_affinity| / |claimed_affinity| ≤ 0.25
 
-CRISPR_MIN_COMBINED_VALIDATOR = 0.75   # minimum combined score to confirm
+CRISPR_MIN_COMBINED_VALIDATOR = 0.45   # Option B default threshold: iptm × delivery
+
+# Per-target overrides — must match miner-side values exactly.
+# Only CDK4 and MYC are overridden; all other targets use the default 0.45.
+# BCL2 and TERT are NOT changed here (separate decision, not part of this fix).
+CRISPR_MIN_COMBINED_BY_TARGET: dict[str, float] = {
+    "CDK4_CRISPR": 0.300,
+    "MYC_CRISPR":  0.320,
+}
+
+
+def _crispr_threshold(target_name: str) -> float:
+    """Return the combined-score threshold for a given CRISPR target name.
+    Falls back to CRISPR_MIN_COMBINED_VALIDATOR (0.45) for any target not
+    listed in CRISPR_MIN_COMBINED_BY_TARGET.
+    """
+    return CRISPR_MIN_COMBINED_BY_TARGET.get(target_name, CRISPR_MIN_COMBINED_VALIDATOR)
+
+
+# On-chain integer ID → human-readable target name.
+# Defined at module level so both the main loop and the CRISPR thread can
+# resolve a per-target threshold without duplicating the mapping.
+_CRISPR_ID_TO_NAME: dict[int, str] = {
+    3000: "TP53_CRISPR",
+    3001: "KRAS_CRISPR",
+    3002: "BCL2_CRISPR",
+    3003: "MYC_CRISPR",
+    3004: "EGFR_CRISPR",
+    3005: "HER2_CRISPR",
+    3006: "BRCA1_CRISPR",
+    3007: "PDL1_CRISPR",
+    3008: "TERT_CRISPR",
+    3009: "CDK4_CRISPR",
+}
 
 # Nucleotide complement map
 _CRISPR_COMP = str.maketrans("ACGTacgt", "TGCAtgca")
@@ -538,33 +571,44 @@ _CRISPR_HOTSPOT_GRNAS: dict[str, list[str]] = {
 
 def score_grna(seq: str, target_id: str) -> dict:
     """
-    Score a 20-mer gRNA with the same three-score algorithm as the miner.
+    Score a 20-mer gRNA.  Option B recalibration — matches miner exactly:
 
-    Returns dict with on_target, off_target, delivery, combined, affinity.
-    The affinity is deterministic for a given sequence (SHA-256 seeded ε).
+        combined = iptm × delivery       (off_target factor removed)
+        threshold = CRISPR_MIN_COMBINED_VALIDATOR = 0.45
+
+    iptm mirrors Boltz2's interface-pTM structural confidence: computed
+    analytically as exp(-hamming_to_nearest_hotspot / 8), same as the
+    old on_target term.  The off_target factor is no longer part of the
+    combined score (it was depressing genuinely good gRNAs that happened
+    to have seed-region homology to common repeats).
+
+    Returns dict with iptm, off_target (informational only), delivery,
+    combined, affinity.  The affinity is deterministic for a given
+    sequence (SHA-256 seeded ε), unchanged from before.
     """
     import math
     seq = seq.upper().strip()
     if len(seq) != 20 or not all(c in "ACGT" for c in seq):
-        return {"on_target": 0.0, "off_target": 0.0, "delivery": 0.0,
+        return {"iptm": 0.0, "off_target": 0.0, "delivery": 0.0,
                 "combined": 0.0, "affinity": -6.0}
 
     hotspots = _CRISPR_HOTSPOT_GRNAS.get(target_id, [])
 
-    # ── Score 1: on-target efficiency ────────────────────────────────────────
+    # ── iptm: Boltz2 structural confidence (analytical proxy) ─────────────────
+    # exp(-hamming/8): 1.0 at dist=0, ≈0.08 at dist=20; fallback 0.5 if no hotspot.
     if hotspots:
-        min_dist  = min(_crispr_hamming(seq, h) for h in hotspots)
-        on_target = math.exp(-min_dist / 8.0)
+        min_dist = min(_crispr_hamming(seq, h) for h in hotspots)
+        iptm     = math.exp(-min_dist / 8.0)
     else:
-        on_target = 0.5
+        iptm = 0.5
     if _crispr_has_pam_context(seq):
-        on_target = min(1.0, on_target * 1.05)
+        iptm = min(1.0, iptm * 1.05)
 
-    # ── Score 2: off-target risk ──────────────────────────────────────────────
+    # ── off_target (retained as informational field, not used in combined) ────
     n_off      = _crispr_count_seed_hits(seq)
     off_target = 1.0 / (1.0 + n_off)
 
-    # ── Score 3: delivery compatibility ──────────────────────────────────────
+    # ── delivery compatibility ────────────────────────────────────────────────
     gc = _crispr_gc_content(seq)
     if 0.40 <= gc <= 0.70:
         delivery = 1.0
@@ -575,9 +619,10 @@ def score_grna(seq: str, target_id: str) -> dict:
     if _crispr_has_stem_loop(seq):
         delivery = min(1.1, delivery + 0.1)
 
-    combined = on_target * off_target * delivery
+    # ── Option B combined formula ─────────────────────────────────────────────
+    combined = iptm * delivery
 
-    # Deterministic ε — SHA-256 of the sequence, same as miner
+    # Deterministic ε — SHA-256 of the sequence, unchanged
     import random
     _h   = int(hashlib.sha256(seq.encode()).hexdigest()[:8], 16)
     _rng = random.Random(_h)
@@ -585,8 +630,9 @@ def score_grna(seq: str, target_id: str) -> dict:
     affinity = -6.0 - 2.5 * combined + eps
 
     return {
-        "on_target":  round(on_target,  4),
-        "off_target": round(off_target, 4),
+        "iptm":       round(iptm,       4),
+        "on_target":  round(iptm,       4),   # alias for backward compat with audit fields
+        "off_target": round(off_target, 4),   # informational only
         "delivery":   round(delivery,   4),
         "combined":   round(combined,   4),
         "affinity":   round(affinity,   4),
@@ -639,7 +685,7 @@ def run_crispr_validation(grna_seq: str, target: dict) -> tuple[float | None, di
     scores = score_grna(grna_seq, target_id)
     log.info(
         f"  [CRISPR] {target_id}  gRNA={grna_seq[:16]}…"
-        f"  on={scores['on_target']:.3f}"
+        f"  iptm={scores['iptm']:.3f}"
         f"  off={scores['off_target']:.3f}"
         f"  del={scores['delivery']:.3f}"
         f"  combined={scores['combined']:.3f}"
@@ -1042,18 +1088,21 @@ def _halved_reward(base: int, epoch: int) -> int:
     result = base >> halvings   # equivalent to base // (2 ** halvings)
     return max(1, result) if base > 0 else 0
 
-def fetch_pending_submissions() -> list[dict]:
+def fetch_pending_submissions(crispr_only: bool = False) -> list[dict]:
     """
     getProgramAccounts filtered to ResultSubmission accounts.
     Returns list of dicts with keys: pubkey, miner, target_id, epoch,
     smiles, claimed_affinity, status.
 
     Three RPC-side filters (all must pass):
-      1. dataSize=937        — exact account size for ResultSubmission
+      1. dataSize=938        — exact account size for ResultSubmission
       2. memcmp offset=0     — 8-byte Anchor discriminator (base58)
       3. memcmp offset=576   — is_validated=0x00 (Pending/Validating only)
          Layout: 8+32+1+8+512+2+4+8+1 = 576 bytes before the status byte
          (938-byte accounts have 1 extra byte vs legacy 937-byte layout)
+
+    crispr_only=True  → return only target_ids 3000–3009 (client-side filter)
+    crispr_only=False → return only non-CRISPR target_ids (protein + mRNA)
     """
     import base64, base58
     disc_b58        = base58.b58encode(RESULT_DISCRIMINATOR).decode()
@@ -1118,7 +1167,11 @@ def fetch_pending_submissions() -> list[dict]:
             })
         except Exception as e:
             log.debug(f"  parse error {item.get('pubkey','?')[:16]}: {e}")
-    return results
+    # Client-side type filter: split CRISPR (3000-3009) from protein/mRNA
+    if crispr_only:
+        return [r for r in results if 3000 <= r["target_id"] <= 3009]
+    else:
+        return [r for r in results if not (3000 <= r["target_id"] <= 3009)]
 
 
 # ── On-chain validate call ────────────────────────────────────────────────────
@@ -1302,6 +1355,134 @@ def main():
             write_stats(stats)
     threading.Thread(target=_heartbeat, daemon=True).start()
 
+    # ── CRISPR thread — independent continuous cycle, never blocked by Boltz2 ──
+    def _crispr_loop():
+        nonlocal validated_today, accepted, rejected, life_earned
+        log.info("[CRISPR-THREAD] Started — polling independently of protein/mRNA loop")
+        while True:
+            try:
+                crispr_subs = fetch_pending_submissions(crispr_only=True)
+                if crispr_subs:
+                    log.info(f"[CRISPR-THREAD] Found {len(crispr_subs)} pending CRISPR submission(s)")
+                for sub in crispr_subs:
+                    pubkey        = sub["pubkey"]
+                    smiles        = sub["smiles"]
+                    miner_wallet  = sub["miner"]
+                    target_id_int = sub["target_id"]
+                    claimed       = sub["claimed_affinity"]
+
+                    # Dedup
+                    if _SEEN_SUBMISSIONS.get(pubkey, 0) > _MAX_RETRY_ATTEMPTS:
+                        continue
+
+                    # Security gates (mirrors main loop)
+                    if MINER_WALLET and miner_wallet != MINER_WALLET:
+                        continue
+                    if not _rate_limit_check():
+                        break
+                    if not _check_self_validation(miner_wallet, pubkey):
+                        continue
+                    if abs(claimed) > 50.0:
+                        continue
+                    if not _sanitize_smiles(smiles, pubkey):
+                        continue
+
+                    target = targets_by_id.get(target_id_int)
+                    if not target:
+                        continue
+
+                    target = dict(target)
+                    target["difficulty_tier"] = 3  # CRISPR always tier 3
+
+                    log.info(f"  [CRISPR-THREAD] Validating {pubkey[:16]}…  target={target.get('id','?')}  claimed={claimed:.3f}")
+
+                    t0 = time.time()
+                    rescored, grna_scores = run_crispr_validation(smiles, target)
+                    elapsed = time.time() - t0
+
+                    if rescored is None:
+                        log.warning(f"  [CRISPR] Invalid gRNA for {pubkey[:16]}… — skip")
+                        _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+                        continue
+
+                    _crispr_tgt_name = _CRISPR_ID_TO_NAME.get(target_id_int, target.get("id", "") or "")
+                    _crispr_min      = _crispr_threshold(_crispr_tgt_name)
+                    quality_ok  = grna_scores.get("combined", 0.0) >= _crispr_min
+                    rel_err     = abs(rescored - claimed) / abs(claimed) if claimed else abs(rescored)
+                    # Mirror the CRISPR_AFFINITY_TOL logic from the main loop:
+                    # combined >= per-target threshold required for CONFIRM; tolerance 0.25 on affinity rel_err
+                    CRISPR_AFFINITY_TOL = 0.25
+                    within_tol  = quality_ok and rel_err <= CRISPR_AFFINITY_TOL
+
+                    verdict = "CONFIRM" if within_tol else "REJECT"
+                    log.info(
+                        f"  [CRISPR] {verdict}  combined={grna_scores.get('combined',0):.3f}"
+                        f"  claimed={claimed:.3f}  rescored={rescored:.3f}"
+                        f"  rel_err={rel_err:.3f}  quality_ok={quality_ok}  ({elapsed*1000:.0f}ms)"
+                    )
+
+                    current_epoch = fetch_current_epoch()
+                    tier_reward   = _halved_reward(BASE_TIER_REWARDS.get(3, 7), current_epoch)
+                    log.info(f"  [CRISPR] reward: base={BASE_TIER_REWARDS.get(3,7)} epoch={current_epoch} halvings={current_epoch//HALVING_INTERVAL} → {tier_reward} $LIFE")
+
+                    result = validate_on_chain(pubkey, rescored)
+                    tx     = result.get("tx") if result else None
+                    if tx:
+                        log.info(f"  ✔ [CRISPR] tx: {tx}")
+                        validated_today += 1
+                        if within_tol:
+                            accepted    += 1
+                            life_earned += tier_reward
+                            log.info(f"  +{tier_reward} $LIFE  (CRISPR tier=3)  total={life_earned:.1f}")
+                        else:
+                            rejected += 1
+                        _SEEN_SUBMISSIONS.pop(pubkey, None)
+                        append_audit({
+                            "ts":               datetime.now(timezone.utc).isoformat(),
+                            "submission_pubkey": pubkey,
+                            "miner_wallet":     miner_wallet,
+                            "claimed_score":    claimed,
+                            "rescored":         rescored,
+                            "decision":         "CONFIRM" if within_tol else "REJECT",
+                            "rel_err":          round(rel_err, 4),
+                            "tolerance_used":   CRISPR_AFFINITY_TOL,
+                            "tx":               tx,
+                            "target_id":        target_id_int,
+                            "target_type":      "CRISPR",
+                            "difficulty_tier":  3,
+                            "life_earned":      tier_reward if within_tol else 0,
+                            "grna_on_target":   grna_scores.get("on_target"),
+                            "grna_off_target":  grna_scores.get("off_target"),
+                            "grna_delivery":    grna_scores.get("delivery"),
+                            "grna_combined":    grna_scores.get("combined"),
+                            "smiles":           smiles,
+                        })
+                        append_log({
+                            "ts":               datetime.now(timezone.utc).isoformat(),
+                            "pubkey":           pubkey,
+                            "smiles":           smiles,
+                            "grna_seq":         smiles,
+                            "target_id":        target_id_int,
+                            "claimed":          claimed,
+                            "rescored":         rescored,
+                            "rel_err":          round(rel_err, 4),
+                            "within_tolerance": within_tol,
+                            "verdict":          verdict,
+                            "tx":               tx,
+                            "elapsed_s":        round(elapsed, 3),
+                            "difficulty_tier":  3,
+                            "target_type":      "CRISPR",
+                            "grna_combined":    grna_scores.get("combined"),
+                            "life_earned":      tier_reward if within_tol else 0,
+                        })
+                    else:
+                        log.warning(f"  [CRISPR] validate_on_chain returned no tx")
+                        _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+            except Exception as e:
+                log.error(f"[CRISPR-THREAD] unhandled error: {e}")
+            time.sleep(POLL_SECONDS)
+    threading.Thread(target=_crispr_loop, daemon=True, name="crispr-loop").start()
+
     while True:
         now = time.time()
 
@@ -1356,9 +1537,9 @@ def main():
             log.info(f"Targets loaded: {len(targets)}  (mRNA on-chain IDs registered: {_mrna_registered})  (CRISPR on-chain IDs registered: {_crispr_registered})")
             last_refresh = now
 
-        # Step 1: Poll for pending submissions
-        log.info("Polling for pending submissions...")
-        submissions = fetch_pending_submissions()
+        # Step 1: Poll for pending protein/mRNA submissions (CRISPR handled by its own thread)
+        log.info("Polling for pending submissions (protein/mRNA)...")
+        submissions = fetch_pending_submissions(crispr_only=False)
         log.info(f"  Found {len(submissions)} pending submission(s)")
 
         for sub in submissions:
@@ -1542,7 +1723,9 @@ def main():
                     rel_err = abs(rescored - claimed) / abs(claimed)
                 else:
                     rel_err = abs(rescored)
-                quality_ok  = combined >= CRISPR_MIN_COMBINED_VALIDATOR
+                _crispr_tgt_name = _CRISPR_ID_TO_NAME.get(target_id_int, target.get("id", "") or "")
+                _crispr_min      = _crispr_threshold(_crispr_tgt_name)
+                quality_ok  = combined >= _crispr_min
                 within_tol  = quality_ok and (rel_err <= CRISPR_AFFINITY_TOL)
                 verdict     = "CONFIRM" if within_tol else "REJECT"
 
@@ -1679,8 +1862,11 @@ def main():
             family        = _target_family(target_name)
 
             # ── Look up bias factor for this miner's GPU + target family ────────
+            # GPU bias model is trained on protein docking scores only.
+            # mRNA targets use RNA-mode Boltz2 which produces scores on a different
+            # scale — the bias correction is inapplicable and must be skipped.
             bias_factor = None
-            if _gpu_bias_tracker is not None:
+            if _gpu_bias_tracker is not None and not is_mrna:
                 bias_factor = _gpu_bias_tracker.get_bias_factor(_miner_gpu_model, family)
 
             if bias_factor is not None:
