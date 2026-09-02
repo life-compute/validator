@@ -86,6 +86,23 @@ BASE_TIER_REWARDS: dict[int, int] = {1: 1, 2: 5, 3: 7}
 # Integer arithmetic: reward >> halvings (floor division, minimum 1 if >0).
 HALVING_INTERVAL = 210_000
 
+# ── CRISPR: gRNA similarity-based reward decay ────────────────────────────────
+# Mirrors the miner's reward_decay logic exactly (same proxy, same thresholds).
+# Proxy: Hamming similarity to any prior confirmed gRNA for the same target.
+# Thresholds (miner-deployed 2026-09-02):
+#   similarity >= 0.85  →  0.35x  (highly similar, strong novelty penalty)
+#   0.70 <= sim < 0.85  →  0.65x  (moderately similar, mild penalty)
+#   similarity < 0.70   →  1.0x   (novel, full reward)
+GRNA_SIM_HIGH          = 0.85
+GRNA_SIM_MID           = 0.70
+GRNA_REWARD_HIGH_SIM   = 0.35
+GRNA_REWARD_MID_SIM    = 0.65
+GRNA_REWARD_NOVEL      = 1.0
+
+# Per-target confirmed gRNA history — keyed by on-chain target_id (int).
+# Populated at startup from audit log; updated live after each CONFIRM.
+_CRISPR_GRNA_HISTORY: dict[int, list[str]] = {}
+
 # ── Anchor / JS paths ─────────────────────────────────────────────────────────
 ANCHOR_DIR  = Path(_env("ANCHOR_DIR", "/tmp/life-compute/core"))
 IDL_PATH    = ANCHOR_DIR / "target/idl/life_core.json"
@@ -461,6 +478,87 @@ def _crispr_revcomp(seq: str) -> str:
 
 def _crispr_hamming(a: str, b: str) -> int:
     return sum(x != y for x, y in zip(a, b))
+
+
+def _grna_similarity_reward_factor(grna_seq: str, target_id: int) -> tuple[float, float]:
+    """
+    Compute the similarity-based reward decay factor for a crispr_generated gRNA.
+    Exactly mirrors the miner's algorithm (deployed 2026-09-02).
+
+    Proxy: maximum Hamming similarity = (20 - hamming_dist) / 20
+           against all confirmed gRNAs for this target in _CRISPR_GRNA_HISTORY.
+
+    Thresholds:
+        max_sim >= 0.85  →  0.35x  (high similarity, strong decay)
+        max_sim >= 0.70  →  0.65x  (moderate similarity, mild decay)
+        max_sim  < 0.70  →  1.0x   (novel, full reward)
+
+    Returns
+    -------
+    (reward_factor, max_similarity)
+    """
+    prior = _CRISPR_GRNA_HISTORY.get(target_id, [])
+    if not prior:
+        return GRNA_REWARD_NOVEL, 0.0
+
+    grna_seq = grna_seq.upper().strip()
+    n = len(grna_seq)
+    max_sim = 0.0
+    for p in prior:
+        p_up = p.upper().strip()
+        if len(p_up) != n:
+            continue
+        dist = sum(a != b for a, b in zip(grna_seq, p_up))
+        sim  = (n - dist) / n
+        if sim > max_sim:
+            max_sim = sim
+
+    if max_sim >= GRNA_SIM_HIGH:          # >= 0.85
+        factor = GRNA_REWARD_HIGH_SIM     # 0.35x
+    elif max_sim >= GRNA_SIM_MID:         # >= 0.70
+        factor = GRNA_REWARD_MID_SIM      # 0.65x
+    else:
+        factor = GRNA_REWARD_NOVEL        # 1.0x
+
+    return factor, max_sim
+
+
+def _load_crispr_grna_history():
+    """
+    Warm up _CRISPR_GRNA_HISTORY from the audit log at startup.
+
+    Collects all confirmed gRNAs per target so similarity decay fires correctly
+    on the first submission after a restart (not just after first live CONFIRM).
+    """
+    if not AUDIT_JSONL.exists():
+        return
+    loaded = 0
+    try:
+        with AUDIT_JSONL.open() as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                    if r.get("target_type") != "CRISPR":
+                        continue
+                    if r.get("decision") != "CONFIRM":
+                        continue
+                    grna = (r.get("smiles") or "").strip().upper()
+                    tid  = r.get("target_id")
+                    if not grna or len(grna) != 20 or tid is None:
+                        continue
+                    history = _CRISPR_GRNA_HISTORY.setdefault(tid, [])
+                    if grna not in history:
+                        history.append(grna)
+                        loaded += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    if loaded:
+        log.info(
+            f"[GRNA-HISTORY] Loaded {loaded} confirmed gRNA(s) from audit log "
+            f"across {len(_CRISPR_GRNA_HISTORY)} target(s)"
+        )
 
 
 def _crispr_gc_content(seq: str) -> float:
@@ -1328,6 +1426,9 @@ def main():
     if _SEEN_SUBMISSIONS:
         log.info(f"Restored {len(_SEEN_SUBMISSIONS)} already-processed submission(s) from audit log")
 
+    # Load confirmed gRNA history for similarity-based reward decay
+    _load_crispr_grna_history()
+
     # Initialize today-counters from today's log so a restart doesn't zero the display
     today_date = _today_date_utc()
     validated_today, accepted, rejected = _count_today_from_log()
@@ -1483,6 +1584,18 @@ def main():
                     tier_reward   = _halved_reward(BASE_TIER_REWARDS.get(3, 7), current_epoch)
                     log.info(f"  [CRISPR] reward: base={BASE_TIER_REWARDS.get(3,7)} epoch={current_epoch} halvings={current_epoch//HALVING_INTERVAL} → {tier_reward} $LIFE")
 
+                    # ── Similarity-based reward decay (mirrors miner, deployed 2026-09-02) ──
+                    grna_reward_factor, grna_max_sim = _grna_similarity_reward_factor(
+                        smiles, target_id_int
+                    )
+                    effective_reward = int(tier_reward * grna_reward_factor)
+                    log.info(
+                        f"  [GRNA-DECAY] target={target_id_int}  gRNA={smiles[:16]}…"
+                        f"  history_size={len(_CRISPR_GRNA_HISTORY.get(target_id_int, []))}"
+                        f"  max_sim={grna_max_sim:.3f}  factor={grna_reward_factor}x"
+                        f"  tier_reward={tier_reward} → effective_reward={effective_reward}"
+                    )
+
                     result = validate_on_chain(pubkey, rescored)
                     tx     = result.get("tx") if result else None
                     if tx:
@@ -1490,8 +1603,12 @@ def main():
                         validated_today += 1
                         if within_tol:
                             accepted    += 1
-                            life_earned += tier_reward
-                            log.info(f"  +{tier_reward} $LIFE  (CRISPR tier=3)  total={life_earned:.1f}")
+                            life_earned += effective_reward
+                            log.info(f"  +{effective_reward} $LIFE  (CRISPR tier=3, factor={grna_reward_factor}x)  total={life_earned:.1f}")
+                            # Register gRNA in history so subsequent submissions are compared against it
+                            grna_upper = smiles.upper().strip()
+                            if len(grna_upper) == 20 and grna_upper not in _CRISPR_GRNA_HISTORY.get(target_id_int, []):
+                                _CRISPR_GRNA_HISTORY.setdefault(target_id_int, []).append(grna_upper)
                         else:
                             rejected += 1
                         _SEEN_SUBMISSIONS.pop(pubkey, None)
@@ -1510,12 +1627,14 @@ def main():
                             "target_id":        target_id_int,
                             "target_type":      "CRISPR",
                             "difficulty_tier":  3,
-                            "life_earned":      tier_reward if within_tol else 0,
+                            "life_earned":      effective_reward if within_tol else 0,
                             "grna_on_target":   grna_scores.get("on_target"),
                             "grna_off_target":  grna_scores.get("off_target"),
                             "grna_delivery":    grna_scores.get("delivery"),
                             "grna_combined":    grna_scores.get("combined"),
                             "smiles":           smiles,
+                            "grna_reward_factor": grna_reward_factor,
+                            "grna_max_sim":       round(grna_max_sim, 4),
                         })
                         append_log({
                             "ts":               datetime.now(timezone.utc).isoformat(),
@@ -1827,13 +1946,29 @@ def main():
                 tier_reward  = _halved_reward(TIER_REWARDS.get(difficulty, 7), current_epoch)
                 log.info(f"  [CRISPR] reward: base={TIER_REWARDS.get(difficulty,7)} epoch={current_epoch} halvings={current_epoch//HALVING_INTERVAL} → {tier_reward} $LIFE")
 
+                # ── Similarity-based reward decay (mirrors miner, deployed 2026-09-02) ──
+                grna_reward_factor, grna_max_sim = _grna_similarity_reward_factor(
+                    smiles, target_id_int
+                )
+                effective_reward = int(tier_reward * grna_reward_factor)
+                log.info(
+                    f"  [GRNA-DECAY] target={target_id_int}  gRNA={smiles[:16]}…"
+                    f"  history_size={len(_CRISPR_GRNA_HISTORY.get(target_id_int, []))}"
+                    f"  max_sim={grna_max_sim:.3f}  factor={grna_reward_factor}x"
+                    f"  tier_reward={tier_reward} → effective_reward={effective_reward}"
+                )
+
                 result = validate_on_chain(pubkey, rescored)
                 tx = result.get("tx") if result else None
                 if tx:
                     log.info(f"  ✔ tx: {tx}")
                     if within_tol:
-                        life_earned += tier_reward
-                        log.info(f"  +{tier_reward} $LIFE  (tier={difficulty})  total={life_earned:.1f}")
+                        life_earned += effective_reward
+                        log.info(f"  +{effective_reward} $LIFE  (tier={difficulty}, factor={grna_reward_factor}x)  total={life_earned:.1f}")
+                        # Register gRNA in history so subsequent submissions are compared against it
+                        grna_upper = smiles.upper().strip()
+                        if len(grna_upper) == 20 and grna_upper not in _CRISPR_GRNA_HISTORY.get(target_id_int, []):
+                            _CRISPR_GRNA_HISTORY.setdefault(target_id_int, []).append(grna_upper)
                     _SEEN_SUBMISSIONS.pop(pubkey, None)
                 else:
                     log.warning(f"  validate_on_chain returned no tx")
@@ -1859,13 +1994,15 @@ def main():
                     "adjusted_claimed": round(adjusted_claimed, 4),
                     "difficulty_tier":  difficulty,
                     "target_type":      "CRISPR",
-                    "life_earned":      tier_reward if (within_tol and tx) else 0,
+                    "life_earned":      effective_reward if (within_tol and tx) else 0,
                     "grna_on_target":   grna_scores.get("on_target"),
                     "grna_off_target":  grna_scores.get("off_target"),
                     "grna_delivery":    grna_scores.get("delivery"),
                     "grna_combined":    combined,
                     "smiles":           smiles,        # gRNA sequence stored in smiles field
                     "target_id":        target_id_int,
+                    "grna_reward_factor": grna_reward_factor,
+                    "grna_max_sim":       round(grna_max_sim, 4),
                 })
                 append_log({
                     "ts":               datetime.now(timezone.utc).isoformat(),
