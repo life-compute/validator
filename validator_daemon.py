@@ -54,8 +54,9 @@ MINER_ACCOUNT = _env("MINER_ACCOUNT", "BaMnTDYP1T4kZVwUbv9ZyppgUHeSRKNo9bMDRvFNN
 
 WORK_DIR    = Path(__file__).parent
 STATS_PATH  = WORK_DIR / "stats.json"
-LOG_JSONL   = WORK_DIR / "output" / "validator_log.jsonl"
-AUDIT_JSONL = WORK_DIR / "output" / "validator_audit.jsonl"
+LOG_JSONL        = WORK_DIR / "output" / "validator_log.jsonl"
+AUDIT_JSONL      = WORK_DIR / "output" / "validator_audit.jsonl"
+CRANK_QUEUE_FILE = WORK_DIR / "output" / "crank_queue.jsonl"
 (WORK_DIR / "output").mkdir(exist_ok=True)
 
 # ── Boltz2 / MSA paths ────────────────────────────────────────────────────────
@@ -235,6 +236,28 @@ def append_audit(row: dict) -> None:
     row.setdefault("ts", datetime.now(timezone.utc).isoformat())
     with AUDIT_JSONL.open("a") as f:
         f.write(json.dumps(row) + "\n")
+
+
+# ── Crank queue ───────────────────────────────────────────────────────────────
+
+def append_crank_queue(submission_pubkey: str) -> None:
+    """
+    Signal life_crank.js to mint reward for a freshly-confirmed ResultSubmission.
+
+    The crank reads new lines from CRANK_QUEUE_FILE using a byte-offset pointer
+    (crank_queue.jsonl.pos) so no line is ever re-processed after a restart.
+    The on-chain reward_minted flag is the real idempotency guard; this queue is
+    just a low-latency hint to avoid waiting for the next periodic scan.
+    """
+    try:
+        with CRANK_QUEUE_FILE.open("a") as f:
+            f.write(json.dumps({
+                "pubkey": submission_pubkey,
+                "ts":     datetime.now(timezone.utc).isoformat(),
+            }) + "\n")
+    except Exception as _e:
+        # Never let a queue-write failure block the validator loop
+        log.warning(f"  [CRANK-QUEUE] write failed ({_e}) — crank will pick up via scan")
 
 
 # ── Today-counter helpers ──────────────────────────────────────────────────────
@@ -1664,6 +1687,10 @@ def main():
                     if tx:
                         log.info(f"  ✔ [CRISPR] tx: {tx}")
                         validated_today += 1
+                        # Signal crank to mint reward for this confirmed submission.
+                        # Only when within_tol (CONFIRM) — REJECTs never reach Confirmed status.
+                        if within_tol:
+                            append_crank_queue(pubkey)
                         # Commission = (miner_amount/20)/confirming_count  [mint_reward.rs]
                         # mRNA/CRISPR/protein-Hard all use the same 25 LIFE miner base.
                         # grna_reward_factor (novelty decay) applies to the MINER reward only;
@@ -2043,6 +2070,7 @@ def main():
                 if tx:
                     log.info(f"  ✔ tx: {tx}")
                     if within_tol:
+                        append_crank_queue(pubkey)
                         life_earned += commission
                         log.info(
                             f"  +{commission:.4f} $LIFE commission"
@@ -2234,6 +2262,7 @@ def main():
             if tx:
                 log.info(f"  ✔ tx: {tx}")
                 if within_tol:
+                    append_crank_queue(pubkey)
                     life_earned += commission
                     log.info(
                         f"  +{commission:.4f} $LIFE commission  (tier={difficulty})  "
