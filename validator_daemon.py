@@ -77,9 +77,24 @@ GPU_BIAS_PATH = WORK_DIR / "output" / "gpu_bias_models.json"
 GPU_BIAS_MIN_SAMPLES = 10
 
 # ── Tokenomics: base rewards and halving schedule ──────────────────────────────
-# Base tier rewards (pre-halving).  CRISPR submissions are tier 3.
-# Updated 2026-08-23: CRISPR tier-3 reward reduced from 25 → 7 $LIFE.
+# Miner base rewards by difficulty tier (raw LIFE units, matching on-chain constants.rs).
+# Tier 1=Easy(1), Tier 2=Medium(5), Tier 3=Hard(25).  All molecule types use these.
+ONCHAIN_MINER_BASE: dict[int, int] = {1: 1, 2: 5, 3: 25}
+
+# Legacy alias used by _halved_reward() calls that still exist in logging paths.
+# Do NOT use for commission calculation — use ONCHAIN_MINER_BASE instead.
 BASE_TIER_REWARDS: dict[int, int] = {1: 1, 2: 5, 3: 7}
+
+# On-chain two-layer halving constants (mirrors rewards.rs / constants.rs).
+# Layer 1 — cumulative supply milestones (raw units at 6 decimals):
+_HALVING_M1 = 5_250_000  * 1_000_000   # 100% → 50% after this many raw tokens minted
+_HALVING_M2 = 10_500_000 * 1_000_000   # 50%  → 25%
+_HALVING_M3 = 15_750_000 * 1_000_000   # 25%  → 12.5%
+# Layer 2 — per-target hit count thresholds:
+_HALVING_HIT_T1 = 100    # below this: 100%; at/above: 75%
+_HALVING_HIT_T2 = 1_000  # at/above this: 50%
+# Number of confirming validators required (on-chain network_config.validators_required).
+_VALIDATORS_REQUIRED = 2
 
 # Halving schedule: every 210,000 on-chain epochs the reward halves.
 # multiplier = 0.5 ** (current_epoch // HALVING_INTERVAL)
@@ -1211,6 +1226,54 @@ def _halved_reward(base: int, epoch: int) -> int:
     result = base >> halvings   # equivalent to base // (2 ** halvings)
     return max(1, result) if base > 0 else 0
 
+def _validator_commission(difficulty_tier: int, total_minted_raw: int, hit_count: int,
+                          confirming_count: int = _VALIDATORS_REQUIRED) -> float:
+    """
+    Exact on-chain formula from mint_reward.rs:
+
+        base_reward = ONCHAIN_MINER_BASE[difficulty_tier]  (LIFE)
+        amount      = calculate_reward(base_reward, total_minted, hit_count)
+                    = base_reward_raw * l1_num * l2_num / 32
+        per_validator_commission = (amount // 20) // confirming_count
+
+    Returns the per-validator commission in LIFE (float).
+
+    Layer 1 (supply milestones) and Layer 2 (hit count) both apply.
+    On devnet at launch total_minted is near-zero → L1=8/8=100%.
+    hit_count is typically < 100 per target → L2=4/4=100%.
+    In both full cases: amount = base_reward_raw, commission = base/20/2.
+
+    Pass total_minted_raw=0 and hit_count=0 for the common devnet-launch case.
+    """
+    ONE_LIFE = 1_000_000
+    base_raw = ONCHAIN_MINER_BASE.get(difficulty_tier, 1) * ONE_LIFE
+
+    # Layer 1: supply milestone multiplier (numerator / 8)
+    if total_minted_raw <= _HALVING_M1:
+        l1 = 8   # 100%
+    elif total_minted_raw <= _HALVING_M2:
+        l1 = 4   # 50%
+    elif total_minted_raw <= _HALVING_M3:
+        l1 = 2   # 25%
+    else:
+        l1 = 1   # 12.5%
+
+    # Layer 2: per-target hit count multiplier (numerator / 4)
+    if hit_count < _HALVING_HIT_T1:
+        l2 = 4   # 100%
+    elif hit_count < _HALVING_HIT_T2:
+        l2 = 3   # 75%
+    else:
+        l2 = 2   # 50%
+
+    # Combined (Rust integer arithmetic — floor div, matching on-chain):
+    amount_raw = base_raw * l1 * l2 // 32
+    if confirming_count <= 0:
+        return 0.0
+    per_validator_raw = (amount_raw // 20) // confirming_count
+    return per_validator_raw / ONE_LIFE
+
+
 def fetch_pending_submissions(crispr_only: bool = False) -> list[dict]:
     """
     getProgramAccounts filtered to ResultSubmission accounts.
@@ -1601,10 +1664,22 @@ def main():
                     if tx:
                         log.info(f"  ✔ [CRISPR] tx: {tx}")
                         validated_today += 1
+                        # Commission = (miner_amount/20)/confirming_count  [mint_reward.rs]
+                        # mRNA/CRISPR/protein-Hard all use the same 25 LIFE miner base.
+                        # grna_reward_factor (novelty decay) applies to the MINER reward only;
+                        # validator commission is always the flat formula — no decay applied.
+                        commission = _validator_commission(difficulty_tier=3,
+                                                           total_minted_raw=0,
+                                                           hit_count=0)
                         if within_tol:
                             accepted    += 1
-                            life_earned += effective_reward
-                            log.info(f"  +{effective_reward} $LIFE  (CRISPR tier=3, factor={grna_reward_factor}x)  total={life_earned:.1f}")
+                            life_earned += commission
+                            log.info(
+                                f"  +{commission:.4f} $LIFE commission"
+                                f"  (CRISPR tier=3, formula=25/20/{_VALIDATORS_REQUIRED})"
+                                f"  total={life_earned:.4f}"
+                                f"  [miner grna_decay={grna_reward_factor:.2f}x — not applied to validator]"
+                            )
                             # Register gRNA in history so subsequent submissions are compared against it
                             grna_upper = smiles.upper().strip()
                             if len(grna_upper) == 20 and grna_upper not in _CRISPR_GRNA_HISTORY.get(target_id_int, []):
@@ -1627,7 +1702,7 @@ def main():
                             "target_id":        target_id_int,
                             "target_type":      "CRISPR",
                             "difficulty_tier":  3,
-                            "life_earned":      effective_reward if within_tol else 0,
+                            "life_earned":      round(commission, 6) if within_tol else 0,
                             "grna_on_target":   grna_scores.get("on_target"),
                             "grna_off_target":  grna_scores.get("off_target"),
                             "grna_delivery":    grna_scores.get("delivery"),
@@ -1652,7 +1727,7 @@ def main():
                             "difficulty_tier":  3,
                             "target_type":      "CRISPR",
                             "grna_combined":    grna_scores.get("combined"),
-                            "life_earned":      tier_reward if within_tol else 0,
+                            "life_earned":      round(commission, 6) if within_tol else 0,
                         })
                     else:
                         log.warning(f"  [CRISPR] validate_on_chain returned no tx")
@@ -1958,13 +2033,23 @@ def main():
                     f"  tier_reward={tier_reward} → effective_reward={effective_reward}"
                 )
 
+                # Commission = (miner_amount/20)/confirming_count  [mint_reward.rs]
+                # grna_reward_factor (novelty decay) applies to the MINER reward only.
+                commission = _validator_commission(difficulty_tier=difficulty,
+                                                   total_minted_raw=0,
+                                                   hit_count=0)
                 result = validate_on_chain(pubkey, rescored)
                 tx = result.get("tx") if result else None
                 if tx:
                     log.info(f"  ✔ tx: {tx}")
                     if within_tol:
-                        life_earned += effective_reward
-                        log.info(f"  +{effective_reward} $LIFE  (tier={difficulty}, factor={grna_reward_factor}x)  total={life_earned:.1f}")
+                        life_earned += commission
+                        log.info(
+                            f"  +{commission:.4f} $LIFE commission"
+                            f"  (tier={difficulty}, formula={ONCHAIN_MINER_BASE.get(difficulty,1)}/20/{_VALIDATORS_REQUIRED})"
+                            f"  total={life_earned:.4f}"
+                            f"  [miner grna_decay={grna_reward_factor:.2f}x — not applied to validator]"
+                        )
                         # Register gRNA in history so subsequent submissions are compared against it
                         grna_upper = smiles.upper().strip()
                         if len(grna_upper) == 20 and grna_upper not in _CRISPR_GRNA_HISTORY.get(target_id_int, []):
@@ -1994,7 +2079,7 @@ def main():
                     "adjusted_claimed": round(adjusted_claimed, 4),
                     "difficulty_tier":  difficulty,
                     "target_type":      "CRISPR",
-                    "life_earned":      effective_reward if (within_tol and tx) else 0,
+                    "life_earned":      round(commission, 6) if (within_tol and tx) else 0,
                     "grna_on_target":   grna_scores.get("on_target"),
                     "grna_off_target":  grna_scores.get("off_target"),
                     "grna_delivery":    grna_scores.get("delivery"),
@@ -2020,7 +2105,7 @@ def main():
                     "difficulty_tier":  difficulty,
                     "target_type":      "CRISPR",
                     "grna_combined":    combined,
-                    "life_earned":      tier_reward if (within_tol and tx) else 0,
+                    "life_earned":      round(commission, 6) if (within_tol and tx) else 0,
                 })
                 stats.update({
                     "validated_today": validated_today,
@@ -2128,11 +2213,20 @@ def main():
             log.info(f"  {verdict}  claimed={claimed:.3f}  rescored={rescored:.3f}  "
                      f"rel_err={rel_err:.3f}  ({elapsed:.1f}s)")
 
-            # ── Tier reward (mirrors miner tokenomics: halved every 210k epochs) ──
-            difficulty    = target.get("difficulty_tier", 1)
-            current_epoch = fetch_current_epoch()
-            tier_reward   = _halved_reward(BASE_TIER_REWARDS.get(difficulty, 1), current_epoch)
-            log.info(f"  reward: base={BASE_TIER_REWARDS.get(difficulty,1)} epoch={current_epoch} halvings={current_epoch//HALVING_INTERVAL} → {tier_reward} $LIFE")
+            # ── Validator commission — exact on-chain formula from mint_reward.rs ──
+            # commission = (miner_amount / 20) / confirming_count
+            # miner_amount = calculate_reward(base, total_minted, hit_count)
+            # At devnet launch: total_minted ≈ 0 (L1=100%), hit_count ≈ 0 (L2=100%)
+            # → commission = ONCHAIN_MINER_BASE[tier] / 20 / _VALIDATORS_REQUIRED
+            difficulty = target.get("difficulty_tier", 1)
+            commission = _validator_commission(difficulty_tier=difficulty,
+                                               total_minted_raw=0,
+                                               hit_count=0)
+            miner_base = ONCHAIN_MINER_BASE.get(difficulty, 1)
+            log.info(
+                f"  commission: miner_base={miner_base} LIFE"
+                f"  → {miner_base}/20/{_VALIDATORS_REQUIRED} = {commission:.4f} $LIFE/validator"
+            )
 
             # Step 4: Submit on-chain
             result = validate_on_chain(pubkey, rescored)
@@ -2140,10 +2234,10 @@ def main():
             if tx:
                 log.info(f"  ✔ tx: {tx}")
                 if within_tol:
-                    life_earned += tier_reward   # halving-adjusted tier reward
+                    life_earned += commission
                     log.info(
-                        f"  +{tier_reward} $LIFE  (tier={difficulty})  "
-                        f"total={life_earned:.1f}"
+                        f"  +{commission:.4f} $LIFE commission  (tier={difficulty})  "
+                        f"total={life_earned:.4f}"
                     )
                 # Tx landed — account will flip to Validating; remove from retry
                 # tracker so we don't needlessly hold the pubkey in memory forever.
@@ -2189,7 +2283,7 @@ def main():
                 "tolerance_used":   round(tol, 4),
                 "difficulty_tier":  difficulty,
                 "target_type":      "CRISPR" if is_crispr else ("RNA" if is_mrna else "PROTEIN"),
-                "life_earned":      tier_reward if (within_tol and tx) else 0,
+                "life_earned":      round(commission, 6) if (within_tol and tx) else 0,
             })
 
             append_log({
@@ -2206,7 +2300,7 @@ def main():
                 "elapsed_s":        round(elapsed, 1),
                 "difficulty_tier":  difficulty,
                 "target_type":      "CRISPR" if is_crispr else ("RNA" if is_mrna else "PROTEIN"),
-                "life_earned":      tier_reward if (within_tol and tx) else 0,
+                "life_earned":      round(commission, 6) if (within_tol and tx) else 0,
             })
 
             # Write stats immediately after each validation so dashboard is live
