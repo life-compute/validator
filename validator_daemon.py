@@ -1640,13 +1640,15 @@ def fetch_pending_submissions(crispr_only: bool = False) -> list[dict]:
     """
     import base64, base58
     disc_b58        = base58.b58encode(RESULT_DISCRIMINATOR).decode()
-    unvalidated_b58 = base58.b58encode(bytes([0x00])).decode()   # is_validated=0x00
     # Build filters list — optionally restrict to a single miner wallet at the RPC level
     # to avoid fetching/processing corrupt submissions from other (old) wallets.
+    # NOTE: we do NOT filter by status byte here — Pending (0x00) and Validating (0x01)
+    # both need to be returned.  The status=0x00 memcmp would miss all Validating accounts,
+    # which may still need an additional validator vote to reach validators_required.
+    # Status filtering is applied client-side below after parsing.
     filters = [
         {"dataSize": 938},
-        {"memcmp": {"offset": 0,   "bytes": disc_b58}},
-        {"memcmp": {"offset": 576, "bytes": unvalidated_b58}},
+        {"memcmp": {"offset": 0, "bytes": disc_b58}},
     ]
     if MINER_WALLET:
         miner_wallet_b58 = base58.b58encode(base58.b58decode(MINER_WALLET)).decode()
