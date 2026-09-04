@@ -2,10 +2,15 @@
 """
 LIFE Compute — Validator Daemon (devnet)
 
-Three-step loop every POLL_SECONDS:
-  1. getProgramAccounts → find all ResultSubmission PDAs with status Pending/Validating
-  2. For each: re-run Boltz2 on the claimed SMILES against the same target
-  3. Call validate_result on-chain — confirm if |rescored - claimed| / |claimed| ≤ 25%
+Event-driven architecture (WS-first):
+  1. programSubscribe WebSocket → notified within seconds when a ResultSubmission
+     account is created or changes state; parsed and enqueued immediately.
+  2. A dispatcher thread routes items to _crispr_queue or _protein_queue.
+  3. CRISPR worker drains _crispr_queue (analytical, no Boltz2).
+     Protein/mRNA worker (main thread) drains _protein_queue (Boltz2 rescore).
+  4. validate_result on-chain — confirm if |rescored - claimed| / |claimed| ≤ tol.
+  5. getProgramAccounts catch-up sweep every 5 min recovers any submissions
+     missed during WS disconnects or silent RPC notification drops.
 
 On-chain call uses the same Node.js / Anchor stack as the miner.
 Boltz2 scoring runs directly via the boltz Python API (pip boltz==2.2.1).
@@ -21,7 +26,7 @@ Security hardening (2026-08-13):
   - Input sanitization: SMILES length < 500 chars, valid chemical chars only.
   - Audit log: every validation decision → output/validator_audit.jsonl.
 """
-import json, time, logging, os, re, shutil, stat, subprocess, sys, threading
+import asyncio, json, time, logging, os, queue, re, shutil, stat, subprocess, sys, threading
 import urllib.request, hashlib, uuid
 from collections import deque
 from pathlib import Path
@@ -46,6 +51,41 @@ VALIDATOR_KEYPAIR = _env("VALIDATOR_KEYPAIR", str(Path.home() / ".life-compute/w
 PAYER_KEYPAIR     = _env("PAYER_KEYPAIR",     str(Path.home() / ".life-compute/wallet.json"))
 TARGETS_URL       = _env("TARGETS_URL",       "https://raw.githubusercontent.com/life-compute/targets/master/targets.json")
 POLL_SECONDS      = int(_env("POLL_SECONDS", "30"))
+
+# ── WebSocket subscription config ─────────────────────────────────────────────
+# Derive WS endpoint from the HTTP RPC URL (https→wss, http→ws).
+# Override with SOLANA_WS env var for custom RPC providers (e.g. Helius, QuickNode).
+def _rpc_to_ws(http_url: str) -> str:
+    if http_url.startswith("https://"):
+        return "wss://" + http_url[len("https://"):]
+    if http_url.startswith("http://"):
+        return "ws://" + http_url[len("http://"):]
+    return http_url
+
+SOLANA_WS = _env("SOLANA_WS", _rpc_to_ws(SOLANA_RPC))
+
+# Keepalive: if no pong is received within PING_TIMEOUT seconds after a ping,
+# the connection is considered dead and the listener reconnects.
+WS_PING_INTERVAL = 20   # seconds between pings
+WS_PING_TIMEOUT  = 10   # seconds to wait for pong
+WS_MAX_BACKOFF   = 60   # cap on exponential reconnect backoff (seconds)
+
+# Catch-up poll interval (seconds).
+# Protects against two real failure modes even with the WS "connected":
+#   (a) Silent notification drops from public devnet RPC nodes under load —
+#       the WS appears healthy but notifications simply don't arrive.
+#   (b) Submissions that existed before subscribe time (daemon restart) —
+#       Solana does NOT replay historical states on (re)subscription.
+# 5 minutes: worst-case delay for a missed submission is 5 min, not 30.
+# The sweep is a no-op when nothing new exists, so overhead is negligible.
+CATCHUP_POLL_INTERVAL = 300   # seconds (5 minutes)
+
+# ── Shared submission work queues ─────────────────────────────────────────────
+# WS listener and catch-up poller both write to _submission_queue.
+# Dispatcher thread routes items to the appropriate typed sub-queue.
+_submission_queue: queue.Queue = queue.Queue()   # raw events from WS / sweep
+_protein_queue:    queue.Queue = queue.Queue()   # protein + mRNA items → main worker
+_crispr_queue:     queue.Queue = queue.Queue()   # CRISPR items → crispr worker
 
 # ── Miner allowlist — only process submissions from this wallet ───────────────
 # Set to empty string to accept all miners (open mode).
@@ -333,6 +373,22 @@ def _load_seen_from_audit() -> None:
                         _SEEN_SUBMISSIONS[pk] = min(
                             _SEEN_SUBMISSIONS.get(pk, 0) + 1,
                             _MAX_RETRY_ATTEMPTS,
+                        )
+                    # Terminal security-gate rejections: these submissions will never
+                    # pass (corrupted score, invalid SMILES, unknown target, wallet
+                    # mismatch, self-validation).  Count each occurrence so they are
+                    # evicted from the queue after _MAX_RETRY_ATTEMPTS re-encounters,
+                    # surviving daemon restarts without re-clogging the catchup poll.
+                    elif decision in (
+                        "CORRUPTED_SCORE",
+                        "SMILES_INVALID",
+                        "UNKNOWN_TARGET",
+                        "WALLET_NOT_ALLOWED",
+                        "SELF_VALIDATION_REJECTED",
+                    ):
+                        _SEEN_SUBMISSIONS[pk] = min(
+                            _SEEN_SUBMISSIONS.get(pk, 0) + 1,
+                            _MAX_RETRY_ATTEMPTS + 1,  # one above cap → immediate skip
                         )
                 except Exception:
                     pass
@@ -1297,6 +1353,223 @@ def _validator_commission(difficulty_tier: int, total_minted_raw: int, hit_count
     return per_validator_raw / ONE_LIFE
 
 
+# ── Account parser (shared by WS listener and catch-up poller) ───────────────
+
+def _parse_result_submission(pubkey: str, data: bytes) -> dict | None:
+    """
+    Parse raw ResultSubmission account bytes (938-byte layout).
+    Returns a submission dict or None if the account is not Pending/Validating,
+    the data is malformed, or the SMILES field is empty.
+
+    Layout (after 8-byte Anchor discriminator):
+      [32 miner][2 target_id u16][8 epoch][512 smiles][2 smiles_len]
+      [4 claimed_affinity f32][8 submitted_slot i64][1 status]
+    Status byte sits at offset 576.
+    """
+    import struct
+    import base58 as _b58
+    try:
+        if len(data) < 578:
+            return None
+        off = 8
+        miner      = data[off:off+32]; off += 32
+        target_id  = int.from_bytes(data[off:off+2], "little"); off += 2
+        epoch      = int.from_bytes(data[off:off+8], "little"); off += 8
+        smiles_raw = data[off:off+512]; off += 512
+        smiles_len = int.from_bytes(data[off:off+2], "little"); off += 2
+        claimed    = struct.unpack_from("<f", data, off)[0]; off += 4
+        off       += 8          # submitted_slot
+        status     = data[off]
+        if status not in (STATUS_PENDING, STATUS_VALIDATING):
+            return None
+        smiles = smiles_raw[:smiles_len].decode("utf-8", errors="replace").strip("\x00")
+        if not smiles:
+            return None
+        return {
+            "pubkey":           pubkey,
+            "miner":            _b58.b58encode(miner).decode(),
+            "target_id":        target_id,
+            "epoch":            epoch,
+            "smiles":           smiles,
+            "claimed_affinity": float(claimed),
+            "status":           status,
+        }
+    except Exception as e:
+        log.debug(f"  _parse_result_submission {pubkey[:16]}: {e}")
+        return None
+
+
+# ── WebSocket subscription loop (async, runs in its own thread) ───────────────
+
+async def _ws_subscription_loop():
+    """
+    Maintain a persistent programSubscribe WebSocket connection to the Solana
+    cluster.  Every time a ResultSubmission account (dataSize=938) is created
+    or updated the RPC pushes the full account data here; we parse it and place
+    it on _submission_queue so the workers pick it up within seconds.
+
+    Reconnects with exponential backoff on any error, forever.
+    No state is carried across reconnects — the catch-up poll covers the gap.
+    """
+    import base64
+    import websockets
+
+    attempt = 0
+    while True:
+        try:
+            async with websockets.connect(
+                SOLANA_WS,
+                ping_interval=WS_PING_INTERVAL,
+                ping_timeout=WS_PING_TIMEOUT,
+                max_size=10 * 1024 * 1024,   # 10 MB: headroom for account data batches
+            ) as ws:
+                attempt = 0   # reset backoff on successful connect
+                log.info(f"[WS] Connected → {SOLANA_WS}")
+
+                # programSubscribe — dataSize filter keeps noise down; status and
+                # discriminator filters are applied client-side after parse so we
+                # never miss an account that changes from Pending→Validating.
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "programSubscribe",
+                    "params": [
+                        PROGRAM_ID,
+                        {
+                            "encoding":    "base64",
+                            "commitment":  "confirmed",
+                            "filters":     [{"dataSize": 938}],
+                        },
+                    ],
+                }))
+
+                raw = await ws.recv()
+                resp = json.loads(raw)
+                log.info(f"[WS] Subscription confirmed  id={resp.get('result')}")
+
+                async for raw_msg in ws:
+                    try:
+                        msg = json.loads(raw_msg)
+                        if msg.get("method") != "programNotification":
+                            continue
+
+                        val    = msg["params"]["result"]["value"]
+                        pubkey = val["pubkey"]
+                        acct   = val["account"]
+                        data   = base64.b64decode(acct["data"][0])
+
+                        # Fast pre-checks before full parse
+                        if data[:8] != RESULT_DISCRIMINATOR:
+                            continue
+                        if len(data) > 576 and data[576] not in (STATUS_PENDING, STATUS_VALIDATING):
+                            continue   # already Confirmed/Rejected — ignore
+
+                        sub = _parse_result_submission(pubkey, data)
+                        if sub is None:
+                            continue
+
+                        log.debug(
+                            f"[WS] Queuing {pubkey[:16]}…  "
+                            f"target={sub['target_id']}  status={sub['status']}"
+                        )
+                        _submission_queue.put_nowait(sub)
+
+                    except Exception as e:
+                        log.debug(f"[WS] message parse error: {e}")
+
+        except Exception as e:
+            attempt += 1
+            backoff = min(2 ** attempt, WS_MAX_BACKOFF)
+            log.warning(
+                f"[WS] Disconnected ({type(e).__name__}: {e}) — "
+                f"reconnecting in {backoff}s (attempt {attempt})"
+            )
+            await asyncio.sleep(backoff)
+
+
+def _start_ws_listener():
+    """
+    Launch _ws_subscription_loop in a dedicated OS thread with its own asyncio
+    event loop.  The rest of the daemon stays purely synchronous.
+    """
+    def _runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_ws_subscription_loop())   # runs forever
+
+    t = threading.Thread(target=_runner, daemon=True, name="ws-listener")
+    t.start()
+    log.info("[WS] Listener thread started")
+    return t
+
+
+# ── Dispatcher thread: routes _submission_queue → typed sub-queues ─────────────
+
+def _start_dispatcher():
+    """
+    Read items from _submission_queue and route them to either _crispr_queue
+    (target_id 3000–3009) or _protein_queue (all others).
+    Dedup against _SEEN_SUBMISSIONS here so neither worker sees duplicates:
+    the WS can deliver multiple notifications for the same account (e.g. on
+    creation and again when status flips to Validating).
+    """
+    def _dispatcher():
+        while True:
+            try:
+                sub = _submission_queue.get(timeout=5)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                log.error(f"[DISPATCHER] queue.get error: {e}")
+                continue
+
+            pubkey = sub["pubkey"]
+
+            # Dedup: if already tracked (processed or max-retried) skip silently
+            if _SEEN_SUBMISSIONS.get(pubkey, 0) > _MAX_RETRY_ATTEMPTS:
+                log.debug(f"[DISPATCHER] {pubkey[:16]}… already at max retries — dropped")
+                continue
+
+            if 3000 <= sub["target_id"] <= 3009:
+                _crispr_queue.put_nowait(sub)
+            else:
+                _protein_queue.put_nowait(sub)
+
+    t = threading.Thread(target=_dispatcher, daemon=True, name="dispatcher")
+    t.start()
+    log.info("[DISPATCHER] Routing thread started")
+    return t
+
+
+# ── Catch-up poll (safety net for WS gaps and post-restart warm-up) ──────────
+
+def _catchup_poll_once():
+    """
+    Run a full getProgramAccounts sweep and enqueue any pending submissions
+    not already in _SEEN_SUBMISSIONS.  Called every CATCHUP_POLL_INTERVAL
+    seconds (5 min) from the main worker loop.
+
+    Recovers submissions missed due to:
+      - Silent notification drops on public devnet RPC under load
+      - Submissions that existed before the WS subscribed (daemon restart)
+      - Brief disconnect windows between ping detection and reconnect (~30–60s)
+    """
+    try:
+        subs = fetch_pending_submissions(crispr_only=False)
+        subs += fetch_pending_submissions(crispr_only=True)
+        new = 0
+        for sub in subs:
+            if _SEEN_SUBMISSIONS.get(sub["pubkey"], 0) <= _MAX_RETRY_ATTEMPTS:
+                _submission_queue.put_nowait(sub)
+                new += 1
+        if new:
+            log.info(f"[CATCHUP-POLL] Enqueued {new} submission(s) not yet seen by WS")
+        else:
+            log.debug("[CATCHUP-POLL] No new submissions — WS delivery healthy")
+    except Exception as e:
+        log.warning(f"[CATCHUP-POLL] sweep failed: {e}")
+
+
 def fetch_pending_submissions(crispr_only: bool = False) -> list[dict]:
     """
     getProgramAccounts filtered to ResultSubmission accounts.
@@ -1558,7 +1831,7 @@ def main():
     }
     write_stats(stats)
 
-    # Heartbeat thread — updates last_heartbeat every 30s independent of poll cycle
+    # Heartbeat thread — updates last_heartbeat every 30s independent of validation work
     def _heartbeat():
         while True:
             time.sleep(30)
@@ -1567,15 +1840,25 @@ def main():
             write_stats(stats)
     threading.Thread(target=_heartbeat, daemon=True).start()
 
-    # ── CRISPR thread — independent continuous cycle, never blocked by Boltz2 ──
-    def _crispr_loop():
+    # ── Event-driven infrastructure ───────────────────────────────────────────
+    # Start WS listener (pushes to _submission_queue on every account change),
+    # dispatcher (routes to _crispr_queue or _protein_queue), and CRISPR worker.
+    # The main thread becomes the protein/mRNA worker draining _protein_queue.
+    _start_ws_listener()
+    _start_dispatcher()
+
+    # ── CRISPR worker — drains _crispr_queue, never touches Boltz2 ───────────
+    def _crispr_worker():
         nonlocal validated_today, accepted, rejected, life_earned
-        log.info("[CRISPR-THREAD] Started — polling independently of protein/mRNA loop")
+        log.info("[CRISPR-WORKER] Started — waiting for queue items")
         while True:
             try:
-                crispr_subs = fetch_pending_submissions(crispr_only=True)
-                if crispr_subs:
-                    log.info(f"[CRISPR-THREAD] Found {len(crispr_subs)} pending CRISPR submission(s)")
+                # Block up to 5s so the thread stays responsive to daemon exit
+                try:
+                    sub = _crispr_queue.get(timeout=5)
+                except queue.Empty:
+                    continue
+                crispr_subs = [sub]
                 for sub in crispr_subs:
                     pubkey        = sub["pubkey"]
                     smiles        = sub["smiles"]
@@ -1583,7 +1866,8 @@ def main():
                     target_id_int = sub["target_id"]
                     claimed       = sub["claimed_affinity"]
 
-                    # Dedup
+                    # Dedup guard (dispatcher already checked, but be defensive
+                    # in case a catch-up poll re-queued an item between checks)
                     if _SEEN_SUBMISSIONS.get(pubkey, 0) > _MAX_RETRY_ATTEMPTS:
                         continue
 
@@ -1760,12 +2044,21 @@ def main():
                         log.warning(f"  [CRISPR] validate_on_chain returned no tx")
                         _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
             except Exception as e:
-                log.error(f"[CRISPR-THREAD] unhandled error: {e}")
-            time.sleep(POLL_SECONDS)
-    threading.Thread(target=_crispr_loop, daemon=True, name="crispr-loop").start()
+                log.error(f"[CRISPR-WORKER] unhandled error: {e}")
+            # No sleep — loop immediately back to queue.get(timeout=5)
+    threading.Thread(target=_crispr_worker, daemon=True, name="crispr-worker").start()
+
+    # ── Protein/mRNA worker (main thread) — drains _protein_queue ────────────
+    last_catchup = time.time()
+    _catchup_poll_once()   # immediate warm-up sweep on startup
 
     while True:
         now = time.time()
+
+        # Catch-up poll every 5 minutes (safety net for WS drops / restart gaps)
+        if now - last_catchup >= CATCHUP_POLL_INTERVAL:
+            _catchup_poll_once()
+            last_catchup = now
 
         # Reset today-counters at midnight UTC
         new_date = _today_date_utc()
@@ -1818,11 +2111,14 @@ def main():
             log.info(f"Targets loaded: {len(targets)}  (mRNA on-chain IDs registered: {_mrna_registered})  (CRISPR on-chain IDs registered: {_crispr_registered})")
             last_refresh = now
 
-        # Step 1: Poll for pending protein/mRNA submissions (CRISPR handled by its own thread)
-        log.info("Polling for pending submissions (protein/mRNA)...")
-        submissions = fetch_pending_submissions(crispr_only=False)
-        log.info(f"  Found {len(submissions)} pending submission(s)")
+        # Step 1: Wait for the next protein/mRNA submission from the queue.
+        # Block up to 10s so the catch-up timer and target refresh above can fire.
+        try:
+            sub = _protein_queue.get(timeout=10)
+        except queue.Empty:
+            continue   # no work yet — loop back for timer checks
 
+        submissions = [sub]
         for sub in submissions:
             pubkey        = sub["pubkey"]
             smiles        = sub["smiles"]
@@ -1845,6 +2141,7 @@ def main():
                     f"  {pubkey[:16]}…: miner wallet {miner_wallet[:16]}… "
                     f"not in allowlist — skipping (old/unknown wallet)"
                 )
+                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
                 append_audit({
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
@@ -1871,6 +2168,7 @@ def main():
 
             # ── Security gate 2: self-validation prevention ───────────────────
             if not _check_self_validation(miner_wallet, pubkey):
+                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
                 append_audit({
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
@@ -1894,6 +2192,7 @@ def main():
                     f"  {pubkey[:16]}…: claimed_score {claimed:.6g} exceeds "
                     f"|{_CLAIMED_SCORE_MAX}| — corrupted submission, skipping"
                 )
+                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
                 append_audit({
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
@@ -1907,6 +2206,7 @@ def main():
 
             # ── Security gate 4: SMILES input sanitization ────────────────────
             if not _sanitize_smiles(smiles, pubkey):
+                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
                 append_audit({
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
@@ -1921,6 +2221,7 @@ def main():
             target = targets_by_id.get(target_id_int)
             if not target:
                 log.warning(f"  {pubkey[:16]}…: unknown target_id={target_id_int} — skip")
+                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
                 append_audit({
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
@@ -2368,8 +2669,7 @@ def main():
         })
         write_stats(stats)
         log.info(f"Validated={validated_today}  Accept={accept_rate}%  $LIFE={life_earned:.1f}  Validators={net_info.get('active_validators',0)}")
-        log.info(f"Sleeping {POLL_SECONDS}s...")
-        time.sleep(POLL_SECONDS)
+        # No sleep — loop back immediately to queue.get(timeout=10)
 
 
 if __name__ == "__main__":
