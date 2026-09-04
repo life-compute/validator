@@ -1266,16 +1266,38 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
 
 
 # ── Solana RPC helpers ────────────────────────────────────────────────────────
-def _rpc(method: str, params: list) -> dict:
+def _rpc(method: str, params: list, max_retries: int = 3) -> dict:
+    """JSON-RPC call with exponential-backoff retry on HTTP 429.
+
+    Solana's public devnet endpoint aggressively rate-limits getProgramAccounts.
+    A single-shot call fails permanently whenever the host is rate-limited, so
+    we retry up to *max_retries* times with a 6-second base delay that doubles
+    each attempt.  The caller still sees an exception if all attempts fail.
+    """
+    import urllib.error as _ue
     payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-    req = urllib.request.Request(
-        SOLANA_RPC,
-        data=payload.encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(
+                SOLANA_RPC,
+                data=payload.encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except _ue.HTTPError as e:
+            last_exc = e
+            if e.code == 429 and attempt < max_retries:
+                delay = 6 * (2 ** (attempt - 1))   # 6 s, 12 s
+                log.debug(f"_rpc {method}: 429 rate-limited, retry {attempt}/{max_retries} in {delay}s")
+                time.sleep(delay)
+            else:
+                raise
+        except Exception as e:
+            raise
+    raise last_exc
 
 
 def fetch_current_epoch() -> int:
@@ -1411,6 +1433,7 @@ async def _ws_subscription_loop():
     Reconnects with exponential backoff on any error, forever.
     No state is carried across reconnects — the catch-up poll covers the gap.
     """
+    global _ws_connected_since, _ws_last_notification_time
     import base64
     import websockets
 
@@ -1425,6 +1448,7 @@ async def _ws_subscription_loop():
             ) as ws:
                 attempt = 0   # reset backoff on successful connect
                 log.info(f"[WS] Connected → {SOLANA_WS}")
+                _ws_connected_since = time.time()
 
                 # programSubscribe — dataSize filter keeps noise down; status and
                 # discriminator filters are applied client-side after parse so we
@@ -1473,6 +1497,7 @@ async def _ws_subscription_loop():
                             f"target={sub['target_id']}  status={sub['status']}"
                         )
                         _submission_queue.put_nowait(sub)
+                        _ws_last_notification_time = time.time()
 
                     except Exception as e:
                         log.debug(f"[WS] message parse error: {e}")
@@ -1543,17 +1568,35 @@ def _start_dispatcher():
 
 # ── Catch-up poll (safety net for WS gaps and post-restart warm-up) ──────────
 
-def _catchup_poll_once():
+# Adaptive catchup interval state — shared between _catchup_poll_once() and main loop.
+# On a 429 failure the interval shrinks so the next window is caught quickly.
+# On success it resets to the full 5-minute cadence.
+_catchup_interval: int = CATCHUP_POLL_INTERVAL   # starts at 300s
+
+# WS silence detector — track when the WS last delivered a submission notification.
+# If the WS has been connected for > WS_SILENCE_THRESHOLD seconds without delivering
+# anything, _catchup_poll_once() is triggered immediately (outside its normal timer).
+WS_SILENCE_THRESHOLD = 90   # seconds: force catchup if WS silent this long after connect
+_ws_last_notification_time: float = 0.0   # updated whenever WS enqueues a submission
+_ws_connected_since: float = 0.0          # updated on each [WS] Connected event
+
+
+def _catchup_poll_once() -> bool:
     """
     Run a full getProgramAccounts sweep and enqueue any pending submissions
-    not already in _SEEN_SUBMISSIONS.  Called every CATCHUP_POLL_INTERVAL
-    seconds (5 min) from the main worker loop.
+    not already in _SEEN_SUBMISSIONS.  Called every _catchup_interval seconds
+    from the main worker loop, or immediately when WS silence is detected.
+
+    Returns True on success (even if no new submissions), False on failure.
+    On 429 failure the global _catchup_interval is shortened to 60 s so the
+    next open RPC window is caught quickly.  On success it resets to 300 s.
 
     Recovers submissions missed due to:
-      - Silent notification drops on public devnet RPC under load
+      - Silent notification throttling on public devnet RPC under load (primary)
       - Submissions that existed before the WS subscribed (daemon restart)
       - Brief disconnect windows between ping detection and reconnect (~30–60s)
     """
+    global _catchup_interval
     try:
         subs = fetch_pending_submissions(crispr_only=False)
         subs += fetch_pending_submissions(crispr_only=True)
@@ -1566,8 +1609,17 @@ def _catchup_poll_once():
             log.info(f"[CATCHUP-POLL] Enqueued {new} submission(s) not yet seen by WS")
         else:
             log.debug("[CATCHUP-POLL] No new submissions — WS delivery healthy")
+        # Success: restore full 5-minute interval
+        if _catchup_interval != CATCHUP_POLL_INTERVAL:
+            log.info(f"[CATCHUP-POLL] RPC recovered — resetting interval to {CATCHUP_POLL_INTERVAL}s")
+            _catchup_interval = CATCHUP_POLL_INTERVAL
+        return True
     except Exception as e:
         log.warning(f"[CATCHUP-POLL] sweep failed: {e}")
+        # Shorten interval so we retry within 60 s instead of waiting the full 5 min
+        _catchup_interval = 60
+        log.warning(f"[CATCHUP-POLL] rate-limited — next attempt in {_catchup_interval}s")
+        return False
 
 
 def fetch_pending_submissions(crispr_only: bool = False) -> list[dict]:
@@ -2061,8 +2113,24 @@ def main():
     while True:
         now = time.time()
 
-        # Catch-up poll every 5 minutes (safety net for WS drops / restart gaps)
-        if now - last_catchup >= CATCHUP_POLL_INTERVAL:
+        # Catch-up poll: adaptive interval (60 s when rate-limited, 300 s when healthy).
+        # Also fires immediately if the WS has been connected for > WS_SILENCE_THRESHOLD
+        # seconds without delivering any notification — the public devnet RPC silently
+        # throttles programSubscribe under load, keeping TCP alive but sending no events.
+        ws_connected = _ws_connected_since > 0
+        ws_silence = (
+            ws_connected
+            and (now - _ws_connected_since) > WS_SILENCE_THRESHOLD
+            and (now - _ws_last_notification_time) > WS_SILENCE_THRESHOLD
+        )
+        if ws_silence and (now - last_catchup) > 10:
+            log.info(
+                f"[CATCHUP-POLL] WS silent for >{WS_SILENCE_THRESHOLD}s — "
+                f"forcing catchup sweep"
+            )
+            _catchup_poll_once()
+            last_catchup = now
+        elif now - last_catchup >= _catchup_interval:
             _catchup_poll_once()
             last_catchup = now
 
