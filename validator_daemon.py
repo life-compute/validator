@@ -1905,6 +1905,12 @@ def main():
                     if rescored is None:
                         log.warning(f"  [CRISPR] Invalid gRNA for {pubkey[:16]}… — skip")
                         _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+                        # Clear dashboard "PROCESSING" state — this submission is done,
+                        # not in progress.  Mirrors the clear done on confirm/reject paths.
+                        stats["current_target"] = None
+                        stats["current_smiles"]  = None
+                        stats["last_updated"]    = datetime.now(timezone.utc).isoformat()
+                        write_stats(stats)
                         continue
 
                     _crispr_tgt_name = _CRISPR_ID_TO_NAME.get(target_id_int, target.get("id", "") or "")
