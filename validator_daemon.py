@@ -1023,21 +1023,170 @@ def validate_protein(
 
 
 # ── Stage-3: validate_crispr() ────────────────────────────────────────────────
-# Formula: score_grna() → affinity = -6.0 - 2.5*combined + ε (deterministic SHA-256 ε)
-# Both miner and validator run the same analytical formula → rel_err ≈ 0.000-0.050.
-# No Boltz2 GPU call needed — fully analytical, runs in microseconds.
+# Authoritative rescoring: real Boltz2 3-chain iptm, matching the miner exactly.
 #
-# Sanity gate from 1,379 real CRISPR CONFIRMs:
-#   rescored spans -8.90 to -6.49, gate set to -9.5/-5.5 with margin.
-#   All 1,379 historical CONFIRMs fall inside this gate (100%).
+# Miner path (adaptive/life_crispr_boltz.py):
+#   Builds a 3-chain Boltz2 input — SpCas9 protein (chain A), spacer+scaffold
+#   RNA (chain B), revcomp(spacer)+NGG DNA (chain C) — runs structure prediction
+#   (no properties/affinity block), reads iptm from confidence JSON top-level,
+#   computes affinity_kcal = -6.0 - 3.0 × iptm.
+#
+# Validator mirrors this exactly.  score_grna() is retained only as a fast
+# pre-screen gate: if combined < threshold the gRNA is garbage and Boltz2 is
+# skipped.  The authoritative rescored value is always the Boltz2 iptm result.
+#
+# Sanity gate: -9.5 to -5.5 kcal/mol (iptm ∈ (0,1] → score ∈ (-9,-6) by construction).
+# Tolerance: 0.25 (unchanged from prior CRISPR_TOL).
 
 CRISPR_SANITY_LO: float = -9.5
 CRISPR_SANITY_HI: float = -5.5
+CRISPR_TOL: float = 0.25
 
-# CRISPR uses CRISPR_AFFINITY_TOL=0.25 (tighter than protein, since formula is deterministic)
-# GPU bias not needed for CRISPR (analytical formula → rescored ≈ claimed); tracker starts
-# fresh, no corrections applied until 10 samples accumulate.
-CRISPR_TOL: float = 0.25  # = CRISPR_AFFINITY_TOL
+# ── SpCas9 / gRNA constants (mirrors adaptive/life_crispr_boltz.py exactly) ───
+# First 200 aa of SpCas9 recognition lobe (UniProt P0DOT7) — single-seq mode,
+# no MSA required.  Same 200-aa fragment used for every target regardless of gene.
+SPCAS9_REC1_200AA: str = (
+    "MDKKYSIGLDIGTNSVGWAVITDEYKVPSKKFKVLGNTDRHSIKKNLIGALLFDSGETAEATRLKRTARRRYTRRK"
+    "NRICYLQEIFSNEMAKVDDSFFHRLEESFLVEEDKKHERHPIFGNIVDEVAYHEKYPTIYHLRKKLVDSTDKADLRL"
+    "IYLALAHMIKFRGHFLIEGDLNPDNSDVDKLFIQLVQTYNQLFEENP"
+)  # exactly 200 aa: 76 + 77 + 47
+
+# Canonical SpCas9 sgRNA scaffold (76 nt), appended after the 20-nt spacer.
+# Spacer (chain B) = spacer_seq + SGRNA_SCAFFOLD_RNA  (96 nt total).
+SGRNA_SCAFFOLD_RNA: str = (
+    "GTTTTAGAGCTAGAAATAGCAAGTTAAAATAAGGCTAGTCCGTTATCAACTTGAAAAAGTGGCACCGAGTCGGTGC"
+)
+
+# Complement map for building the DNA target strand (chain C).
+_DNA_COMP: dict[str, str] = {"A": "T", "T": "A", "G": "C", "C": "G"}
+
+
+def _revcomp(seq: str) -> str:
+    """Reverse complement of a DNA sequence."""
+    return "".join(_DNA_COMP.get(b, "N") for b in reversed(seq.upper()))
+
+
+def _write_crispr_boltz_yaml(in_dir: Path, mol_id: int, target_id: str,
+                              grna_seq: str) -> Path:
+    """
+    Build the 3-chain Boltz2 YAML for a CRISPR gRNA submission.
+
+    Chain A — protein  : SPCAS9_REC1_200AA (SpCas9 recognition lobe, msa=empty)
+    Chain B — rna      : grna_seq (20 nt spacer) + SGRNA_SCAFFOLD_RNA (76 nt)
+    Chain C — dna      : revcomp(grna_seq) + "NGG" (23 nt target strand + PAM)
+
+    No properties block → structure-only mode → Boltz2 writes confidence_*.json
+    with top-level "iptm" field.
+    """
+    import yaml as _yaml
+    spacer   = grna_seq.upper()
+    rna_seq  = spacer + SGRNA_SCAFFOLD_RNA          # 20 + 76 = 96 nt
+    dna_seq  = _revcomp(spacer) + "NGG"             # 20 + 3 = 23 nt
+    data = {
+        "version": 1,
+        "sequences": [
+            {"protein": {"id": "A", "sequence": SPCAS9_REC1_200AA, "msa": "empty"}},
+            {"rna":     {"id": "B", "sequence": rna_seq}},
+            {"dna":     {"id": "C", "sequence": dna_seq}},
+        ],
+        # NO properties block — structure-only mode, iptm is the signal
+    }
+    yaml_path = in_dir / f"{mol_id}_{target_id}.yaml"
+    yaml_path.write_text(_yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+    return yaml_path
+
+
+def run_boltz2_crispr_iptm(grna_seq: str, target: dict,
+                            seed: int = BOLTZ_SEED) -> float | None:
+    """
+    Run Boltz2 in structure-only mode for a CRISPR gRNA and return affinity
+    via  -6.0 - 3.0 × iptm,  matching adaptive/life_crispr_boltz.py exactly.
+
+    3-chain complex: SpCas9 protein (A) + spacer+scaffold RNA (B) + DNA target (C).
+    Boltz2 runs structure prediction (no properties/affinity block).
+    iptm is read from the top-level "iptm" field of the confidence JSON.
+
+    Returns affinity in kcal/mol, or None on any failure.
+    """
+    from boltz.main import predict
+
+    grna_seq  = grna_seq.upper().strip().replace("U", "T")
+    target_id = target.get("id", "UNKNOWN")
+
+    if len(grna_seq) != 20 or not all(c in "ACGT" for c in grna_seq):
+        log.warning(f"  [CRISPR-BOLTZ] invalid gRNA length/alphabet: {grna_seq[:24]} — skip")
+        return None
+
+    mol_id   = _mol_id(grna_seq)      # deterministic hash of the sequence
+    run_uuid = str(uuid.uuid4())
+    run_root = Path(f"/tmp/life-validator-crispr-{run_uuid}")
+    in_dir   = run_root / "inputs"
+    out_dir  = run_root / "outputs"
+    in_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(run_root, stat.S_IRWXU)   # 700: owner-only
+
+    try:
+        yaml_path = _write_crispr_boltz_yaml(in_dir, mol_id, target_id, grna_seq)
+
+        # ── Integrity check: re-read and verify the spacer sequence ───────────
+        import yaml as _yaml
+        written = _yaml.safe_load(yaml_path.read_text())
+        rna_blocks = [s["rna"] for s in written.get("sequences", []) if "rna" in s]
+        if not rna_blocks:
+            log.warning("  [CRISPR-BOLTZ] SECURITY: no rna block in written YAML — skip")
+            return None
+        written_spacer = rna_blocks[0].get("sequence", "")[:20]
+        if written_spacer.upper() != grna_seq:
+            log.warning(
+                f"  [CRISPR-BOLTZ] SECURITY: spacer mismatch after write "
+                f"(expected={grna_seq} actual={written_spacer}) — skip"
+            )
+            return None
+
+        boltz_start = time.time()
+
+        # ── Run Boltz2 in structure-only mode (no affinity flags) ─────────────
+        predict.main([
+            str(in_dir),
+            "--out_dir",          str(out_dir),
+            "--recycling_steps",  str(_RECYCLING_STEPS),
+            "--sampling_steps",   str(_SAMPLING_STEPS),
+            "--diffusion_samples", str(_DIFFUSION_SAMPLES),
+            "--output_format",    "mmcif",
+            "--seed",             str(seed),
+            "--num_workers",      "0",
+            "--accelerator",      "gpu",
+            "--override",
+            "--no_kernels",
+        ], standalone_mode=False)
+
+        # ── Read iptm from confidence JSON (reuse existing reader) ─────────────
+        metrics = _read_boltz_affinity(out_dir, mol_id, target_id, boltz_start)
+        if metrics is None:
+            log.warning(f"  [CRISPR-BOLTZ] no confidence output for {grna_seq[:16]}…")
+            return None
+
+        iptm = metrics.get("iptm")
+        if iptm is None:
+            log.warning(
+                f"  [CRISPR-BOLTZ] iptm missing from confidence JSON "
+                f"(keys: {list(metrics.keys())[:8]})"
+            )
+            return None
+
+        score = round(-6.0 - 3.0 * float(iptm), 4)
+        log.info(
+            f"  [CRISPR-BOLTZ] -6.0-3.0*iptm  "
+            f"gRNA={grna_seq[:16]}…  iptm={iptm:.4f} → {score:.4f} kcal/mol"
+        )
+        return score
+
+    except Exception as exc:
+        log.warning(f"  [CRISPR-BOLTZ] Boltz2 raised: {exc}")
+        return None
+    finally:
+        shutil.rmtree(str(run_root), ignore_errors=True)
 
 
 def validate_crispr(
@@ -1050,8 +1199,14 @@ def validate_crispr(
     """
     Validate a CRISPR gRNA submission end-to-end.
 
-    Returns same dict shape as validate_protein(), with modality="CRISPR".
-    No Boltz2 call — score_grna() is purely analytical (microseconds).
+    Two-stage pipeline:
+      Stage A — analytical pre-screen (score_grna): fast CPU check.
+                If combined < CRISPR_MIN_COMBINED_VALIDATOR the gRNA is
+                garbage; skip Boltz2 and return VALIDATOR_ERROR immediately.
+      Stage B — Boltz2 iptm rescore (run_boltz2_crispr_iptm): authoritative.
+                Mirrors adaptive/life_crispr_boltz.py on the miner exactly.
+                Tolerance check is applied to the Boltz2 result, not the
+                analytical pre-screen value.
     """
     result: dict = {
         "modality":         "CRISPR",
@@ -1059,7 +1214,7 @@ def validate_crispr(
         "sanity_ok":        False,
         "sanity_note":      "",
         "bias_factor":      None,
-        "bias_note":        "CRISPR: analytical formula, bias not applied",
+        "bias_note":        "CRISPR: Boltz2 iptm rescore, no bias correction",
         "adjusted_claimed": claimed,
         "rel_err":          None,
         "tol":              CRISPR_TOL,
@@ -1067,51 +1222,92 @@ def validate_crispr(
         "verdict":          "VALIDATOR_ERROR",
     }
 
-    # ── Step 1: Run analytical scoring ────────────────────────────────────────
-    rescored, grna_scores = run_crispr_validation(grna_seq, target)
-    result["rescored"] = rescored
-    if rescored is None:
+    # ── Stage A: analytical pre-screen (fast gate, no GPU) ───────────────────
+    # run_crispr_validation() handles: int→string ID mapping, U→T, length check.
+    prescreen_affinity, grna_scores = run_crispr_validation(grna_seq, target)
+    if prescreen_affinity is None:
+        # Invalid sequence (bad length or alphabet)
         result["sanity_note"] = "Invalid gRNA (bad length/alphabet)"
         result["verdict"]     = "VALIDATOR_ERROR"
         return result
 
-    # ── Step 2: Sanity gate ───────────────────────────────────────────────────
+    combined = grna_scores.get("combined", 0.0)
+    # target.get("id") is the authoritative target identifier (already resolved
+    # by run_crispr_validation's int→string mapping inside grna_scores indirectly,
+    # but the target dict's "id" field is what _crispr_threshold expects).
+    target_name = target.get("id", "")
+    # If target_id is an on-chain integer, map it to the string name first.
+    _CRISPR_ONCHAIN_TO_NAME_V: dict = {
+        3000: "TP53_CRISPR",  3001: "KRAS_CRISPR",  3002: "BCL2_CRISPR",
+        3003: "MYC_CRISPR",   3004: "EGFR_CRISPR",  3005: "HER2_CRISPR",
+        3006: "BRCA1_CRISPR", 3007: "PDL1_CRISPR",  3008: "TERT_CRISPR",
+        3009: "CDK4_CRISPR",
+    }
+    try:
+        target_name = _CRISPR_ONCHAIN_TO_NAME_V.get(int(target_name), str(target_name))
+    except (ValueError, TypeError):
+        target_name = str(target_name)
+    threshold = _crispr_threshold(target_name)
+    if combined < threshold:
+        result["sanity_note"] = (
+            f"pre-screen combined={combined:.4f} < threshold={threshold:.3f} — skip Boltz2"
+        )
+        result["verdict"] = "VALIDATOR_ERROR"
+        log.info(
+            f"  [CRISPR] pre-screen FAIL  combined={combined:.3f} < {threshold:.3f}"
+            f"  gRNA={grna_seq[:16]}… — skipping Boltz2"
+        )
+        return result
+
+    log.info(
+        f"  [CRISPR] pre-screen OK  combined={combined:.3f} ≥ {threshold:.3f}"
+        f"  gRNA={grna_seq[:16]}… — launching Boltz2"
+    )
+
+    # ── Stage B: Boltz2 iptm rescore (authoritative) ─────────────────────────
+    rescored = run_boltz2_crispr_iptm(grna_seq, target, seed=BOLTZ_SEED)
+    result["rescored"] = rescored
+    if rescored is None:
+        result["sanity_note"] = "Boltz2 returned None"
+        result["verdict"]     = "VALIDATOR_ERROR"
+        return result
+
+    # ── Sanity gate on Boltz2 result ──────────────────────────────────────────
     if not (CRISPR_SANITY_LO <= rescored <= CRISPR_SANITY_HI):
         result["sanity_ok"]   = False
         result["sanity_note"] = (
             f"rescored={rescored:.3f} outside [{CRISPR_SANITY_LO}, {CRISPR_SANITY_HI}]"
         )
         result["verdict"] = "VALIDATOR_ERROR"
-        log.warning(f"  [CRISPR-SANITY] rescored={rescored:.3f} outside "
-                    f"[{CRISPR_SANITY_LO},{CRISPR_SANITY_HI}] — VALIDATOR_ERROR")
+        log.warning(
+            f"  [CRISPR-SANITY] rescored={rescored:.3f} outside "
+            f"[{CRISPR_SANITY_LO},{CRISPR_SANITY_HI}] — VALIDATOR_ERROR"
+        )
         return result
     result["sanity_ok"]   = True
     result["sanity_note"] = "ok"
 
-    # ── Step 3: No GPU bias for CRISPR (analytical formula is deterministic) ──
-    # Bias tracker still records for future reference, but correction is not applied.
-    # CRISPR bias_factors should cluster near 1.0 (same formula both sides).
-    # If significant drift appears in future data, re-evaluate.
-    family = _target_family(target.get("id", ""))
-    if bias_tracker is not None and gpu_model and gpu_model != "UNKNOWN":
-        bias_tracker.record(gpu_model, family, claimed, rescored)
-
-    adjusted_claimed = claimed  # no correction
+    # ── Tolerance check ───────────────────────────────────────────────────────
+    adjusted_claimed = claimed
     tol              = CRISPR_TOL
-
-    # ── Step 4: Tolerance check ───────────────────────────────────────────────
     denom   = abs(adjusted_claimed)
     rel_err = abs(rescored - adjusted_claimed) / denom if denom else abs(rescored)
     within_tol = rel_err <= tol
 
     result["adjusted_claimed"] = adjusted_claimed
+    result["tol"]              = tol
     result["rel_err"]          = round(rel_err, 4)
     result["within_tol"]       = within_tol
     result["verdict"]          = "CONFIRM" if within_tol else "REJECT"
 
+    # ── Record in bias tracker (informational only, not applied) ──────────────
+    family = _target_family(target.get("id", ""))
+    if bias_tracker is not None and gpu_model and gpu_model != "UNKNOWN":
+        bias_tracker.record(gpu_model, family, claimed, rescored)
+
     log.info(
         f"  [CRISPR] {result['verdict']}"
-        f"  combined={grna_scores.get('combined', 0):.3f}"
+        f"  combined={combined:.3f}"
         f"  claimed={claimed:.3f}  rescored={rescored:.3f}"
         f"  rel_err={rel_err:.4f}  tol={tol}"
     )
@@ -1134,8 +1330,15 @@ MRNA_SANITY_HI: float = -5.5   # -6.0-3.0*0.0 = -6.0, gate adds headroom
 MRNA_BIAS_LO: float = BIAS_FACTOR_LO   # 0.1
 MRNA_BIAS_HI: float = BIAS_FACTOR_HI   # 10.0
 
-# Minimum samples before mRNA bias is applied (Option C ramp-up)
-MRNA_BIAS_MIN_SAMPLES: int = 50
+# Minimum samples before mRNA bias is applied (Option C ramp-up).
+# Set to 9999 to DISABLE bias activation: the gpu_bias_models.json mRNA entries
+# were contaminated by an old-formula era (miner used -iptm*30.0, validator used
+# -6.0-3.0*iptm) before both sides were aligned.  The bias_factor values (~0.35-0.52)
+# are an artifact of that mismatch — they do NOT represent real GPU variance.
+# Applying them squashes adjusted_claimed to ~40% of the true value, then the
+# TIGHTENED_TOLERANCE=0.35 rejects nearly everything.  Until the bias model is
+# rebuilt from clean, aligned-formula samples only, mRNA stays on raw tol=0.7777.
+MRNA_BIAS_MIN_SAMPLES: int = 9999   # effectively disabled until bias file is rebuilt
 
 
 def validate_mrna(
@@ -1304,6 +1507,17 @@ class GpuBiasTracker:
             return
         if claimed == 0.0:
             return   # avoid division by zero in ratio
+        # Guard: skip mRNA samples where claimed is tiny (|claimed| < 1.0).
+        # This happens when the miner used the old iptm-fallback formula that
+        # produced very small claimed values (e.g. -0.028) while the validator
+        # rescores to a normal docking value (-7.8), giving a spurious ratio ~280.
+        # These cross-formula samples corrupt the bias model — skip them entirely.
+        if family.startswith("mRNA_") and abs(claimed) < 1.0:
+            log.debug(
+                f"[GPU-BIAS] skip mRNA record (tiny claimed={claimed:.4f}) "
+                f"gpu={gpu_model} family={family}"
+            )
+            return
         ratio = rescored / claimed
         gpu_entry = self._data.setdefault(gpu_model, {})
         fam_entry = gpu_entry.setdefault(family, {"n": 0, "samples": [], "bias_factor": None})
