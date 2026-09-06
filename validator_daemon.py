@@ -232,8 +232,11 @@ def _sanitize_smiles(smiles: str, pubkey: str) -> bool:
 
 def _rate_limit_check() -> bool:
     """
-    Return True if this validation is permitted under the rolling hourly limit.
-    Prunes expired timestamps on each call.
+    PEEK at the rolling hourly limit — does NOT consume a slot.
+    Prunes expired timestamps on each call.  Callers that go on to perform
+    real scoring work must call _rate_limit_commit() once the scorer has
+    actually produced a value.  Items discarded before scoring (dedup,
+    security gates, invalid sequence, Boltz2 failure) never charge a slot.
     """
     now = time.time()
     cutoff = now - _RATE_LIMIT_WINDOW
@@ -247,8 +250,19 @@ def _rate_limit_check() -> bool:
             f"next slot available in ~{secs_until_free}s"
         )
         return False
-    _validation_timestamps.append(now)
     return True
+
+
+def _rate_limit_commit(kind: str = "") -> None:
+    """
+    Charge exactly one hourly slot.  Call ONLY after a real scorer run has
+    returned a value (Boltz2 protein / mRNA iptm / CRISPR 3-chain iptm).
+    """
+    _validation_timestamps.append(time.time())
+    log.info(
+        f"  [RATE-LIMIT] slot charged{(' ' + kind) if kind else ''} — "
+        f"{len(_validation_timestamps)}/{_RATE_LIMIT_MAX} used this hour"
+    )
 
 
 # ── Security: self-validation prevention ─────────────────────────────────────
@@ -1031,9 +1045,9 @@ def validate_protein(
 #   (no properties/affinity block), reads iptm from confidence JSON top-level,
 #   computes affinity_kcal = -6.0 - 3.0 × iptm.
 #
-# Validator mirrors this exactly.  score_grna() is retained only as a fast
-# pre-screen gate: if combined < threshold the gRNA is garbage and Boltz2 is
-# skipped.  The authoritative rescored value is always the Boltz2 iptm result.
+# Validator mirrors this exactly.  score_grna() is NO LONGER a gate (removed
+# 2026-09-06) — it is retained only to populate the grna_* telemetry columns
+# in the audit log.  run_boltz2_crispr_iptm() is the sole scorer.
 #
 # Sanity gate: -9.5 to -5.5 kcal/mol (iptm ∈ (0,1] → score ∈ (-9,-6) by construction).
 # Tolerance: 0.25 (unchanged from prior CRISPR_TOL).
@@ -1199,14 +1213,15 @@ def validate_crispr(
     """
     Validate a CRISPR gRNA submission end-to-end.
 
-    Two-stage pipeline:
-      Stage A — analytical pre-screen (score_grna): fast CPU check.
-                If combined < CRISPR_MIN_COMBINED_VALIDATOR the gRNA is
-                garbage; skip Boltz2 and return VALIDATOR_ERROR immediately.
-      Stage B — Boltz2 iptm rescore (run_boltz2_crispr_iptm): authoritative.
-                Mirrors adaptive/life_crispr_boltz.py on the miner exactly.
-                Tolerance check is applied to the Boltz2 result, not the
-                analytical pre-screen value.
+    Single-scorer pipeline: run_boltz2_crispr_iptm() is the SOLE scorer.
+    Mirrors adaptive/life_crispr_boltz.py on the miner exactly.
+
+    The analytical score_grna()/combined pre-screen was REMOVED 2026-09-06:
+    sampling 14 vetoed items across 7 targets through real Boltz2 produced
+    14/14 CONFIRM at CRISPR_TOL=0.25 (rel_err 0.082-0.214) while the
+    analytical combined said 0.14-0.33.  The proxy (exp(-hamming/8)) cannot
+    reproduce structural iptm, so it was discarding valid work.  Every
+    CRISPR submission now goes straight to Boltz2.
     """
     result: dict = {
         "modality":         "CRISPR",
@@ -1222,49 +1237,15 @@ def validate_crispr(
         "verdict":          "VALIDATOR_ERROR",
     }
 
-    # ── Stage A: analytical pre-screen (fast gate, no GPU) ───────────────────
-    # run_crispr_validation() handles: int→string ID mapping, U→T, length check.
-    prescreen_affinity, grna_scores = run_crispr_validation(grna_seq, target)
-    if prescreen_affinity is None:
-        # Invalid sequence (bad length or alphabet)
+    # ── Sequence validity only (alphabet/length) — NOT a quality judgement ────
+    _seq = grna_seq.upper().strip().replace("U", "T")
+    if len(_seq) != 20 or not all(c in "ACGT" for c in _seq):
         result["sanity_note"] = "Invalid gRNA (bad length/alphabet)"
         result["verdict"]     = "VALIDATOR_ERROR"
         return result
 
-    combined = grna_scores.get("combined", 0.0)
-    # target.get("id") is the authoritative target identifier (already resolved
-    # by run_crispr_validation's int→string mapping inside grna_scores indirectly,
-    # but the target dict's "id" field is what _crispr_threshold expects).
-    target_name = target.get("id", "")
-    # If target_id is an on-chain integer, map it to the string name first.
-    _CRISPR_ONCHAIN_TO_NAME_V: dict = {
-        3000: "TP53_CRISPR",  3001: "KRAS_CRISPR",  3002: "BCL2_CRISPR",
-        3003: "MYC_CRISPR",   3004: "EGFR_CRISPR",  3005: "HER2_CRISPR",
-        3006: "BRCA1_CRISPR", 3007: "PDL1_CRISPR",  3008: "TERT_CRISPR",
-        3009: "CDK4_CRISPR",
-    }
-    try:
-        target_name = _CRISPR_ONCHAIN_TO_NAME_V.get(int(target_name), str(target_name))
-    except (ValueError, TypeError):
-        target_name = str(target_name)
-    threshold = _crispr_threshold(target_name)
-    if combined < threshold:
-        result["sanity_note"] = (
-            f"pre-screen combined={combined:.4f} < threshold={threshold:.3f} — skip Boltz2"
-        )
-        result["verdict"] = "VALIDATOR_ERROR"
-        log.info(
-            f"  [CRISPR] pre-screen FAIL  combined={combined:.3f} < {threshold:.3f}"
-            f"  gRNA={grna_seq[:16]}… — skipping Boltz2"
-        )
-        return result
-
-    log.info(
-        f"  [CRISPR] pre-screen OK  combined={combined:.3f} ≥ {threshold:.3f}"
-        f"  gRNA={grna_seq[:16]}… — launching Boltz2"
-    )
-
-    # ── Stage B: Boltz2 iptm rescore (authoritative) ─────────────────────────
+    # ── Sole scorer: Boltz2 3-chain iptm (no analytical pre-filter) ──────────
+    log.info(f"  [CRISPR] routing to Boltz2 (no pre-screen)  gRNA={_seq[:16]}…")
     rescored = run_boltz2_crispr_iptm(grna_seq, target, seed=BOLTZ_SEED)
     result["rescored"] = rescored
     if rescored is None:
@@ -1307,7 +1288,6 @@ def validate_crispr(
 
     log.info(
         f"  [CRISPR] {result['verdict']}"
-        f"  combined={combined:.3f}"
         f"  claimed={claimed:.3f}  rescored={rescored:.3f}"
         f"  rel_err={rel_err:.4f}  tol={tol}"
     )
@@ -2658,8 +2638,6 @@ def main():
                         continue
 
                     _crispr_tgt_name = _CRISPR_ID_TO_NAME.get(target_id_int, target.get("id", "") or "")
-                    _crispr_min      = _crispr_threshold(_crispr_tgt_name)
-                    quality_ok  = grna_scores.get("combined", 0.0) >= _crispr_min
 
                     # ── Stage-3: validate_crispr() ───────────────────────────────
                     vc = validate_crispr(
@@ -2669,9 +2647,12 @@ def main():
                         gpu_model=_miner_gpu_model,
                         bias_tracker=_gpu_bias_tracker,
                     )
+                    # Charge a rate-limit slot only if Boltz2 actually produced a score.
+                    if vc["rescored"] is not None:
+                        _rate_limit_commit("CRISPR")
                     rescored   = vc["rescored"] if vc["rescored"] is not None else rescored
                     rel_err    = vc["rel_err"] or 0.0
-                    within_tol = quality_ok and vc["within_tol"]
+                    within_tol = vc["within_tol"]   # Boltz2 tolerance is the sole gate
                     verdict    = "CONFIRM" if within_tol else "REJECT"
                     _crispr_tol = CRISPR_TOL
                     adjusted_claimed = claimed  # validate_crispr does not apply bias
@@ -3048,11 +3029,9 @@ def main():
                         })
                     continue
 
-                combined   = grna_scores.get("combined", 0.0)
+                combined   = grna_scores.get("combined", 0.0)   # telemetry only — no longer a gate
                 # Stage-3: validate_crispr()
                 _crispr_tgt_name = _CRISPR_ID_TO_NAME.get(target_id_int, target.get("id", "") or "")
-                _crispr_min      = _crispr_threshold(_crispr_tgt_name)
-                quality_ok  = combined >= _crispr_min
 
                 vc = validate_crispr(
                     grna_seq=smiles,
@@ -3061,9 +3040,12 @@ def main():
                     gpu_model=_miner_gpu_model,
                     bias_tracker=_gpu_bias_tracker,
                 )
+                # Charge a rate-limit slot only if Boltz2 actually produced a score.
+                if vc["rescored"] is not None:
+                    _rate_limit_commit("CRISPR")
                 rescored         = vc["rescored"] if vc["rescored"] is not None else rescored
                 rel_err          = vc["rel_err"] or 0.0
-                within_tol       = quality_ok and vc["within_tol"]
+                within_tol       = vc["within_tol"]   # Boltz2 tolerance is the sole gate
                 verdict          = "CONFIRM" if within_tol else "REJECT"
                 _crispr_tol      = CRISPR_TOL
                 adjusted_claimed = claimed
@@ -3261,6 +3243,10 @@ def main():
                         "sanity_note":      vm.get("sanity_note", ""),
                     })
                     continue
+
+            # Real scoring work completed for this item — charge one slot now.
+            if rescored is not None:
+                _rate_limit_commit("mRNA" if is_mrna else "PROTEIN")
 
             # ── Validator commission — exact on-chain formula from mint_reward.rs ──
             # commission = (miner_amount / 20) / confirming_count
