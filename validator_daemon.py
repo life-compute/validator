@@ -87,6 +87,52 @@ _submission_queue: queue.Queue = queue.Queue()   # raw events from WS / sweep
 _protein_queue:    queue.Queue = queue.Queue()   # protein + mRNA items → main worker
 _crispr_queue:     queue.Queue = queue.Queue()   # CRISPR items → crispr worker
 
+# ── Pipeline de-duplication ───────────────────────────────────────────────────
+# The same pubkey is delivered many times: the WS fires on create AND again on
+# each status flip, and every catch-up sweep re-reports every actionable
+# account.  Unguarded, those duplicates stack in _protein_queue far faster than
+# the worker drains it (~1 item/60s with Boltz2), so genuinely new submissions
+# sit behind thousands of copies of already-seen ones and are never reached.
+#
+# Invariant: a pubkey is present in the pipeline (raw queue + typed queue) at
+# most once.  Added at ingress by _enqueue_submission(); released by
+# _release_pipeline() when a worker pops the item and begins real work.
+_pending_pubkeys: set = set()
+_pending_lock = threading.Lock()
+_dupes_suppressed: int = 0       # cumulative, telemetry only
+
+
+def _enqueue_submission(sub: dict) -> bool:
+    """Enqueue a submission unless that pubkey is already in the pipeline.
+
+    Returns True if it was enqueued, False if suppressed as a duplicate.
+    """
+    global _dupes_suppressed
+    pk = sub.get("pubkey", "")
+    if not pk:
+        return False
+    with _pending_lock:
+        if pk in _pending_pubkeys:
+            _dupes_suppressed += 1
+            return False
+        _pending_pubkeys.add(pk)
+    _submission_queue.put_nowait(sub)
+    return True
+
+
+def _release_pipeline(pubkey: str) -> None:
+    """Allow a future sweep to re-report this pubkey (called when work starts)."""
+    with _pending_lock:
+        _pending_pubkeys.discard(pubkey)
+
+
+def _pipeline_depth() -> tuple:
+    """(raw, protein, crispr, tracked, dupes_suppressed) — for telemetry."""
+    with _pending_lock:
+        tracked = len(_pending_pubkeys)
+    return (_submission_queue.qsize(), _protein_queue.qsize(),
+            _crispr_queue.qsize(), tracked, _dupes_suppressed)
+
 # ── Miner allowlist — only process submissions from this wallet ───────────────
 # Set to empty string to accept all miners (open mode).
 MINER_WALLET  = _env("MINER_WALLET",  "")   # empty = open mode, accept all miners
@@ -374,12 +420,31 @@ def _load_seen_from_audit() -> None:
                     if not pk:
                         continue
                     decision = row.get("decision", "")
+                    # ALREADY_VOTED is structurally terminal: the ValidationRecord
+                    # PDA exists, so no future tx with this keypair can ever land.
+                    # Pin above the cap so it is skipped without a re-probe.
+                    if decision == "ALREADY_VOTED":
+                        _SEEN_SUBMISSIONS[pk] = _MAX_RETRY_ATTEMPTS + 1
                     # A CONFIRM or REJECT decision means we ran Boltz2 and called
                     # validate_on_chain.  Mark at max-attempts so we skip on reload
                     # (the tx either landed — account is now Validating and filtered
                     # out by RPC — or it failed and we've already tried enough).
-                    if decision in ("CONFIRM", "REJECT"):
+                    elif decision in ("CONFIRM", "REJECT"):
                         _SEEN_SUBMISSIONS[pk] = _MAX_RETRY_ATTEMPTS
+                    # ── Transient tx failures are NOT counted here ──────────────
+                    # {CONFIRM,REJECT}_TX_FAILED means Boltz2 produced a verdict but
+                    # the tx did not land.  Historically these accumulated toward the
+                    # retry cap, so a submission that failed for an environmental
+                    # reason (RPC 429, blockhash expiry) — or for the unwinnable
+                    # already-voted reason, which we could not distinguish before —
+                    # was blacklisted for the rest of the day.  Whether such an item
+                    # is truly unwinnable is now decided authoritatively on-chain by
+                    # the _validation_record_exists() pre-check, which is both
+                    # cheaper and correct.  Leaving TX_FAILED uncounted lets fresh,
+                    # winnable submissions back into the queue after a restart; the
+                    # unwinnable ones are skipped by the PDA probe on first sight.
+                    elif decision.endswith("_TX_FAILED"):
+                        pass
                     # BOLTZ2_FAILED: count each occurrence so the cap is preserved
                     # across restarts, preventing repeated GPU waste on permanently-
                     # failing submissions (e.g. siRNA sequences on protein targets).
@@ -2163,7 +2228,7 @@ async def _ws_subscription_loop():
                             f"[WS] Queuing {pubkey[:16]}…  "
                             f"target={sub['target_id']}  status={sub['status']}"
                         )
-                        _submission_queue.put_nowait(sub)
+                        _enqueue_submission(sub)
                         _ws_last_notification_time = time.time()
 
                     except Exception as e:
@@ -2220,6 +2285,7 @@ def _start_dispatcher():
             # Dedup: if already tracked (processed or max-retried) skip silently
             if _SEEN_SUBMISSIONS.get(pubkey, 0) > _MAX_RETRY_ATTEMPTS:
                 log.debug(f"[DISPATCHER] {pubkey[:16]}… already at max retries — dropped")
+                _release_pipeline(pubkey)   # dropped, not queued — stop tracking
                 continue
 
             if 3000 <= sub["target_id"] <= 3009:
@@ -2244,6 +2310,11 @@ _catchup_interval: int = CATCHUP_POLL_INTERVAL   # starts at 300s
 # If the WS has been connected for > WS_SILENCE_THRESHOLD seconds without delivering
 # anything, _catchup_poll_once() is triggered immediately (outside its normal timer).
 WS_SILENCE_THRESHOLD = 90   # seconds: force catchup if WS silent this long after connect
+# Minimum spacing between silence-forced sweeps.  Previously the silence branch
+# used a hardcoded 10 s floor, so a permanently-throttled WS (the normal state
+# on public devnet) triggered ~6 sweeps/minute — each one two full
+# getProgramAccounts calls that re-enqueued every actionable account.
+WS_SILENCE_CATCHUP_INTERVAL = 60   # seconds
 _ws_last_notification_time: float = 0.0   # updated whenever WS enqueues a submission
 _ws_connected_since: float = 0.0          # updated on each [WS] Connected event
 
@@ -2268,12 +2339,24 @@ def _catchup_poll_once() -> bool:
         subs = fetch_pending_submissions(crispr_only=False)
         subs += fetch_pending_submissions(crispr_only=True)
         new = 0
+        dup = 0
+        skipped = 0
         for sub in subs:
-            if _SEEN_SUBMISSIONS.get(sub["pubkey"], 0) <= _MAX_RETRY_ATTEMPTS:
-                _submission_queue.put_nowait(sub)
+            if _SEEN_SUBMISSIONS.get(sub["pubkey"], 0) > _MAX_RETRY_ATTEMPTS:
+                skipped += 1
+                continue
+            if _enqueue_submission(sub):
                 new += 1
-        if new:
-            log.info(f"[CATCHUP-POLL] Enqueued {new} submission(s) not yet seen by WS")
+            else:
+                dup += 1
+        raw_q, prot_q, cris_q, tracked, _dupes = _pipeline_depth()
+        if new or dup:
+            log.info(
+                f"[CATCHUP-POLL] swept {len(subs)} account(s): "
+                f"enqueued {new}, suppressed {dup} duplicate(s), "
+                f"skipped {skipped} at-max-retries  "
+                f"[queues raw={raw_q} protein={prot_q} crispr={cris_q} tracked={tracked}]"
+            )
         else:
             log.debug("[CATCHUP-POLL] No new submissions — WS delivery healthy")
         # Success: restore full 5-minute interval
@@ -2375,6 +2458,51 @@ def fetch_pending_submissions(crispr_only: bool = False) -> list[dict]:
         return [r for r in results if 3000 <= r["target_id"] <= 3009]
     else:
         return [r for r in results if not (3000 <= r["target_id"] <= 3009)]
+
+
+# ── ValidationRecord pre-check (unwinnable-vote guard) ───────────────────────
+# validate_result initialises a ValidationRecord PDA seeded on
+# (b"validation", result_pubkey, validator_pubkey).  Anchor `init` fails with
+# system_program custom error 0x0 ("already in use") if it exists, so once this
+# validator has voted on a submission it can NEVER vote again — regardless of
+# score.  A submission left at validation_count>=1, confirmed_count=0 (our vote
+# was outside the on-chain tolerance) is therefore permanently unwinnable for
+# this keypair.  Retrying burns a full Boltz2 run, a rate-limit slot and a
+# retry attempt on a transaction that cannot succeed.
+#
+# Cache is keyed by pubkey; only positive results are cached (a record that
+# exists can never stop existing).  Unknown/RPC-failure returns False so we
+# fall through to the normal path rather than skipping real work.
+_VR_EXISTS_CACHE: set = set()
+
+
+def _validation_record_exists(submission_pubkey: str) -> bool:
+    """True if this validator already has a ValidationRecord for *submission_pubkey*.
+
+    Returns False on any RPC/derivation failure — callers must treat False as
+    "proceed normally", never as a guarantee that the vote will land.
+    """
+    if not _VALIDATOR_PUBKEY:
+        return False
+    if submission_pubkey in _VR_EXISTS_CACHE:
+        return True
+    try:
+        from solders.pubkey import Pubkey as _Pk
+        program = _Pk.from_string(PROGRAM_ID)
+        sub_pk  = _Pk.from_string(submission_pubkey)
+        val_pk  = _Pk.from_string(_VALIDATOR_PUBKEY)
+        vr, _bump = _Pk.find_program_address(
+            [b"validation", bytes(sub_pk), bytes(val_pk)], program
+        )
+        resp = _rpc("getAccountInfo", [str(vr), {"encoding": "base64",
+                                                 "commitment": "confirmed"}])
+        exists = bool(resp.get("result", {}).get("value"))
+        if exists:
+            _VR_EXISTS_CACHE.add(submission_pubkey)
+        return exists
+    except Exception as e:
+        log.debug(f"  [VR-PRECHECK] {submission_pubkey[:16]}…: probe failed ({e}) — proceeding")
+        return False
 
 
 # ── On-chain validate call ────────────────────────────────────────────────────
@@ -2585,6 +2713,9 @@ def main():
                 crispr_subs = [sub]
                 for sub in crispr_subs:
                     pubkey        = sub["pubkey"]
+                    # Item has left the queue and is now being worked; allow a
+                    # future sweep to re-report it if this attempt doesn't finish.
+                    _release_pipeline(pubkey)
                     smiles        = sub["smiles"]
                     miner_wallet  = sub["miner"]
                     target_id_int = sub["target_id"]
@@ -2597,6 +2728,28 @@ def main():
 
                     # Security gates (mirrors main loop)
                     if MINER_WALLET and miner_wallet != MINER_WALLET:
+                        continue
+                    # Unwinnable-vote guard: if we already hold a ValidationRecord
+                    # for this submission the tx can never land (Anchor init →
+                    # system_program 0x0).  Skip permanently BEFORE charging a
+                    # rate-limit slot or running the scorer.
+                    if _validation_record_exists(pubkey):
+                        log.info(
+                            f"  [VR-PRECHECK] {pubkey[:16]}…: ValidationRecord already "
+                            f"exists — this validator has voted; permanent skip"
+                        )
+                        _SEEN_SUBMISSIONS[pubkey] = _MAX_RETRY_ATTEMPTS + 1
+                        append_audit({
+                            "ts":                datetime.now(timezone.utc).isoformat(),
+                            "submission_pubkey": pubkey,
+                            "miner_wallet":      miner_wallet,
+                            "claimed_score":     claimed,
+                            "rescored":          None,
+                            "decision":          "ALREADY_VOTED",
+                            "rel_err":           None,
+                            "target_id":         target_id_int,
+                            "target_type":       "CRISPR",
+                        })
                         continue
                     if not _rate_limit_check():
                         break
@@ -2757,7 +2910,17 @@ def main():
                         })
                     else:
                         log.warning(f"  [CRISPR] validate_on_chain returned no tx")
-                        _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+                        # Same classification as the protein path: an existing
+                        # ValidationRecord makes this permanently unwinnable, so
+                        # pin above the cap instead of counting a retry.
+                        if _validation_record_exists(pubkey):
+                            log.info(
+                                f"  [VR-PRECHECK] {pubkey[:16]}…: tx failed because a "
+                                f"ValidationRecord already exists — unwinnable, permanent skip"
+                            )
+                            _SEEN_SUBMISSIONS[pubkey] = _MAX_RETRY_ATTEMPTS + 1
+                        else:
+                            _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
             except Exception as e:
                 log.error(f"[CRISPR-WORKER] unhandled error: {e}")
             # No sleep — loop immediately back to queue.get(timeout=5)
@@ -2780,14 +2943,20 @@ def main():
             and (now - _ws_connected_since) > WS_SILENCE_THRESHOLD
             and (now - _ws_last_notification_time) > WS_SILENCE_THRESHOLD
         )
-        if ws_silence and (now - last_catchup) > 10:
-            log.info(
-                f"[CATCHUP-POLL] WS silent for >{WS_SILENCE_THRESHOLD}s — "
-                f"forcing catchup sweep"
-            )
-            _catchup_poll_once()
-            last_catchup = now
-        elif now - last_catchup >= _catchup_interval:
+        # A silent WS means the sweep is our ONLY source of work, so we poll on
+        # the shortened WS_SILENCE_CATCHUP_INTERVAL instead of the full 300 s.
+        # It must never be faster than that floor: each sweep is two full
+        # getProgramAccounts calls (~9.4k accounts) and firing every 10 s both
+        # self-inflicts HTTP 429s and re-stacks the queue with duplicates.
+        effective_interval = _catchup_interval
+        if ws_silence:
+            effective_interval = min(_catchup_interval, WS_SILENCE_CATCHUP_INTERVAL)
+        if now - last_catchup >= effective_interval:
+            if ws_silence:
+                log.info(
+                    f"[CATCHUP-POLL] WS silent for >{WS_SILENCE_THRESHOLD}s — "
+                    f"sweeping (cadence {effective_interval}s)"
+                )
             _catchup_poll_once()
             last_catchup = now
 
@@ -2852,6 +3021,9 @@ def main():
         submissions = [sub]
         for sub in submissions:
             pubkey        = sub["pubkey"]
+            # Item has left the queue and is now being worked; allow a future
+            # sweep to re-report it if this attempt doesn't finish.
+            _release_pipeline(pubkey)
             smiles        = sub["smiles"]
             miner_wallet  = sub["miner"]
             target_id_int = sub["target_id"]
@@ -2881,6 +3053,31 @@ def main():
                     "rescored":         None,
                     "decision":         "WALLET_NOT_ALLOWED",
                     "rel_err":          None,
+                })
+                continue
+
+            # ── Security gate 0b: unwinnable-vote guard ──────────────────────
+            # A ValidationRecord PDA that already exists means this validator
+            # voted on this submission before and the on-chain tolerance check
+            # failed (validation_count>=1, confirmed_count=0).  The PDA blocks
+            # any re-vote with the same keypair, so the tx can never succeed.
+            # Skip permanently here — before a rate-limit slot or a ~60s Boltz2
+            # run is spent on it.
+            if _validation_record_exists(pubkey):
+                log.info(
+                    f"  [VR-PRECHECK] {pubkey[:16]}…: ValidationRecord already exists "
+                    f"— this validator has voted; permanent skip (no slot charged)"
+                )
+                _SEEN_SUBMISSIONS[pubkey] = _MAX_RETRY_ATTEMPTS + 1
+                append_audit({
+                    "ts":                datetime.now(timezone.utc).isoformat(),
+                    "submission_pubkey": pubkey,
+                    "miner_wallet":      miner_wallet,
+                    "claimed_score":     claimed,
+                    "rescored":          None,
+                    "decision":          "ALREADY_VOTED",
+                    "rel_err":           None,
+                    "target_id":         target_id_int,
                 })
                 continue
 
@@ -3266,6 +3463,7 @@ def main():
             elapsed = time.time() - t0
 
             # Step 4: Submit on-chain
+            unwinnable = False   # set when a failure is provably un-retryable
             result = validate_on_chain(pubkey, rescored or 0.0)
             tx = result.get("tx") if result else None
             if tx:
@@ -3282,16 +3480,28 @@ def main():
                 _SEEN_SUBMISSIONS.pop(pubkey, None)
             else:
                 log.warning(f"  validate_on_chain returned no tx")
-                # Increment attempt counter so we stop retrying after _MAX_RETRY_ATTEMPTS
-                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                attempt_n = _SEEN_SUBMISSIONS[pubkey]
-                if attempt_n < _MAX_RETRY_ATTEMPTS:
+                # Classify the failure instead of blindly counting it.  If a
+                # ValidationRecord now exists, this validator has already voted
+                # and no retry can ever succeed → pin above the cap (permanent
+                # skip) rather than burning two more attempts to learn nothing.
+                if _validation_record_exists(pubkey):
                     log.info(
-                        f"  {pubkey[:16]}…: attempt {attempt_n}/{_MAX_RETRY_ATTEMPTS} "
-                        f"— will retry up to {_MAX_RETRY_ATTEMPTS - attempt_n} more time(s)"
+                        f"  [VR-PRECHECK] {pubkey[:16]}…: tx failed because a "
+                        f"ValidationRecord already exists — unwinnable, permanent skip"
                     )
+                    _SEEN_SUBMISSIONS[pubkey] = _MAX_RETRY_ATTEMPTS + 1
+                    unwinnable = True
                 else:
-                    log.info(f"  {pubkey[:16]}…: max retries reached — will skip next polls")
+                    # Genuinely transient (RPC 429, blockhash expiry, node hiccup).
+                    _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
+                    attempt_n = _SEEN_SUBMISSIONS[pubkey]
+                    if attempt_n < _MAX_RETRY_ATTEMPTS:
+                        log.info(
+                            f"  {pubkey[:16]}…: attempt {attempt_n}/{_MAX_RETRY_ATTEMPTS} "
+                            f"— will retry up to {_MAX_RETRY_ATTEMPTS - attempt_n} more time(s)"
+                        )
+                    else:
+                        log.info(f"  {pubkey[:16]}…: max retries reached — will skip next polls")
 
             # Count every verdict (confirm or reject), regardless of tx success
             validated_today += 1
@@ -3306,7 +3516,13 @@ def main():
             # re-appear in future polls; recording CONFIRM/REJECT here would
             # cause _load_seen_from_audit() on restart to mark the submission
             # at max-attempts and block it permanently despite no tx landing.
-            audit_decision = verdict if tx else f"{verdict}_TX_FAILED"
+            if tx:
+                audit_decision = verdict
+            elif unwinnable:
+                # Distinct from *_TX_FAILED: structurally unwinnable, never retried.
+                audit_decision = "ALREADY_VOTED"
+            else:
+                audit_decision = f"{verdict}_TX_FAILED"
             append_audit({
                 "ts":               datetime.now(timezone.utc).isoformat(),
                 "submission_pubkey": pubkey,
