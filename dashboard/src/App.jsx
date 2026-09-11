@@ -44,8 +44,10 @@ const CSS = `
   @keyframes blink      { 0%,100%{opacity:1} 50%{opacity:0} }
   @keyframes pulse      { 0%,100%{opacity:0.7} 50%{opacity:1} }
   @keyframes textPulse  { 0%,100%{opacity:1} 50%{opacity:0.82} }
-  @keyframes helix1     { from{stroke-dashoffset:0} to{stroke-dashoffset:-100} }
   @keyframes spinDot    { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+  @keyframes coinAura   { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+  @keyframes coinBreathe{ 0%,100%{box-shadow:0 0 16px #00ff4155,0 0 38px #00ffff26,inset 0 0 18px rgba(0,0,0,0.55)}
+                          50%    {box-shadow:0 0 24px #00ff4177,0 0 54px #00ffff3d,inset 0 0 18px rgba(0,0,0,0.55)} }
 `
 
 /* ─── Style helpers ─────────────────────────────────────────── */
@@ -310,45 +312,7 @@ function MatrixRain() {
   return <canvas ref={ref} style={S.matrixCanvas} />
 }
 
-/* ─── DNA Helix SVG ─────────────────────────────────────────── */
-function DNAHelix() {
-  const pts = 14
-  return (
-    <svg width="280" height="56" viewBox="0 0 280 56" style={{ opacity: 0.65 }}>
-      <defs>
-        <filter id="gf">
-          <feGaussianBlur stdDeviation="1.2" result="blur"/>
-          <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-        </filter>
-      </defs>
-      <path
-        d={`M 0 28 ${Array.from({length:pts},(_,i)=>{
-          const x=(i/pts)*280, y=28+Math.sin((i/pts)*Math.PI*2)*17
-          return `${i===0?'':'L'} ${x} ${y}`
-        }).join(' ')}`}
-        fill="none" stroke={T.green} strokeWidth="1.5" filter="url(#gf)"
-        style={{animation:'helix1 3s linear infinite'}}
-      />
-      <path
-        d={`M 0 28 ${Array.from({length:pts},(_,i)=>{
-          const x=(i/pts)*280, y=28-Math.sin((i/pts)*Math.PI*2)*17
-          return `${i===0?'':'L'} ${x} ${y}`
-        }).join(' ')}`}
-        fill="none" stroke={T.cyan} strokeWidth="1.5" filter="url(#gf)"
-        style={{animation:'helix1 3s linear infinite'}}
-      />
-      {Array.from({length:pts},(_,i)=>{
-        const x=(i/pts)*280+10
-        const y1=28+Math.sin((i/pts)*Math.PI*2)*17
-        const y2=28-Math.sin((i/pts)*Math.PI*2)*17
-        const t=Math.abs(Math.sin((i/pts)*Math.PI*2))
-        return <line key={i} x1={x} y1={y1} x2={x} y2={y2}
-          stroke={t>0.5?T.pink:T.green} strokeWidth="1" opacity={0.5+t*0.5} filter="url(#gf)"/>
-      })}
-    </svg>
-  )
-}
-
+/* ─── Target ID map ─────────────────────────────────────────── */
 // Target ID → gene name (indices 0-59 match life-compute/targets targets.json)
 // Indices 0-29: protein targets; indices 30-59: mRNA targets (GENE_mRNA suffix)
 // Indices 60-69: CRISPR targets (on-chain IDs 3000-3009)
@@ -1214,36 +1178,66 @@ export default function App() {
           {/* ── Header ── */}
           <header style={S.header}>
             <div style={S.headerInner}>
-              {/* Logo */}
+              {/* Logo — LIFE Compute coin medallion */}
               <div style={{
-                width:        '120px',
-                height:       '120px',
-                borderRadius: '4px',
-                overflow:     'hidden',
-                border:       `1px solid ${T.green}55`,
-                boxShadow:    `0 0 18px ${T.green}44, 0 0 40px ${T.green}22, inset 0 0 20px rgba(0,0,0,0.6)`,
-                flexShrink:   0,
-                position:     'relative',
+                width:      '132px',
+                height:     '132px',
+                flexShrink: 0,
+                position:   'relative',
+                display:    'grid',
+                placeItems: 'center',
               }}>
-                <img
-                  src="/logo.jpg"
-                  alt="LIFE Compute"
-                  style={{
-                    width:      '100%',
-                    height:     '100%',
-                    objectFit:  'cover',
-                    objectPosition: 'center top',
-                    filter:     'brightness(1.1) saturate(1.3) contrast(1.05)',
-                    display:    'block',
-                  }}
-                />
-                {/* green scan-line overlay */}
+                {/* rotating conic aura behind the coin */}
                 <div style={{
-                  position:   'absolute',
-                  inset:      0,
-                  background: `repeating-linear-gradient(0deg,transparent,transparent 3px,${T.green}08 3px,${T.green}08 4px)`,
-                  pointerEvents: 'none',
+                  position:     'absolute',
+                  inset:        '-9px',
+                  borderRadius: '50%',
+                  background:   `conic-gradient(from 0deg,${T.green}00,${T.green}55,${T.cyan}44,${T.purple}4d,${T.green}00)`,
+                  filter:       'blur(7px)',
+                  opacity:      0.75,
+                  animation:    'coinAura 14s linear infinite',
+                  pointerEvents:'none',
                 }} />
+
+                {/* coin disc */}
+                <div style={{
+                  position:     'relative',
+                  width:        '100%',
+                  height:       '100%',
+                  borderRadius: '50%',
+                  overflow:     'hidden',
+                  border:       `1px solid ${T.green}66`,
+                  boxShadow:    `0 0 16px ${T.green}55, 0 0 38px ${T.cyan}26, inset 0 0 18px rgba(0,0,0,0.55)`,
+                  animation:    'coinBreathe 6s ease-in-out infinite',
+                }}>
+                  <img
+                    src="/life-coin.jpg"
+                    alt="LIFE Compute"
+                    width="132" height="132"
+                    style={{
+                      width:      '100%',
+                      height:     '100%',
+                      objectFit:  'cover',
+                      objectPosition: 'center center',
+                      filter:     'brightness(1.06) saturate(1.22) contrast(1.06)',
+                      display:    'block',
+                    }}
+                  />
+                  {/* green scan-line overlay */}
+                  <div style={{
+                    position:   'absolute',
+                    inset:      0,
+                    background: `repeating-linear-gradient(0deg,transparent,transparent 3px,${T.green}08 3px,${T.green}08 4px)`,
+                    pointerEvents: 'none',
+                  }} />
+                  {/* specular sheen sweep */}
+                  <div style={{
+                    position:   'absolute',
+                    inset:      0,
+                    background: `linear-gradient(135deg,${T.cyan}00 42%,${T.textBright}1f 50%,${T.cyan}00 58%)`,
+                    pointerEvents: 'none',
+                  }} />
+                </div>
               </div>
 
               {/* Title */}
@@ -1258,9 +1252,6 @@ export default function App() {
                   {' — VALIDATOR NODE'}
                 </span>
               </div>
-
-              {/* DNA helix */}
-              <DNAHelix />
 
               {/* Subtitle */}
               <div style={S.subtitle}>
