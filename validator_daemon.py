@@ -990,8 +990,21 @@ def run_crispr_validation(grna_seq: str, target: dict) -> tuple[float | None, di
 # Data-derived sanity bounds (from 1,191 real protein CONFIRMs in audit history):
 #   rescored spans -3.05 to +0.20; gate set to -5.0/+1.0 for GPU variance headroom.
 #   Catches physically impossible values (e.g. -28 kcal/mol from formula bugs).
-PROTEIN_SANITY_LO: float = -5.0
-PROTEIN_SANITY_HI: float =  1.0
+# Recalibrated 2026-09-16 for the ΔG scale (miner commit 54a9d1f, branch
+# stage4-pegrna-daemon; on-chain scale boundary slot 497232432).
+# The old bounds [-5.0, +1.0] belonged to the dimensionless -boltz_score*30
+# ranking statistic and reject 234/234 real ΔG values as VALIDATOR_ERROR.
+# Miner's own observed post-fix range is [-15.32, -3.46]; -16.0 leaves 0.68
+# kcal/mol headroom. HI = 0.0 mirrors the miner's [SUBMIT-GUARD], which
+# refuses to submit affinity >= 0.0 (a non-binder, IC50 > 1 M).
+PROTEIN_SANITY_LO: float = -16.0
+PROTEIN_SANITY_HI: float =   0.0
+
+# RT*ln(10) at 298.15 K in kcal/mol.
+# Copied verbatim from miner_daemon.py `_RT_LN10_KCAL` @ 54a9d1f — keep this
+# byte-identical to the miner literal, do NOT recompute from the expression
+# (0.001987204259 * 298.15 * ln(10) = 1.364247013, a 1.3e-08 drift).
+_RT_LN10_KCAL: float = 1.364247
 
 # Bias guard: must be positive and within a sane magnitude range.
 # 0.1 floor prevents near-zero nonsense corrections.
@@ -1890,8 +1903,32 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
 
         prob = metrics.get("affinity_probability_binary")
         pred = metrics.get("affinity_pred_value")
+        if pred is not None and not is_mrna:
+            # ── Protein ΔG path ──────────────────────────────────────────────
+            # Mirrors the miner's `_affinity_pred_value_to_dg()` exactly
+            # (miner_daemon.py L1078-1099 @ 54a9d1f, branch stage4-pegrna-daemon).
+            #
+            # affinity_pred_value is log10(IC50) with IC50 in MICROMOLAR
+            # (Boltz-2 docs, prediction.md), therefore:
+            #     IC50_molar = 10 ** (v - 6)
+            #     ΔG         = RT*ln(IC50_molar) = RT*ln(10) * (v - 6)
+            #
+            # Do NOT reintroduce `ha` or `prob` here. The old expression
+            # -((prob - pred)/ha)*30 is the dimensionless Nova *ranking*
+            # statistic: it subtracts a log concentration from a probability,
+            # so it is valid for ordering candidates and meaningless as an
+            # energy. Verified against 234 live post-boundary submissions:
+            # this form gives median |err| 0.33, the /ha and *ha variants give
+            # 9.70 and 315.30 respectively.
+            score = round(_RT_LN10_KCAL * (float(pred) - 6.0), 3)
+            log.info(
+                f"  [PROTEIN-SCORE] ΔG=RT*ln10*(pred-6)"
+                f"  pred={pred:.4f} → {score:.3f} kcal/mol"
+            )
+            return score
         if prob is not None and pred is not None:
-            # Primary affinity path — same formula as miner's _boltz_score_to_affinity()
+            # mRNA affinity path — unchanged. mRNA never crossed the protein
+            # scale boundary (AFFINITY_SCALE_BOUNDARY.md: protein targets only).
             score = round(-((prob - pred) / ha) * 30.0, 3)
             log.info(
                 f"  [mRNA-SCORE-SOURCE] affinity path"
@@ -2915,6 +2952,7 @@ def main():
                             "rel_err":          round(rel_err, 4),
                             "tolerance_used":   _crispr_tol,
                             "bias_factor_used": None,  # bias not applied for CRISPR
+                            "bias_factor":      None,  # alias — keep both names in sync
                             "adjusted_claimed": round(adjusted_claimed, 4),
                             "tx":               tx,
                             "target_id":        target_id_int,
@@ -3352,6 +3390,7 @@ def main():
                     "rel_err":          round(rel_err, 4),
                     "tolerance_used":   _crispr_tol,
                     "bias_factor_used": None,  # bias not applied for CRISPR
+                    "bias_factor":      None,  # alias — keep both names in sync
                     "adjusted_claimed": round(adjusted_claimed, 4),
                     "difficulty_tier":  difficulty,
                     "target_type":      "CRISPR",
@@ -3432,6 +3471,7 @@ def main():
                         "claimed_score":    claimed,
                         "adjusted_claimed": adjusted_claimed,
                         "bias_factor":      bias_factor,
+                        "bias_factor_used": bias_factor,  # alias — see main audit writer
                         "rescored":         rescored,
                         "decision":         "VALIDATOR_ERROR",
                         "rel_err":          rel_err,
@@ -3469,6 +3509,7 @@ def main():
                         "claimed_score":    claimed,
                         "adjusted_claimed": adjusted_claimed,
                         "bias_factor":      bias_factor,
+                        "bias_factor_used": bias_factor,  # alias — see main audit writer
                         "rescored":         rescored,
                         "decision":         "VALIDATOR_ERROR",
                         "rel_err":          rel_err,
@@ -3570,6 +3611,13 @@ def main():
                 "claimed_score":    claimed,
                 "adjusted_claimed": round(adjusted_claimed, 4),
                 "bias_factor":      round(bias_factor, 4) if bias_factor is not None else None,
+                # Emit BOTH key names. The CRISPR writers use "bias_factor_used"
+                # while the protein/mRNA writers historically used only
+                # "bias_factor", so any cross-modality query on one name silently
+                # returned null for the other's rows (observed 2026-09-16:
+                # 2,415 PROTEIN + 7,791 RNA rows invisible to a
+                # "bias_factor_used" query). Keep both in sync here.
+                "bias_factor_used": round(bias_factor, 4) if bias_factor is not None else None,
                 "rescored":         rescored,
                 "decision":         audit_decision,
                 "rel_err":          round(rel_err, 4),
