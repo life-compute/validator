@@ -54,6 +54,7 @@ const {
   createAssociatedTokenAccountInstruction,
   TOKEN_PROGRAM_ID,
 } = require("@solana/spl-token");
+const crypto = require("crypto");
 const fs   = require("fs");
 const path = require("path");
 
@@ -80,6 +81,8 @@ const IDL_PATHS = [
 // ResultSubmission layout offsets (938 bytes total)
 const OFF_MINER          = 8;
 const OFF_TARGET_ID      = 40;   // u16 LE
+const OFF_SMILES         = 50;   // bytes
+const OFF_SMILES_LEN     = 562;  // u16 LE
 const OFF_STATUS         = 576;  // enum: 0=Pending,1=Validating,2=Confirmed,3=Rejected
 const OFF_REWARD_MINTED  = 742;  // bool
 const OFF_CONF_COUNT     = 743;  // u8 — confirming_count used by mint_reward
@@ -185,8 +188,20 @@ async function mintOne(pubkeyStr, program, connection, crankKp, lifeMintPda, min
   // Miner ATA
   const minerAta = await getAssociatedTokenAddress(lifeMintPda, minerPubkey);
 
+  // ConfirmedMol PDA — sybil/dedup guard added in latest deploy
+  // seeds: ["confirmed_mol", target_id_u16_le, sha256(smiles)[0:32]]
+  const smilesLen = d.readUInt16LE(OFF_SMILES_LEN);
+  const smiles    = d.slice(OFF_SMILES, OFF_SMILES + smilesLen);
+  const smilesHash = crypto.createHash("sha256").update(smiles).digest();
+  const tidBuf = Buffer.alloc(2);
+  tidBuf.writeUInt16LE(targetId);
+  const [confirmedMolPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("confirmed_mol"), tidBuf, smilesHash],
+    PROGRAM_ID
+  );
+
   if (dryRun) {
-    log(`[DRY-RUN] would mint for ${pubkeyStr.slice(0,16)}…  target=${targetId}  miner=${minerPubkey.toBase58().slice(0,12)}…  confirmingCount=${confirmingCount}`);
+    log(`[DRY-RUN] would mint for ${pubkeyStr.slice(0,16)}…  target=${targetId}  miner=${minerPubkey.toBase58().slice(0,12)}…  confirmingCount=${confirmingCount}  confirmedMol=${confirmedMolPda.toBase58().slice(0,12)}…`);
     return "dry_run";
   }
 
@@ -246,6 +261,7 @@ async function mintOne(pubkeyStr, program, connection, crankKp, lifeMintPda, min
           target:          targetPda,
           minerAccount:    minerAccountPda,
           minerAta:        minerAta,
+          confirmedMol:    confirmedMolPda,
           tokenProgram:    TOKEN_PROGRAM_ID,
           systemProgram:   SystemProgram.programId,
         })
@@ -266,6 +282,14 @@ async function mintOne(pubkeyStr, program, connection, crankKp, lifeMintPda, min
     // unregistered miner; the program cannot mint for them under current state.
     if (msg.includes("AccountDidNotDeserialize") || msg.includes("3003") || msg.includes("0xbbb")) {
       err(`mintReward PERMANENT-SKIP ${pubkeyStr.slice(0,12)}…: miner_account undeserializable — will not retry`);
+      return "permanent_error";
+    }
+    // confirmed_mol PDA already exists (system_program 0x0 = AccountAlreadyInUse):
+    // another crank already minted this molecule (same target+smiles). Dedup guard fired.
+    // This submission can never be minted — classify as permanent skip.
+    if ((msg.includes("custom program error: 0x0") || msg.includes("already in use")) &&
+        (msg.includes("11111111111111111111111111111111") || msg.includes("system_program"))) {
+      warn(`${pubkeyStr.slice(0,12)}… confirmed_mol already exists (molecule already minted by another crank) — permanent skip`);
       return "permanent_error";
     }
     err(`mintReward failed for ${pubkeyStr.slice(0,12)}…: ${msg.slice(0,140)}`);
