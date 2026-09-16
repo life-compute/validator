@@ -146,7 +146,14 @@ CRANK_QUEUE_FILE = WORK_DIR / "output" / "crank_queue.jsonl"
 (WORK_DIR / "output").mkdir(exist_ok=True)
 
 # ── Boltz2 / MSA paths ────────────────────────────────────────────────────────
-MSA_DIR = Path(_env("MSA_DIR", str(WORK_DIR / "data" / "msa_files")))
+# The MSA library lives on the data volume, NOT under WORK_DIR.  The previous
+# default was str(WORK_DIR / "data" / "msa_files") = /tmp/validator/data/msa_files,
+# a directory that has never existed on this host.  _msa_path_for() therefore
+# returned "empty" for all 30 protein targets, every protein rescore ran
+# single-sequence, and the receptor fell back to targets.json protein_sequence —
+# which disagrees with the canonical UniProt sequence for 9 targets.
+# scripts/download_all_msas.py (L211) writes the a3m library here.
+MSA_DIR = Path(_env("MSA_DIR", "/mnt/life-data/msa_files"))
 
 # Fast inference settings (match miner)
 _RECYCLING_STEPS       = 1
@@ -154,6 +161,15 @@ _SAMPLING_STEPS        = 25
 _DIFFUSION_SAMPLES     = 1
 _SAMPLING_STEPS_AFF    = 25
 _DIFFUSION_SAMPLES_AFF = 1
+
+# MSA depth cap.  Pinned explicitly rather than inherited so validator and miner
+# use the same effective depth; 1024 is also the boltz-2.2.1 default for
+# --num_subsampled_msa.  Without a cap Boltz feeds up to --max_msa_seqs (8192)
+# rows from a deep a3m (CDK4/P11802 is 17,233 seqs) and OOMs an 8GB RTX 4060:
+#   "memory allocation failed with OOM ... allocate 1409286144 bytes"
+#   -> "ran out of memory, skipping batch" -> run_boltz2() returns None
+#   -> VALIDATOR_ERROR.  Applied only when a real a3m is attached.
+_NUM_SUBSAMPLED_MSA = 1024
 
 BOLTZ_SEED = 68  # must match miner BOLTZ_SEED; used for reproducible Boltz2 rescoring
 VALIDATION_TOLERANCE = 0.7777  # DEVNET TESTING TOLERANCE — tighten for mainnet
@@ -1637,7 +1653,19 @@ def _heavy_atom_count(smiles: str) -> int:
 
 def _msa_path_for(uniprot_id: str) -> str:
     path = MSA_DIR / f"{uniprot_id}.a3m"
-    return str(path) if path.exists() else "empty"
+    # >1024-byte guard mirrors the miner's _msa_path_for (miner_daemon_ref.py L688):
+    # a truncated/failed download must not be treated as a usable alignment.
+    if path.exists() and path.stat().st_size > 1024:
+        return str(path)
+    # Never degrade silently — falling back to targets.json protein_sequence in
+    # single-sequence mode makes this validator's rescore incomparable to the
+    # miner's, which is how 935 CDK4 submissions were rejected unnoticed.
+    log.warning(
+        f"  [MSA-MISS] no usable a3m for {uniprot_id} at {path} — falling back to "
+        f"targets.json protein_sequence in single-sequence mode; rescore will not "
+        f"be comparable to the miner's"
+    )
+    return "empty"
 
 
 def _sequence_from_msa(msa_path: str) -> str | None:
@@ -1827,7 +1855,7 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
         boltz_start = time.time()
 
         # ── Run Boltz2 ────────────────────────────────────────────────────────
-        predict.main([
+        _boltz_args = [
             str(in_dir),
             "--out_dir",                     str(out_dir),
             "--recycling_steps",             str(_RECYCLING_STEPS),
@@ -1842,7 +1870,18 @@ def run_boltz2(smiles: str, target: dict, seed: int = BOLTZ_SEED) -> float | Non
             "--affinity_mw_correction",
             "--override",
             "--no_kernels",      # disable cuequivariance CUDA kernels (incompatible with CUDA 13 / driver 580)
-        ], standalone_mode=False)
+        ]
+        # Cap MSA depth only when a real alignment is attached.  RNA mode and the
+        # msa:"empty" fallback have no alignment to subsample, and passing these
+        # flags there would be a no-op at best.  Without the cap a deep a3m OOMs
+        # the 8GB card and run_boltz2() returns None (VALIDATOR_ERROR).
+        if msa_path != "empty":
+            _boltz_args += [
+                "--subsample_msa",
+                "--num_subsampled_msa", str(_NUM_SUBSAMPLED_MSA),
+                "--max_msa_seqs",       str(_NUM_SUBSAMPLED_MSA),
+            ]
+        predict.main(_boltz_args, standalone_mode=False)
 
         # ── Read output with mtime verification ───────────────────────────────
         metrics = _read_boltz_affinity(out_dir, mol_id, target_id, boltz_start)
