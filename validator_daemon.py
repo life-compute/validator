@@ -179,6 +179,16 @@ GPU_BIAS_PATH = WORK_DIR / "output" / "gpu_bias_models.json"
 # Minimum samples per GPU·target-family before bias model activates
 GPU_BIAS_MIN_SAMPLES = 10
 
+# Legacy bias buckets recorded BEFORE per-submission GPU identity existed were
+# keyed by the VALIDATOR's own card (local nvidia-smi), not the submitting
+# miner's hardware — two different miners were both filed under "RTX 4060".
+# Those samples cannot be re-attributed (pre-boundary accounts carry no GPU
+# bytes), so they are renamed under this prefix instead of deleted: lookups use
+# the real parsed GPU string, which can never equal this key, so the bucket is
+# permanently inert AND can never grow. That closes the recontamination path
+# where an inert entry silently reactivates once enough samples accumulate.
+_UNATTRIBUTED_GPU_PREFIX = "UNATTRIBUTED_PRE_"
+
 # ── Tokenomics: base rewards and halving schedule ──────────────────────────────
 # Miner base rewards by difficulty tier (raw LIFE units, matching on-chain constants.rs).
 # Tier 1=Easy(1), Tier 2=Medium(5), Tier 3=Hard(25).  All molecule types use these.
@@ -493,12 +503,82 @@ def _load_seen_from_audit() -> None:
 
 # ── GPU detection ─────────────────────────────────────────────────────────────
 
+# On-chain GPU identity: the deployed program (last_deploy_slot 500325657) writes
+# the miner's raw GPU name into the 31 trailing padding bytes of ResultSubmission
+# as NUL-right-padded ASCII.
+#
+#   offset 907 .. 937  (31B)
+#   observed: b"NVIDIA GeForce RTX 5060" + 8 NUL bytes
+#
+# Verified empirically against 15,590 live 938-byte accounts (NOT from local Rust
+# source, which has no such field — the deployed binary is AHEAD of the local
+# source tree and no on-chain IDL is published, so the account bytes are the only
+# authority here).  Clean regime change at the deploy boundary:
+#   slot <  500325657 → 0 / 15586 carry a payload
+#   slot >= 500325657 → 4 / 4     carry a payload
+GPU_ID_OFFSET: int = 907
+GPU_ID_LEN:    int = 31
+
+# Slot at which the GPU-identity-bearing program build went live. Submissions
+# older than this can never carry a payload — they are UNKNOWN by construction,
+# not by parse failure. Used only for logging/telemetry clarity.
+GPU_ID_BOUNDARY_SLOT: int = 500325657
+
+_GPU_NAME_PREFIXES = ("NVIDIA GeForce ", "NVIDIA ", "GeForce ")
+
+
+def _normalize_gpu_name(raw: str) -> str:
+    """
+    Normalise a raw GPU name to the daemon's short bucket key.
+
+      "NVIDIA GeForce RTX 5060" → "RTX 5060"
+
+    CRITICAL: the on-chain field carries the RAW vendor string while
+    detect_gpu_model() has always stored the stripped short form. Bucketing the
+    raw string alongside the short form would split one physical card into two
+    bias buckets, each needing its own GPU_BIAS_MIN_SAMPLES before activating.
+    Every producer of a bucket key MUST route through this one function.
+    """
+    s = (raw or "").strip().strip("\x00").strip()
+    for prefix in _GPU_NAME_PREFIXES:
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    s = s.strip()
+    return s or "UNKNOWN"
+
+
+def _parse_gpu_model(data: bytes) -> str:
+    """
+    Extract the miner's GPU model from raw ResultSubmission account bytes.
+
+    Returns a normalised bucket key, or "UNKNOWN" when the field is absent
+    (pre-boundary submission), all-NUL, or not decodable. "UNKNOWN" is already
+    refused by GpuBiasTracker.record() and bypasses get_bias_factor(), so an
+    unattributed submission falls back to raw VALIDATION_TOLERANCE rather than
+    silently borrowing another card's correction.
+    """
+    try:
+        if len(data) < GPU_ID_OFFSET + GPU_ID_LEN:
+            return "UNKNOWN"
+        raw = bytes(data[GPU_ID_OFFSET:GPU_ID_OFFSET + GPU_ID_LEN]).rstrip(b"\x00")
+        if not raw:
+            return "UNKNOWN"
+        return _normalize_gpu_name(raw.decode("ascii", errors="replace"))
+    except Exception:
+        return "UNKNOWN"
+
+
 def detect_gpu_model() -> str:
     """
     Query nvidia-smi for the GPU name and normalise to short form.
     e.g. "NVIDIA GeForce RTX 5060" → "RTX 5060"
     Falls back to MINER_GPU_MODEL env var, then "UNKNOWN".
     Also writes MINER_GPU_MODEL to .env so the miner picks it up at next start.
+
+    NOTE: this is the VALIDATOR's OWN card (local nvidia-smi) — it is the
+    rescoring host, NOT the submitting miner's hardware. Never use it as a bias
+    bucket key; use _parse_gpu_model() on the submission account instead.
     """
     # 1. Try env override first
     env_val = _env("MINER_GPU_MODEL", "")
@@ -515,11 +595,11 @@ def detect_gpu_model() -> str:
         )
         if result.returncode == 0:
             raw = result.stdout.strip().splitlines()[0].strip()
-            # Normalise: strip known prefixes
-            for prefix in ("NVIDIA GeForce ", "NVIDIA ", "GeForce "):
-                if raw.startswith(prefix):
-                    raw = raw[len(prefix):]
-            gpu_name = raw
+            # Normalise via the shared helper so the local card and the
+            # on-chain miner strings can never disagree on bucket-key form.
+            gpu_name = _normalize_gpu_name(raw)
+            if gpu_name == "UNKNOWN":
+                gpu_name = ""
     except Exception as e:
         log.warning(f"nvidia-smi query failed: {e}")
 
@@ -1478,10 +1558,12 @@ def validate_mrna(
         bias_tracker.record(gpu_model, family, claimed, rescored)
 
     # ── Step 4: Check how many samples we have ────────────────────────────────
+    # Use the public accessor, NOT bias_tracker._data — reaching into the private
+    # dict silently returns n=0 (and disables mRNA forever) if the bias file's
+    # key structure ever changes.
     n_samples = 0
     if bias_tracker is not None:
-        entry = bias_tracker._data.get(gpu_model, {}).get(family, {})
-        n_samples = entry.get("n", 0)
+        n_samples = bias_tracker.get_n(gpu_model, family)
 
     bias_factor = None
     if n_samples >= MRNA_BIAS_MIN_SAMPLES and bias_tracker is not None:
@@ -1579,6 +1661,10 @@ class GpuBiasTracker:
         """Record a rescoring observation for bias learning."""
         if not gpu_model or gpu_model == "UNKNOWN":
             return
+        # Never append to a retired/unattributed bucket — it must stay frozen so
+        # it can never re-cross the activation threshold.
+        if gpu_model.startswith(_UNATTRIBUTED_GPU_PREFIX):
+            return
         if claimed == 0.0:
             return   # avoid division by zero in ratio
         # Guard: skip mRNA samples where claimed is tiny (|claimed| < 1.0).
@@ -1628,21 +1714,54 @@ class GpuBiasTracker:
     def summary(self) -> dict:
         """
         Return a dict suitable for stats.json GPU_BIAS section.
-        {gpu_model: {n_total, families: [{family, n, bias_factor, tolerance}]}}
+
+        {gpu_model: {n_total, families: [...], calibrated, families_total,
+                     calibration_pct, applied, unattributed}}
+
+        `calibration_pct` is REAL progress toward an activatable bias model for
+        this GPU bucket: the mean of min(n, GPU_BIAS_MIN_SAMPLES)/GPU_BIAS_MIN_SAMPLES
+        across that GPU's families. It never exceeds 100 and is never synthesised
+        — a bucket with no samples reports 0.
+
+        `applied` is False for buckets whose samples can never reach a live
+        lookup (the UNATTRIBUTED legacy bucket), so the dashboard can label them
+        honestly instead of implying an active correction.
         """
         out = {}
         for gpu, families in self._data.items():
             total_n = sum(v["n"] for v in families.values())
             fam_list = []
+            calibrated = 0
+            prog_sum = 0.0
             for fam, v in sorted(families.items()):
                 bf = v["bias_factor"]
+                n  = v["n"]
+                in_range = (bf is not None
+                            and BIAS_FACTOR_LO <= bf <= BIAS_FACTOR_HI)
+                if bf is not None:
+                    calibrated += 1
+                prog = min(n, GPU_BIAS_MIN_SAMPLES) / GPU_BIAS_MIN_SAMPLES
+                prog_sum += prog
                 fam_list.append({
-                    "family":      fam,
-                    "n":           v["n"],
-                    "bias_factor": round(bf, 4) if bf is not None else None,
-                    "tolerance":   TIGHTENED_TOLERANCE if bf is not None else VALIDATION_TOLERANCE,
+                    "family":          fam,
+                    "n":               n,
+                    "bias_factor":     round(bf, 4) if bf is not None else None,
+                    "in_range":        in_range,
+                    "needed":          max(0, GPU_BIAS_MIN_SAMPLES - n),
+                    "progress_pct":    round(prog * 100, 1),
+                    "tolerance":       TIGHTENED_TOLERANCE if in_range else VALIDATION_TOLERANCE,
                 })
-            out[gpu] = {"n_total": total_n, "families": fam_list}
+            nfam = len(families) or 1
+            out[gpu] = {
+                "n_total":         total_n,
+                "families":        fam_list,
+                "families_total":  len(families),
+                "calibrated":      calibrated,
+                "calibration_pct": round(prog_sum / nfam * 100, 1),
+                "applied":         not gpu.startswith(_UNATTRIBUTED_GPU_PREFIX),
+                "unattributed":    gpu.startswith(_UNATTRIBUTED_GPU_PREFIX),
+                "min_samples":     GPU_BIAS_MIN_SAMPLES,
+            }
         return out
 
 
@@ -2215,6 +2334,7 @@ def _parse_result_submission(pubkey: str, data: bytes) -> dict | None:
         smiles = smiles_raw[:smiles_len].decode("utf-8", errors="replace").strip("\x00")
         if not smiles:
             return None
+        gpu_model = _parse_gpu_model(data)
         return {
             "pubkey":           pubkey,
             "miner":            _b58.b58encode(miner).decode(),
@@ -2223,6 +2343,7 @@ def _parse_result_submission(pubkey: str, data: bytes) -> dict | None:
             "smiles":           smiles,
             "claimed_affinity": float(claimed),
             "status":           status,
+            "miner_gpu":        gpu_model,
         }
     except Exception as e:
         log.debug(f"  _parse_result_submission {pubkey[:16]}: {e}")
@@ -2526,6 +2647,7 @@ def fetch_pending_submissions(crispr_only: bool = False) -> list[dict]:
                 "smiles":           smiles,
                 "claimed_affinity": float(claimed),
                 "status":           status,
+                "miner_gpu":        _parse_gpu_model(data),
             })
         except Exception as e:
             log.debug(f"  parse error {item.get('pubkey','?')[:16]}: {e}")
@@ -2796,6 +2918,14 @@ def main():
                     miner_wallet  = sub["miner"]
                     target_id_int = sub["target_id"]
                     claimed       = sub["claimed_affinity"]
+                    # Per-submission GPU identity parsed from the account bytes.
+                    # NOT _miner_gpu_model (that is this validator's own card).
+                    submission_gpu = sub.get("miner_gpu") or "UNKNOWN"
+                    if submission_gpu == "UNKNOWN":
+                        log.info(f"  [GPU-ID-MISS] {pubkey[:16]}… no GPU field — "
+                                 f"bias bypassed, raw tolerance")
+                    else:
+                        log.info(f"  [GPU-ID] {pubkey[:16]}… miner_gpu={submission_gpu}")
 
                     # Dedup guard (dispatcher already checked, but be defensive
                     # in case a catch-up poll re-queued an item between checks)
@@ -2819,6 +2949,7 @@ def main():
                             "ts":                datetime.now(timezone.utc).isoformat(),
                             "submission_pubkey": pubkey,
                             "miner_wallet":      miner_wallet,
+                            "miner_gpu":         submission_gpu,
                             "claimed_score":     claimed,
                             "rescored":          None,
                             "decision":          "ALREADY_VOTED",
@@ -2873,7 +3004,7 @@ def main():
                         grna_seq=smiles,
                         target={**target, "id": _crispr_tgt_name},
                         claimed=claimed,
-                        gpu_model=_miner_gpu_model,
+                        gpu_model=submission_gpu,
                         bias_tracker=_gpu_bias_tracker,
                     )
                     # Charge a rate-limit slot only if Boltz2 actually produced a score.
@@ -2946,6 +3077,7 @@ def main():
                             "ts":               datetime.now(timezone.utc).isoformat(),
                             "submission_pubkey": pubkey,
                             "miner_wallet":     miner_wallet,
+                            "miner_gpu":        submission_gpu,
                             "claimed_score":    claimed,
                             "rescored":         rescored,
                             "decision":         "CONFIRM" if within_tol else "REJECT",
@@ -3105,6 +3237,14 @@ def main():
             miner_wallet  = sub["miner"]
             target_id_int = sub["target_id"]
             claimed       = sub["claimed_affinity"]
+            # Per-submission GPU identity parsed from the account bytes.
+            # NOT _miner_gpu_model (that is this validator's own card).
+            submission_gpu = sub.get("miner_gpu") or "UNKNOWN"
+            if submission_gpu == "UNKNOWN":
+                log.info(f"  [GPU-ID-MISS] {pubkey[:16]}… no GPU field — "
+                         f"bias bypassed, raw tolerance")
+            else:
+                log.info(f"  [GPU-ID] {pubkey[:16]}… miner_gpu={submission_gpu}")
 
             # ── Dedup: skip already-processed or over-retried submissions ─────
             attempts = _SEEN_SUBMISSIONS.get(pubkey, 0)
@@ -3126,6 +3266,7 @@ def main():
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
                     "miner_wallet":     miner_wallet,
+                    "miner_gpu":        submission_gpu,
                     "claimed_score":    claimed,
                     "rescored":         None,
                     "decision":         "WALLET_NOT_ALLOWED",
@@ -3150,6 +3291,7 @@ def main():
                     "ts":                datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
                     "miner_wallet":      miner_wallet,
+                    "miner_gpu":         submission_gpu,
                     "claimed_score":     claimed,
                     "rescored":          None,
                     "decision":          "ALREADY_VOTED",
@@ -3164,6 +3306,7 @@ def main():
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
                     "miner_wallet":     miner_wallet,
+                    "miner_gpu":        submission_gpu,
                     "claimed_score":    claimed,
                     "rescored":         None,
                     "decision":         "RATE_LIMITED",
@@ -3178,6 +3321,7 @@ def main():
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
                     "miner_wallet":     miner_wallet,
+                    "miner_gpu":        submission_gpu,
                     "claimed_score":    claimed,
                     "rescored":         None,
                     "decision":         "SELF_VALIDATION_REJECTED",
@@ -3202,6 +3346,7 @@ def main():
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
                     "miner_wallet":     miner_wallet,
+                    "miner_gpu":        submission_gpu,
                     "claimed_score":    claimed,
                     "rescored":         None,
                     "decision":         "CORRUPTED_SCORE",
@@ -3216,6 +3361,7 @@ def main():
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
                     "miner_wallet":     miner_wallet,
+                    "miner_gpu":        submission_gpu,
                     "claimed_score":    claimed,
                     "rescored":         None,
                     "decision":         "SMILES_INVALID",
@@ -3231,6 +3377,7 @@ def main():
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
                     "miner_wallet":     miner_wallet,
+                    "miner_gpu":        submission_gpu,
                     "claimed_score":    claimed,
                     "rescored":         None,
                     "decision":         "UNKNOWN_TARGET",
@@ -3277,6 +3424,7 @@ def main():
                             "ts":               datetime.now(timezone.utc).isoformat(),
                             "submission_pubkey": pubkey,
                             "miner_wallet":     miner_wallet,
+                            "miner_gpu":        submission_gpu,
                             "claimed_score":    claimed,
                             "rescored":         None,
                             "decision":         "BOLTZ2_FAILED",
@@ -3295,6 +3443,7 @@ def main():
                             "ts":               datetime.now(timezone.utc).isoformat(),
                             "submission_pubkey": pubkey,
                             "miner_wallet":     miner_wallet,
+                            "miner_gpu":        submission_gpu,
                             "claimed_score":    claimed,
                             "rescored":         None,
                             "decision":         "BOLTZ2_FAILED" if not tx else "BOLTZ2_REJECT",
@@ -3311,7 +3460,7 @@ def main():
                     grna_seq=smiles,
                     target={**target, "id": _crispr_tgt_name},
                     claimed=claimed,
-                    gpu_model=_miner_gpu_model,
+                    gpu_model=submission_gpu,
                     bias_tracker=_gpu_bias_tracker,
                 )
                 # Charge a rate-limit slot only if Boltz2 actually produced a score.
@@ -3384,6 +3533,7 @@ def main():
                     "ts":               datetime.now(timezone.utc).isoformat(),
                     "submission_pubkey": pubkey,
                     "miner_wallet":     miner_wallet,
+                    "miner_gpu":        submission_gpu,
                     "claimed_score":    claimed,
                     "rescored":         rescored,
                     "decision":         crispr_audit_decision,
@@ -3450,7 +3600,7 @@ def main():
                     target=target,
                     claimed=claimed,
                     seed=_seed,
-                    gpu_model=_miner_gpu_model,
+                    gpu_model=submission_gpu,
                     bias_tracker=_gpu_bias_tracker,
                 )
                 rescored       = vp["rescored"] if vp["rescored"] is not None else rescored
@@ -3467,7 +3617,7 @@ def main():
                         "ts":               datetime.now(timezone.utc).isoformat(),
                         "submission_pubkey": pubkey,
                         "miner_wallet":     miner_wallet,
-                        "miner_gpu":        _miner_gpu_model,
+                        "miner_gpu":        submission_gpu,
                         "claimed_score":    claimed,
                         "adjusted_claimed": adjusted_claimed,
                         "bias_factor":      bias_factor,
@@ -3489,7 +3639,7 @@ def main():
                     target=target,
                     claimed=claimed,
                     seed=_seed,
-                    gpu_model=_miner_gpu_model,
+                    gpu_model=submission_gpu,
                     bias_tracker=_gpu_bias_tracker,
                 )
                 rescored         = vm["rescored"] if vm["rescored"] is not None else rescored
@@ -3505,7 +3655,7 @@ def main():
                         "ts":               datetime.now(timezone.utc).isoformat(),
                         "submission_pubkey": pubkey,
                         "miner_wallet":     miner_wallet,
-                        "miner_gpu":        _miner_gpu_model,
+                        "miner_gpu":        submission_gpu,
                         "claimed_score":    claimed,
                         "adjusted_claimed": adjusted_claimed,
                         "bias_factor":      bias_factor,
@@ -3607,7 +3757,7 @@ def main():
                 "ts":               datetime.now(timezone.utc).isoformat(),
                 "submission_pubkey": pubkey,
                 "miner_wallet":     miner_wallet,
-                "miner_gpu":        _miner_gpu_model,
+                "miner_gpu":        submission_gpu,
                 "claimed_score":    claimed,
                 "adjusted_claimed": round(adjusted_claimed, 4),
                 "bias_factor":      round(bias_factor, 4) if bias_factor is not None else None,

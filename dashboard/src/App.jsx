@@ -1027,26 +1027,64 @@ function LifeAgentPanel() {
 }
 
 /* ─── GPU BIAS MONITOR panel ────────────────────────────────── */
+/* Shows ONLY real GPU models parsed from miner submission accounts
+   (ResultSubmission bytes 907..937). The validator's own card is the
+   rescoring host and is deliberately NOT presented as a miner GPU.
+   Nothing here is synthesised: a model appears only after it has
+   actually submitted, and progress is min(n,10)/10 per bucket. */
 function GpuBiasPanel({ stats }) {
-  const gpuBias   = stats?.gpu_bias   ?? {}
-  const gpuModel  = stats?.gpu_model  ?? '—'
-  const entries   = Object.entries(gpuBias)
-  const hasData   = entries.length > 0
+  const gpuBias  = stats?.gpu_bias ?? {}
+  const hostGpu  = stats?.gpu_model ?? '—'
 
-  // Flatten to per-GPU summary rows for the top-level table
-  const gpuRows = entries.map(([gpu, info]) => ({
-    gpu,
-    n:      info.n_total ?? 0,
-    // aggregate bias: weighted mean of family bias factors that are non-null
-    bias:   (() => {
-      const active = (info.families ?? []).filter(f => f.bias_factor != null)
-      if (!active.length) return null
-      const sum = active.reduce((s, f) => s + f.bias_factor * f.n, 0)
-      const tot = active.reduce((s, f) => s + f.n, 0)
-      return tot > 0 ? sum / tot : null
-    })(),
-    families: info.families ?? [],
-  }))
+  // Bias-factor sanity window mirrors the daemon's BIAS_FACTOR_LO/HI.
+  const BF_LO = 0.1, BF_HI = 10.0
+
+  const all = Object.entries(gpuBias).map(([gpu, info]) => {
+    const minN = info.min_samples ?? 10
+    // Derive every per-family field defensively: the dashboard bundle and the
+    // daemon deploy independently, so an older stats.json (pre-restart) will
+    // lack progress_pct/in_range/needed. Never call .toFixed on undefined.
+    const families = (info.families ?? []).map(f => {
+      const n  = f.n ?? 0
+      const bf = f.bias_factor ?? null
+      return {
+        ...f,
+        n,
+        bias_factor:  bf,
+        in_range:     f.in_range     ?? (bf != null && bf >= BF_LO && bf <= BF_HI),
+        needed:       f.needed       ?? Math.max(0, minN - n),
+        progress_pct: f.progress_pct ?? Math.min(n, minN) / minN * 100,
+      }
+    })
+    const derivedPct = families.length
+      ? families.reduce((s, f) => s + f.progress_pct, 0) / families.length
+      : 0
+    return {
+      gpu,
+      n:        info.n_total ?? 0,
+      families,
+      famTotal: info.families_total ?? families.length,
+      calib:    info.calibrated ?? families.filter(f => f.bias_factor != null).length,
+      pct:      info.calibration_pct ?? derivedPct,
+      minN,
+      // Treat the legacy validator-card bucket as unattributed even when the
+      // daemon hasn't restarted yet and the flag is absent.
+      unattributed: info.unattributed ?? gpu.startsWith('UNATTRIBUTED_PRE_'),
+    }
+  })
+
+  // Real submitting GPUs vs the retired pre-boundary bucket.
+  const real    = all.filter(r => !r.unattributed).sort((a, b) => b.n - a.n)
+  const retired = all.filter(r =>  r.unattributed)
+
+  const Bar = ({ pct, color }) => (
+    <div style={{ flex:1, height:'6px', background:'#0a1410',
+                  border:`1px solid ${T.purple}22`, minWidth:'60px' }}>
+      <div style={{ width:`${Math.max(0, Math.min(100, pct))}%`, height:'100%',
+                    background:color, boxShadow:glow(color, 2),
+                    transition:'width .4s ease' }} />
+    </div>
+  )
 
   return (
     <Panel accent={T.purple} style={{ gridColumn:'1 / -1' }}>
@@ -1055,57 +1093,78 @@ function GpuBiasPanel({ stats }) {
         <span style={S.titleAccent(T.purple)}>◈</span>
         <span>GPU BIAS MONITOR</span>
         <span style={{ marginLeft:'auto', color:T.textDim, fontSize:'10px', letterSpacing:'0.12em' }}>
-          ACTIVE GPU: <span style={{ color:T.purple, textShadow:glow(T.purple,2) }}>{gpuModel}</span>
+          MINER GPUs REPORTING: <span style={{ color: real.length ? T.purple : T.textDim,
+                                               textShadow: real.length ? glow(T.purple,2) : 'none' }}>
+            {real.length}
+          </span>
         </span>
       </div>
 
-      {!hasData ? (
-        <div style={{ color:T.textDim, fontSize:'11px', fontFamily:T.mono }}>
-          Collecting samples… bias model activates after {10} rescorings per GPU · target family <Cursor />
+      {/* Host GPU — explicitly labelled as the rescoring host, not a miner */}
+      <div style={{ fontSize:'9px', fontFamily:T.mono, color:T.textDim,
+                    letterSpacing:'0.1em', paddingBottom:'8px' }}>
+        RESCORING HOST (THIS VALIDATOR): <span style={{ color:T.textDim }}>{hostGpu}</span>
+        <span style={{ opacity:0.7 }}> — not a miner GPU, never used as a bias bucket</span>
+      </div>
+
+      {real.length === 0 ? (
+        <div style={{ color:T.textDim, fontSize:'11px', fontFamily:T.mono, lineHeight:1.7 }}>
+          No miner GPU model has submitted data yet. <Cursor />
+          <div style={{ fontSize:'9px', opacity:0.75, paddingTop:'4px' }}>
+            Per-model bias stays inactive until real GPU identity arrives on a submission.
+          </div>
         </div>
       ) : (
-        gpuRows.map(({ gpu, n, bias, families }) => {
-          const hasModel = bias != null
-          const biasPct  = hasModel ? (bias * 100).toFixed(1) + '%' : '(learning)'
-          const tolLabel = hasModel ? '35%' : '77.77%'
-          const dotColor = hasModel ? T.green : T.amber
+        real.map(({ gpu, n, families, famTotal, calib, pct, minN }) => {
+          const ready    = families.filter(f => f.in_range).length
+          const active   = ready > 0
+          const dotColor = active ? T.green : T.amber
           return (
             <div key={gpu} style={{ marginBottom:'14px' }}>
               {/* GPU header row */}
               <div style={{
                 display:'flex', alignItems:'center', gap:'10px',
                 padding:'6px 0', borderBottom:`1px solid ${T.purple}33`,
-                fontSize:'11px', fontFamily:T.mono,
+                fontSize:'11px', fontFamily:T.mono, flexWrap:'wrap',
               }}>
                 <div style={{ width:'8px', height:'8px', borderRadius:'50%',
                               background:dotColor, boxShadow:glow(dotColor,3), flexShrink:0 }} />
-                <span style={{ color:T.purple, fontWeight:700, textShadow:glow(T.purple,2), minWidth:'120px' }}>
+                <span style={{ color:T.purple, fontWeight:700, textShadow:glow(T.purple,2), minWidth:'110px' }}>
                   {gpu}
                 </span>
                 <span style={{ color:T.textDim, fontSize:'10px' }}>
-                  n=<span style={{ color:T.cyan }}>{n}</span>
+                  samples=<span style={{ color:T.cyan }}>{n}</span>
                 </span>
                 <span style={{ color:T.textDim, fontSize:'10px' }}>
-                  · bias=<span style={{ color: hasModel ? T.green : T.amber }}>{biasPct}</span>
+                  · targets=<span style={{ color:T.cyan }}>{famTotal}</span>
                 </span>
                 <span style={{ color:T.textDim, fontSize:'10px' }}>
-                  · tolerance=<span style={{ color: hasModel ? T.green : T.amber }}>{tolLabel}</span>
+                  · calibrated=<span style={{ color: active ? T.green : T.amber }}>
+                    {ready}/{famTotal}
+                  </span>
                 </span>
-                <span style={{ marginLeft:'auto', ...S.pill(hasModel ? T.green : T.amber) }}>
-                  {hasModel ? 'MODEL ACTIVE' : 'LEARNING'}
+                <span style={{ display:'flex', alignItems:'center', gap:'6px',
+                               flex:1, minWidth:'140px' }}>
+                  <Bar pct={pct} color={active ? T.green : T.amber} />
+                  <span style={{ color: active ? T.green : T.amber, fontSize:'10px', minWidth:'42px' }}>
+                    {pct.toFixed(1)}%
+                  </span>
+                </span>
+                <span style={{ marginLeft:'auto', ...S.pill(active ? T.green : T.amber) }}>
+                  {active ? `BIAS ACTIVE (${ready})` : `CALIBRATING → n≥${minN}`}
                 </span>
               </div>
 
-              {/* Per-family breakdown (collapsed if empty) */}
+              {/* Per-target calibration progress — real n, real percentage */}
               {families.length > 0 && (
                 <div style={{
                   display:'grid',
-                  gridTemplateColumns:'repeat(auto-fill,minmax(220px,1fr))',
+                  gridTemplateColumns:'repeat(auto-fill,minmax(310px,1fr))',
                   gap:'6px', paddingTop:'6px',
                 }}>
                   {families.map(f => {
-                    const fHasModel = f.bias_factor != null
-                    const fc = fHasModel ? T.green : T.textDim
+                    const done = f.in_range
+                    const c    = done ? T.green : T.amber
                     return (
                       <div key={f.family} style={{
                         background:'#010603',
@@ -1113,19 +1172,23 @@ function GpuBiasPanel({ stats }) {
                         padding:'5px 8px',
                         fontSize:'10px', fontFamily:T.mono,
                         display:'flex', gap:'6px', alignItems:'center',
+                        overflow:'hidden', whiteSpace:'nowrap',
                       }}>
-                        <span style={{ color:T.purple, minWidth:'38px' }}>{f.family}</span>
-                        <span style={{ color:T.textDim }}>n=</span>
-                        <span style={{ color:T.cyan }}>{f.n}</span>
-                        {fHasModel && (
-                          <>
-                            <span style={{ color:T.textDim }}>·</span>
-                            <span style={{ color:fc }}>bias={f.bias_factor?.toFixed(4)}</span>
-                          </>
-                        )}
-                        {!fHasModel && (
-                          <span style={{ color:T.amber, fontSize:'9px' }}>({10-f.n} more needed)</span>
-                        )}
+                        <span style={{ color:T.purple, minWidth:'86px', flexShrink:0 }}>{f.family}</span>
+                        <span style={{ color:T.textDim, flexShrink:0 }}>
+                          n=<span style={{ color:T.cyan }}>{f.n}</span>/{minN}
+                        </span>
+                        <Bar pct={f.progress_pct} color={c} />
+                        <span style={{ color:c, minWidth:'34px', textAlign:'right', flexShrink:0 }}>
+                          {f.progress_pct.toFixed(0)}%
+                        </span>
+                        {done
+                          ? <span style={{ color:T.green, flexShrink:0 }}>
+                              bias={f.bias_factor?.toFixed(4)}
+                            </span>
+                          : <span style={{ color:T.amber, fontSize:'9px', flexShrink:0 }}>
+                              +{f.needed} needed
+                            </span>}
                       </div>
                     )
                   })}
@@ -1135,6 +1198,25 @@ function GpuBiasPanel({ stats }) {
           )
         })
       )}
+
+      {/* Retired pre-boundary history — shown, never counted as a miner GPU */}
+      {retired.map(({ gpu, n, famTotal }) => (
+        <div key={gpu} style={{
+          marginTop:'10px', paddingTop:'8px',
+          borderTop:`1px dashed ${T.textDim}55`,
+          fontSize:'9px', fontFamily:T.mono, color:T.textDim, lineHeight:1.6,
+        }}>
+          <span style={{ ...S.pill(T.textDim) }}>RETIRED</span>
+          <span style={{ paddingLeft:'8px' }}>
+            {gpu} — {n} samples across {famTotal} targets, recorded before
+            per-submission GPU identity existed
+          </span>
+          <div style={{ opacity:0.75, paddingTop:'3px' }}>
+            Attributed to this validator's own card, not the submitting miner.
+            Frozen and never applied: no lookup can reach this bucket.
+          </div>
+        </div>
+      ))}
     </Panel>
   )
 }
