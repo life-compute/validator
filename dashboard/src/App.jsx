@@ -1036,6 +1036,13 @@ function GpuBiasPanel({ stats }) {
   const gpuBias  = stats?.gpu_bias ?? {}
   const hostGpu  = stats?.gpu_model ?? '—'
 
+  // Per-GPU collapse state. Keyed by GPU model so each group toggles
+  // independently — expanding one never collapses another. Default is
+  // collapsed: only the aggregate summary line per GPU model is shown.
+  const [expanded, setExpanded] = useState({})
+  const toggleGpu = (gpu) =>
+    setExpanded(prev => ({ ...prev, [gpu]: !prev[gpu] }))
+
   // Bias-factor sanity window mirrors the daemon's BIAS_FACTOR_LO/HI.
   const BF_LO = 0.1, BF_HI = 10.0
 
@@ -1115,18 +1122,47 @@ function GpuBiasPanel({ stats }) {
           </div>
         </div>
       ) : (
-        real.map(({ gpu, n, families, famTotal, calib, pct, minN }) => {
+        /* Scroll container: the panel keeps a fixed height as GPU models and
+           their expanded target rows grow. Collapsed groups are one line each,
+           so this only engages once groups are expanded or many GPUs report. */
+        <div
+          data-gpu-scroll
+          style={{
+            maxHeight:  '340px',
+            overflowY:  'auto',
+            overflowX:  'hidden',
+            paddingRight: '6px',
+          }}
+        >
+        {real.map(({ gpu, n, families, famTotal, calib, pct, minN }) => {
           const ready    = families.filter(f => f.in_range).length
           const active   = ready > 0
           const dotColor = active ? T.green : T.amber
+          const isOpen   = !!expanded[gpu]
           return (
-            <div key={gpu} style={{ marginBottom:'14px' }}>
-              {/* GPU header row */}
-              <div style={{
-                display:'flex', alignItems:'center', gap:'10px',
-                padding:'6px 0', borderBottom:`1px solid ${T.purple}33`,
-                fontSize:'11px', fontFamily:T.mono, flexWrap:'wrap',
-              }}>
+            <div key={gpu} style={{ marginBottom:'14px' }} data-gpu-group={gpu}>
+              {/* GPU summary line — click to expand/collapse this model only */}
+              <div
+                data-gpu-summary={gpu}
+                data-expanded={isOpen ? 'true' : 'false'}
+                role="button"
+                tabIndex={0}
+                aria-expanded={isOpen}
+                onClick={() => toggleGpu(gpu)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleGpu(gpu) }
+                }}
+                style={{
+                  display:'flex', alignItems:'center', gap:'10px',
+                  padding:'6px 0', borderBottom:`1px solid ${T.purple}33`,
+                  fontSize:'11px', fontFamily:T.mono, flexWrap:'wrap',
+                  cursor:'pointer', userSelect:'none',
+                }}
+              >
+                <span style={{ color:T.purple, textShadow:glow(T.purple,3),
+                               fontSize:'10px', width:'10px', flexShrink:0 }}>
+                  {isOpen ? '▼' : '▶'}
+                </span>
                 <div style={{ width:'8px', height:'8px', borderRadius:'50%',
                               background:dotColor, boxShadow:glow(dotColor,3), flexShrink:0 }} />
                 <span style={{ color:T.purple, fontWeight:700, textShadow:glow(T.purple,2), minWidth:'110px' }}>
@@ -1155,13 +1191,17 @@ function GpuBiasPanel({ stats }) {
                 </span>
               </div>
 
-              {/* Per-target calibration progress — real n, real percentage */}
-              {families.length > 0 && (
-                <div style={{
-                  display:'grid',
-                  gridTemplateColumns:'repeat(auto-fill,minmax(310px,1fr))',
-                  gap:'6px', paddingTop:'6px',
-                }}>
+              {/* Per-target calibration progress — real n, real percentage.
+                  Rendered only while this GPU model is expanded. */}
+              {isOpen && families.length > 0 && (
+                <div
+                  data-gpu-targets={gpu}
+                  style={{
+                    display:'grid',
+                    gridTemplateColumns:'repeat(auto-fill,minmax(310px,1fr))',
+                    gap:'6px', paddingTop:'6px',
+                  }}
+                >
                   {families.map(f => {
                     const done = f.in_range
                     const c    = done ? T.green : T.amber
@@ -1196,7 +1236,8 @@ function GpuBiasPanel({ stats }) {
               )}
             </div>
           )
-        })
+        })}
+        </div>
       )}
 
       {/* Retired pre-boundary history — shown, never counted as a miner GPU */}
