@@ -1,0 +1,26 @@
+{
+ "gene": "PDL1",
+ "mrna_acc": "NM_014143.4",
+ "genomic_acc": "NC_000009.12",
+ "cds_len": 873,
+ "protein_len": 290,
+ "cds_offset": 0,
+ "cancer_indication": "melanoma, NSCLC (checkpoint blockade)",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "CDS_START",
+   "codon": 1,
+   "cds_codon": 1,
+   "wt_codon": "ATG",
+   "wt_aa": "M",
+   "strand": "+",
+   "genomic_acc": "NC_000009.12",
+   "genomic_codon_start": 16114,
+   "window": "TAATTATTAAGTGAAGCAGTCTTCTTTTCGTGTTTTCCATAATTAGGGCATTCCAGAAAGATGAGGATATTTGCTGTCTTTATATTCATGACCTACTGGCATTTGCTGAACGGTAAGACACCA",
+   "window_start": 16054,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_start_no_recurrent_hotspot"
+  }
+ ]
+}

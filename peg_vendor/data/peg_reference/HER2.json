@@ -1,0 +1,68 @@
+{
+ "gene": "HER2",
+ "mrna_acc": "NM_004448.4",
+ "genomic_acc": "NG_007503.1",
+ "cds_len": 3768,
+ "protein_len": 1255,
+ "cds_offset": 0,
+ "cancer_indication": "breast, gastric",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "S310F",
+   "codon": 310,
+   "cds_codon": 310,
+   "wt_codon": "TCC",
+   "wt_aa": "S",
+   "strand": "+",
+   "genomic_acc": "NG_007503.1",
+   "genomic_codon_start": 28814,
+   "window": "AGGGTATGTGGCTACATGTTCCTGATCTCCTTAGACAACTACCTTTCTACGGACGTGGGATCCTGCACCCTCGTCTGCCCCCTGCACAACCAAGAGGTGACAGCAGAGGATGGAACACAGCGG",
+   "window_start": 28754,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "L755S",
+   "codon": 755,
+   "cds_codon": 755,
+   "wt_codon": "TTG",
+   "wt_aa": "L",
+   "strand": "+",
+   "genomic_acc": "NG_007503.1",
+   "genomic_codon_start": 40826,
+   "window": "GCCCAGGGCATCTGGATCCCTGATGGGGAGAATGTGAAAATTCCAGTGGCCATCAAAGTGTTGAGGGAAAACACATCCCCCAAAGCCAACAAAGAAATCTTAGACGTAAGCCCCTCCACCCTC",
+   "window_start": 40766,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "V777L",
+   "codon": 777,
+   "cds_codon": 777,
+   "wt_codon": "GTG",
+   "wt_aa": "V",
+   "strand": "+",
+   "genomic_acc": "NG_007503.1",
+   "genomic_codon_start": 41607,
+   "window": "GTGGTCTCCCATACCCTCTCAGCGTACCCTTGTCCCCAGGAAGCATACGTGATGGCTGGTGTGGGCTCCCCATATGTCTCCCGCCTTCTGGGCATCTGCCTGACATCCACGGTGCAGCTGGTG",
+   "window_start": 41547,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "V842I",
+   "codon": 842,
+   "cds_codon": 842,
+   "wt_codon": "GTA",
+   "wt_aa": "V",
+   "strand": "+",
+   "genomic_acc": "NG_007503.1",
+   "genomic_codon_start": 41939,
+   "window": "GAAGGTCTACATGGGTGCTTCCCATTCCAGGGGATGAGCTACCTGGAGGATGTGCGGCTCGTACACAGGGACTTGGCCGCTCGGAACGTGCTGGTCAAGAGTCCCAACCATGTCAAAATTACA",
+   "window_start": 41879,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  }
+ ]
+}

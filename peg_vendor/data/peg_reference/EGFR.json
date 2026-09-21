@@ -1,0 +1,68 @@
+{
+ "gene": "EGFR",
+ "mrna_acc": "NM_005228.5",
+ "genomic_acc": "NG_007726.3",
+ "cds_len": 3633,
+ "protein_len": 1210,
+ "cds_offset": 0,
+ "cancer_indication": "non-small-cell lung cancer",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "G719S",
+   "codon": 719,
+   "cds_codon": 719,
+   "wt_codon": "GGC",
+   "wt_aa": "G",
+   "strand": "+",
+   "genomic_acc": "NG_007726.3",
+   "genomic_codon_start": 159982,
+   "window": "CCCAACCAAGCTCTCTTGAGGATCTTGAAGGAAACTGAATTCAAAAAGATCAAAGTGCTGGGCTCCGGTGCGTTCGGCACGGTGTATAAGGTAAGGTCCCTGGCACAGGCCTCTGGGCTGGGC",
+   "window_start": 159922,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "T790M",
+   "codon": 790,
+   "cds_codon": 790,
+   "wt_codon": "ACG",
+   "wt_aa": "T",
+   "strand": "+",
+   "genomic_acc": "NG_007726.3",
+   "genomic_codon_start": 167345,
+   "window": "GACAACCCCCACGTGTGCCGCCTGCTGGGCATCTGCCTCACCTCCACCGTGCAGCTCATCACGCAGCTCATGCCCTTCGGCTGCCTCCTGGACTATGTCCGGGAACACAAAGACAATATTGGC",
+   "window_start": 167285,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "L858R",
+   "codon": 858,
+   "cds_codon": 858,
+   "wt_codon": "CTG",
+   "wt_aa": "L",
+   "strand": "+",
+   "genomic_acc": "NG_007726.3",
+   "genomic_codon_start": 177789,
+   "window": "CTGGCAGCCAGGAACGTACTGGTGAAAACACCGCAGCATGTCAAGATCACAGATTTTGGGCTGGCCAAACTGCTGGGTGCGGAAGAGAAAGAATACCATGCAGAAGGAGGCAAAGTAAGGAGG",
+   "window_start": 177729,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "L861Q",
+   "codon": 861,
+   "cds_codon": 861,
+   "wt_codon": "CTG",
+   "wt_aa": "L",
+   "strand": "+",
+   "genomic_acc": "NG_007726.3",
+   "genomic_codon_start": 177798,
+   "window": "AGGAACGTACTGGTGAAAACACCGCAGCATGTCAAGATCACAGATTTTGGGCTGGCCAAACTGCTGGGTGCGGAAGAGAAAGAATACCATGCAGAAGGAGGCAAAGTAAGGAGGTGGCTTTAG",
+   "window_start": 177738,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  }
+ ]
+}

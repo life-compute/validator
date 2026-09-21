@@ -1,0 +1,116 @@
+{
+ "genes": {
+  "TP53": {
+   "gene": "TP53",
+   "n_hotspots": 4,
+   "status": "OK",
+   "genomic_acc": "NG_017013.2",
+   "labels": [
+    "R175H",
+    "R248W/Q",
+    "R249S",
+    "R273H"
+   ]
+  },
+  "KRAS": {
+   "gene": "KRAS",
+   "n_hotspots": 4,
+   "status": "OK",
+   "genomic_acc": "NG_007524.2",
+   "labels": [
+    "G12C/D/V",
+    "G13D",
+    "Q61H",
+    "A146T"
+   ]
+  },
+  "MYC": {
+   "gene": "MYC",
+   "n_hotspots": 2,
+   "status": "OK",
+   "genomic_acc": "NG_007161.1",
+   "labels": [
+    "T58A",
+    "S62"
+   ]
+  },
+  "EGFR": {
+   "gene": "EGFR",
+   "n_hotspots": 4,
+   "status": "OK",
+   "genomic_acc": "NG_007726.3",
+   "labels": [
+    "G719S",
+    "T790M",
+    "L858R",
+    "L861Q"
+   ]
+  },
+  "HER2": {
+   "gene": "HER2",
+   "n_hotspots": 4,
+   "status": "OK",
+   "genomic_acc": "NG_007503.1",
+   "labels": [
+    "S310F",
+    "L755S",
+    "V777L",
+    "V842I"
+   ]
+  },
+  "BRCA1": {
+   "gene": "BRCA1",
+   "n_hotspots": 3,
+   "status": "OK",
+   "genomic_acc": "NG_005905.2",
+   "labels": [
+    "C61G",
+    "R1699W",
+    "M1775R"
+   ]
+  },
+  "CDK4": {
+   "gene": "CDK4",
+   "n_hotspots": 1,
+   "status": "OK",
+   "genomic_acc": "NG_007484.2",
+   "labels": [
+    "R24C"
+   ]
+  },
+  "BCL2": {
+   "gene": "BCL2",
+   "n_hotspots": 3,
+   "status": "OK",
+   "genomic_acc": "NG_009361.1",
+   "labels": [
+    "T69",
+    "S70",
+    "S87"
+   ]
+  },
+  "PDL1": {
+   "gene": "PDL1",
+   "n_hotspots": 1,
+   "status": "OK",
+   "genomic_acc": "NC_000009.12",
+   "labels": [
+    "CDS_START"
+   ]
+  },
+  "TERT": {
+   "gene": "TERT",
+   "n_hotspots": 2,
+   "status": "OK",
+   "genomic_acc": "NG_009265.1",
+   "labels": [
+    "C228T",
+    "C250T"
+   ]
+  }
+ },
+ "total_hotspots": 28,
+ "window_half": 60,
+ "built_at": 1789050110.6283767,
+ "source": "NCBI RefSeq via E-utilities"
+}

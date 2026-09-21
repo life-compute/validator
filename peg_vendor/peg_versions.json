@@ -1,0 +1,20 @@
+{
+ "captured_from": "live running interpreter (not requirements.txt)",
+ "python": "3.10.12 (main, Jun 22 2026, 18:55:27) [GCC 11.4.0]",
+ "python_version_tuple": [
+  3,
+  10,
+  12
+ ],
+ "executable": "/usr/bin/python3",
+ "platform": "Linux-6.10.0-hiveos-x86_64-with-glibc2.35",
+ "sklearn": "1.7.2",
+ "numpy": "2.2.6",
+ "scipy": "1.15.3",
+ "onnx_tooling": {
+  "skl2onnx": null,
+  "onnx": null,
+  "onnxruntime": null
+ },
+ "note": "These versions are required ONLY to load peg_model.pkl. output/peg_model.json evaluates with the Python standard library alone (json + struct) and is the recommended Stage 3 validator path."
+}

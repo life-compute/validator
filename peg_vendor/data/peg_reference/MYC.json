@@ -1,0 +1,40 @@
+{
+ "gene": "MYC",
+ "mrna_acc": "NM_002467.6",
+ "genomic_acc": "NG_007161.1",
+ "cds_len": 1365,
+ "protein_len": 454,
+ "cds_offset": 15,
+ "cancer_indication": "Burkitt lymphoma, TNBC, neuroblastoma",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "T58A",
+   "codon": 58,
+   "cds_codon": 73,
+   "wt_codon": "ACC",
+   "wt_aa": "T",
+   "strand": "+",
+   "genomic_acc": "NG_007161.1",
+   "genomic_codon_start": 7364,
+   "window": "AGCGAGCTGCAGCCCCCGGCGCCCAGCGAGGATATCTGGAAGAAATTCGAGCTGCTGCCCACCCCGCCCCTGTCCCCTAGCCGCCGCTCCGGGCTCTGCTCGCCCTCCTACGTTGCGGTCACA",
+   "window_start": 7304,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "S62",
+   "codon": 62,
+   "cds_codon": 77,
+   "wt_codon": "TCC",
+   "wt_aa": "S",
+   "strand": "+",
+   "genomic_acc": "NG_007161.1",
+   "genomic_codon_start": 7376,
+   "window": "CCCCCGGCGCCCAGCGAGGATATCTGGAAGAAATTCGAGCTGCTGCCCACCCCGCCCCTGTCCCCTAGCCGCCGCTCCGGGCTCTGCTCGCCCTCCTACGTTGCGGTCACACCCTTCTCCCTT",
+   "window_start": 7316,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  }
+ ]
+}

@@ -1,0 +1,68 @@
+{
+ "gene": "TP53",
+ "mrna_acc": "NM_000546.6",
+ "genomic_acc": "NG_017013.2",
+ "cds_len": 1182,
+ "protein_len": 393,
+ "cds_offset": 0,
+ "cancer_indication": "colorectal, lung, breast, ovarian",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "R175H",
+   "codon": 175,
+   "cds_codon": 175,
+   "wt_codon": "CGC",
+   "wt_aa": "R",
+   "strand": "+",
+   "genomic_acc": "NG_017013.2",
+   "genomic_codon_start": 17461,
+   "window": "ACCCGCGTCCGCGCCATGGCCATCTACAAGCAGTCACAGCACATGACGGAGGTTGTGAGGCGCTGCCCCCACCATGAGCGCTGCTCAGATAGCGATGGTGAGCAGCTGGGGCTGGAGAGACGA",
+   "window_start": 17401,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "R248W/Q",
+   "codon": 248,
+   "cds_codon": 248,
+   "wt_codon": "CGG",
+   "wt_aa": "R",
+   "strand": "+",
+   "genomic_acc": "NG_017013.2",
+   "genomic_codon_start": 18329,
+   "window": "GACTGTACCACCATCCACTACAACTACATGTGTAACAGTTCCTGCATGGGCGGCATGAACCGGAGGCCCATCCTCACCATCATCACACTGGAAGACTCCAGGTCAGGAGCCACTTGCCACCCT",
+   "window_start": 18269,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "R249S",
+   "codon": 249,
+   "cds_codon": 249,
+   "wt_codon": "AGG",
+   "wt_aa": "R",
+   "strand": "+",
+   "genomic_acc": "NG_017013.2",
+   "genomic_codon_start": 18332,
+   "window": "TGTACCACCATCCACTACAACTACATGTGTAACAGTTCCTGCATGGGCGGCATGAACCGGAGGCCCATCCTCACCATCATCACACTGGAAGACTCCAGGTCAGGAGCCACTTGCCACCCTGCA",
+   "window_start": 18272,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "R273H",
+   "codon": 273,
+   "cds_codon": 273,
+   "wt_codon": "CGT",
+   "wt_aa": "R",
+   "strand": "+",
+   "genomic_acc": "NG_017013.2",
+   "genomic_codon_start": 18747,
+   "window": "TGCTTCTCTTTTCCTATCCTGAGTAGTGGTAATCTACTGGGACGGAACAGCTTTGAGGTGCGTGTTTGTGCCTGTCCTGGGAGAGACCGGCGCACAGAGGAAGAGAATCTCCGCAAGAAAGGG",
+   "window_start": 18687,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  }
+ ]
+}

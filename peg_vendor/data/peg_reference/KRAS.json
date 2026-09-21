@@ -1,0 +1,68 @@
+{
+ "gene": "KRAS",
+ "mrna_acc": "NM_004985.5",
+ "genomic_acc": "NG_007524.2",
+ "cds_len": 567,
+ "protein_len": 188,
+ "cds_offset": 0,
+ "cancer_indication": "pancreatic, colorectal, lung",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "G12C/D/V",
+   "codon": 12,
+   "cds_codon": 12,
+   "wt_codon": "GGT",
+   "wt_aa": "G",
+   "strand": "+",
+   "genomic_acc": "NG_007524.2",
+   "genomic_codon_start": 10652,
+   "window": "TTATTTTTATTATAAGGCCTGCTGAAAATGACTGAATATAAACTTGTGGTAGTTGGAGCTGGTGGCGTAGGCAAGAGTGCCTTGACGATACAGCTAATTCAGAATCATTTTGTGGACGAATAT",
+   "window_start": 10592,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "G13D",
+   "codon": 13,
+   "cds_codon": 13,
+   "wt_codon": "GGC",
+   "wt_aa": "G",
+   "strand": "+",
+   "genomic_acc": "NG_007524.2",
+   "genomic_codon_start": 10655,
+   "window": "TTTTTATTATAAGGCCTGCTGAAAATGACTGAATATAAACTTGTGGTAGTTGGAGCTGGTGGCGTAGGCAAGAGTGCCTTGACGATACAGCTAATTCAGAATCATTTTGTGGACGAATATGAT",
+   "window_start": 10595,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "Q61H",
+   "codon": 61,
+   "cds_codon": 61,
+   "wt_codon": "CAA",
+   "wt_aa": "Q",
+   "strand": "+",
+   "genomic_acc": "NG_007524.2",
+   "genomic_codon_start": 28660,
+   "window": "AGGAAGCAAGTAGTAATTGATGGAGAAACCTGTCTCTTGGATATTCTCGACACAGCAGGTCAAGAGGAGTACAGTGCAATGAGGGACCAGTACATGAGGACTGGGGAGGGCTTTCTTTGTGTA",
+   "window_start": 28600,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "A146T",
+   "codon": 146,
+   "cds_codon": 146,
+   "wt_codon": "GCA",
+   "wt_aa": "A",
+   "strand": "+",
+   "genomic_acc": "NG_007524.2",
+   "genomic_codon_start": 30375,
+   "window": "GACACAAAACAGGCTCAGGACTTAGCAAGAAGTTATGGAATTCCTTTTATTGAAACATCAGCAAAGACAAGACAGGTAAGTAACACTGAAATAAATACAGATCTGTTTTCTGCAAAATCATAA",
+   "window_start": 30315,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  }
+ ]
+}

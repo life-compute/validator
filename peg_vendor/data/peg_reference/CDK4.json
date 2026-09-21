@@ -1,0 +1,26 @@
+{
+ "gene": "CDK4",
+ "mrna_acc": "NM_000075.4",
+ "genomic_acc": "NG_007484.2",
+ "cds_len": 912,
+ "protein_len": 303,
+ "cds_offset": 0,
+ "cancer_indication": "melanoma, sarcoma",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "R24C",
+   "codon": 24,
+   "cds_codon": 24,
+   "wt_codon": "CGT",
+   "wt_aa": "R",
+   "strand": "+",
+   "genomic_acc": "NG_007484.2",
+   "genomic_codon_start": 5733,
+   "window": "TCTCGATATGAGCCAGTGGCTGAAATTGGTGTCGGTGCCTATGGGACAGTGTACAAGGCCCGTGATCCCCACAGTGGCCACTTTGTGGCCCTCAAGAGTGTGAGAGTCCCCAATGGAGGAGGA",
+   "window_start": 5673,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  }
+ ]
+}

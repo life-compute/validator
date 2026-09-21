@@ -1,0 +1,54 @@
+{
+ "gene": "BRCA1",
+ "mrna_acc": "NM_007294.4",
+ "genomic_acc": "NG_005905.2",
+ "cds_len": 5592,
+ "protein_len": 1863,
+ "cds_offset": 0,
+ "cancer_indication": "breast, ovarian",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "C61G",
+   "codon": 61,
+   "cds_codon": 61,
+   "wt_codon": "TGT",
+   "wt_aa": "C",
+   "strand": "+",
+   "genomic_acc": "NG_005905.2",
+   "genomic_codon_start": 111496,
+   "window": "TTTATAATTTATAGATTTTGCATGCTGAAACTTCTCAACCAGAAGAAAGGGCCTTCACAGTGTCCTTTATGTAAGAATGATATAACCAAAAGGTATATAATTTGGTAATGATGCTAGGTTGGA",
+   "window_start": 111436,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "R1699W",
+   "codon": 1699,
+   "cds_codon": 1699,
+   "wt_codon": "CGG",
+   "wt_aa": "R",
+   "strand": "+",
+   "genomic_acc": "NG_005905.2",
+   "genomic_codon_start": 154052,
+   "window": "TTTTCAACTTCTAATCCTTTGAGTGTTTTTCATTCTGCAGATGCTGAGTTTGTGTGTGAACGGACACTGAAATATTTTCTAGGAATTGCGGGAGGAAAATGGGTAGTTAGCTATTTCTGTAAG",
+   "window_start": 153992,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "M1775R",
+   "codon": 1775,
+   "cds_codon": 1775,
+   "wt_codon": "ATG",
+   "wt_aa": "M",
+   "strand": "+",
+   "genomic_acc": "NG_005905.2",
+   "genomic_codon_start": 166911,
+   "window": "CCTCTCTTCTTCCAGATCTTCAGGGGGCTAGAAATCTGTTGCTATGGGCCCTTCACCAACATGCCCACAGGTAAGAGCCTGGGAGAACCCCAGAGTTCCAGCACCAGCCTTTGTCTTACATAG",
+   "window_start": 166851,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  }
+ ]
+}

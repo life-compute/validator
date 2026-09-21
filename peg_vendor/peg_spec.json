@@ -1,0 +1,84 @@
+{
+ "format": "life-peg-feature-spec",
+ "format_version": 1,
+ "n_features": 43,
+ "feature_order": [
+  "spacer_len",
+  "spacer_gc",
+  "spacer_a",
+  "spacer_c",
+  "spacer_g",
+  "spacer_t",
+  "spacer_tm",
+  "spacer_homopolymer",
+  "pbs_len",
+  "pbs_gc",
+  "pbs_a",
+  "pbs_c",
+  "pbs_g",
+  "pbs_t",
+  "pbs_tm",
+  "pbs_homopolymer",
+  "rtt_len",
+  "rtt_gc",
+  "rtt_a",
+  "rtt_c",
+  "rtt_g",
+  "rtt_t",
+  "rtt_tm",
+  "rtt_homopolymer",
+  "edit_substitution",
+  "edit_insertion",
+  "edit_deletion",
+  "correction_len",
+  "nick_to_edit",
+  "edit_to_rtt_end",
+  "rtt_pbs_ratio",
+  "edit_rel_pos_in_rtt",
+  "ext_fold_energy",
+  "ext_self_comp",
+  "spacer_ext_comp",
+  "rtt_starts_c",
+  "pbs_gc_clamp",
+  "hotspot_dist",
+  "hotspot_exact",
+  "hotspot_is_coding",
+  "pam_density",
+  "pam_to_edit",
+  "strand_plus"
+ ],
+ "normalization": null,
+ "normalization_note": "No scaling of any kind is applied. Gradient-boosted decision trees are invariant to monotonic per-feature rescaling, so no scaler was fitted and none is required. Feed raw values from adaptive.life_peg.featurize_* in feature_order.",
+ "formula": "y_raw = init_constant + learning_rate * sum(tree_value(x) for tree in trees); y = clamp(y_raw, 0.0, 1.0). Each tree: descend from node 0, take children_left when float32(x[feature[n]]) <= threshold[n] else children_right, stop when children_left[n] == -1, emit value[n].",
+ "float32_compare_note": "MANDATORY: cast the feature value to IEEE-754 single precision before comparing against threshold. sklearn casts X to float32 (sklearn.tree._tree.DTYPE) while thresholds remain float64; comparing in float64 takes a different branch near rounding boundaries and silently changes the prediction. In Python: struct.unpack('f', struct.pack('f', v))[0].",
+ "absent_sentinel": -1.0,
+ "absent_sentinel_note": "Unsupplied optional context features are set to -1.0, out of band for every feature that uses it, so absent is distinguishable from zero.",
+ "output_clamp": [
+  0.0,
+  1.0
+ ],
+ "model_artifacts": {
+  "pickle": "output/peg_model.pkl",
+  "json": "output/peg_model.json",
+  "onnx": null,
+  "onnx_note": "skl2onnx/onnx/onnxruntime are not installed on this host; the JSON export supersedes ONNX for this model class (plain threshold trees) and needs no runtime at all."
+ },
+ "verifier_baselines": {
+  "verify_peg_reference.py": {
+   "assertions": 211,
+   "entries": 28
+  },
+  "verify_peg_features.py": {
+   "assertions": 374354,
+   "candidates": 9830
+  },
+  "verify_peg_model.py": {
+   "assertions": 44
+  },
+  "verify_peg_export.py": {
+   "assertions": 1132,
+   "candidates_compared": 1120,
+   "max_abs_deviation": 0.0
+  }
+ }
+}

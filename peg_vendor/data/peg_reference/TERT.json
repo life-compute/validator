@@ -1,0 +1,42 @@
+{
+ "gene": "TERT",
+ "mrna_acc": "NM_198253.3",
+ "genomic_acc": "NG_009265.1",
+ "cds_len": 3399,
+ "protein_len": 1132,
+ "cds_offset": 0,
+ "cancer_indication": "melanoma, glioma, bladder",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "C228T",
+   "codon": null,
+   "cds_codon": null,
+   "wt_codon": null,
+   "wt_aa": null,
+   "strand": "+",
+   "genomic_acc": "NG_009265.1",
+   "genomic_codon_start": 4934,
+   "window": "CGCCTCCTCCGCGCGGACCCCGCCCCGTCCCGACCCCTCCCGGGTCCCCGGCCCAGCCCCCTCCGGGCCCTCCCAGCCCCTCCCCTTCCTTTCCGCGGCCCCGCCCTCTCCTCGCGGCGCG",
+   "window_start": 4874,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "promoter",
+   "promoter_offset_from_atg": -124
+  },
+  {
+   "label": "C250T",
+   "codon": null,
+   "cds_codon": null,
+   "wt_codon": null,
+   "wt_aa": null,
+   "strand": "+",
+   "genomic_acc": "NG_009265.1",
+   "genomic_codon_start": 4912,
+   "window": "CTGCCCCTTCACCTTCCAGCTCCGCCTCCTCCGCGCGGACCCCGCCCCGTCCCGACCCCTCCCGGGTCCCCGGCCCAGCCCCCTCCGGGCCCTCCCAGCCCCTCCCCTTCCTTTCCGCGGC",
+   "window_start": 4852,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "promoter",
+   "promoter_offset_from_atg": -146
+  }
+ ]
+}

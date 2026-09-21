@@ -1,0 +1,54 @@
+{
+ "gene": "BCL2",
+ "mrna_acc": "NM_000633.3",
+ "genomic_acc": "NG_009361.1",
+ "cds_len": 720,
+ "protein_len": 239,
+ "cds_offset": 0,
+ "cancer_indication": "B-cell lymphoma, CLL",
+ "status": "OK",
+ "hotspots": [
+  {
+   "label": "T69",
+   "codon": 69,
+   "cds_codon": 69,
+   "wt_codon": "ACC",
+   "wt_aa": "T",
+   "strand": "+",
+   "genomic_acc": "NG_009361.1",
+   "genomic_codon_start": 5918,
+   "window": "TTCTCCTCCCAGCCCGGGCACACGCCCCATCCAGCCGCATCCCGGGACCCGGTCGCCAGGACCTCGCCGCTGCAGACCCCGGCTGCCCCCGGCGCCGCCGCGGGGCCTGCGCTCAGCCCGGTG",
+   "window_start": 5858,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "S70",
+   "codon": 70,
+   "cds_codon": 70,
+   "wt_codon": "TCG",
+   "wt_aa": "S",
+   "strand": "+",
+   "genomic_acc": "NG_009361.1",
+   "genomic_codon_start": 5921,
+   "window": "TCCTCCCAGCCCGGGCACACGCCCCATCCAGCCGCATCCCGGGACCCGGTCGCCAGGACCTCGCCGCTGCAGACCCCGGCTGCCCCCGGCGCCGCCGCGGGGCCTGCGCTCAGCCCGGTGCCA",
+   "window_start": 5861,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  },
+  {
+   "label": "S87",
+   "codon": 87,
+   "cds_codon": 87,
+   "wt_codon": "AGC",
+   "wt_aa": "S",
+   "strand": "+",
+   "genomic_acc": "NG_009361.1",
+   "genomic_codon_start": 5972,
+   "window": "GCCAGGACCTCGCCGCTGCAGACCCCGGCTGCCCCCGGCGCCGCCGCGGGGCCTGCGCTCAGCCCGGTGCCACCTGTGGTCCACCTGACCCTCCGCCAGGCCGGCGACGACTTCTCCCGCCGC",
+   "window_start": 5912,
+   "edit_offset_in_window": 60,
+   "hotspot_source": "cds_codon"
+  }
+ ]
+}
