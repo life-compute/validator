@@ -32,7 +32,9 @@
  *
  * Environment / config (all optional, defaults shown):
  *   LIFE_PROGRAM_ID     74RHjg1zYgN9zuVykde4SK2ERiRgNkouATW9MmQDLRWf
- *   SOLANA_RPC          https://api.devnet.solana.com
+ *   SOLANA_RPC          (unset)   explicit override; wins over the key file
+ *   HELIUS_ENV_PATH     ~/.helius.env   HELIUS_API_KEY → Helius devnet
+ *                       falls back to https://api.devnet.solana.com
  *   CRANK_KEYPAIR       /root/.life-compute/wallet.json
  *   CRANK_QUEUE_FILE    output/crank_queue.jsonl   (relative to cwd)
  *   INTER_TX_DELAY_MS   2000
@@ -57,12 +59,63 @@ const {
 const crypto = require("crypto");
 const fs   = require("fs");
 const path = require("path");
+const os   = require("os");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const PROGRAM_ID = new PublicKey(
   process.env.LIFE_PROGRAM_ID || "74RHjg1zYgN9zuVykde4SK2ERiRgNkouATW9MmQDLRWf"
 );
-const RPC_URL         = process.env.SOLANA_RPC        || "https://api.devnet.solana.com";
+// ── RPC endpoint resolution ───────────────────────────────────────────────────
+// Priority (identical to validator_daemon.py and life_validate.js):
+//   1. explicit SOLANA_RPC env var
+//   2. HELIUS_API_KEY read in-process from ~/.helius.env (never exported)
+//   3. public devnet
+// Only RPC_SOURCE is ever logged — a Helius URL carries ?api-key=… in the query
+// string, so the URL itself must never reach stderr or argv.
+const HELIUS_ENV_PATH = process.env.HELIUS_ENV_PATH || path.join(os.homedir(), ".helius.env");
+let RPC_SOURCE  = "public-devnet (no key file)";
+let RPC_WARNING = "";
+
+function readHeliusKey(p) {
+  try {
+    if (!fs.existsSync(p)) {
+      RPC_WARNING = `key file ${p} not found — falling back to public devnet`;
+      return "";
+    }
+    for (const raw of fs.readFileSync(p, "utf8").split("\n")) {
+      let line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      if (line.startsWith("export ")) line = line.slice(7).trim();
+      const i = line.indexOf("=");
+      if (i < 0) continue;
+      if (line.slice(0, i).trim() !== "HELIUS_API_KEY") continue;
+      const key = line.slice(i + 1).trim().replace(/^['"]|['"]$/g, "");
+      if (key) return key;
+      RPC_WARNING = `HELIUS_API_KEY in ${p} is empty — falling back to public devnet`;
+      return "";
+    }
+    RPC_WARNING = `HELIUS_API_KEY not present in ${p} — falling back to public devnet`;
+    return "";
+  } catch (e) {
+    RPC_WARNING = `could not read ${p} (${e.code || e.name}) — falling back to public devnet`;
+    return "";
+  }
+}
+
+function resolveRpc() {
+  if (process.env.SOLANA_RPC) { RPC_SOURCE = "explicit SOLANA_RPC"; return process.env.SOLANA_RPC; }
+  const key = readHeliusKey(HELIUS_ENV_PATH);
+  if (key) { RPC_SOURCE = "helius-devnet"; return `https://devnet.helius-rpc.com/?api-key=${key}`; }
+  return "https://api.devnet.solana.com";
+}
+
+const RPC_URL = resolveRpc();
+
+// scheme://host only — never the path, never the query string.
+function urlHost(u) {
+  try { const p = new URL(u); return `${p.protocol}//${p.hostname}`; }
+  catch (_) { return "<unparseable>"; }
+}
 const CRANK_KEYPAIR   = process.env.CRANK_KEYPAIR     || "/root/.life-compute/wallet.json";
 const QUEUE_FILE      = path.resolve(
   process.env.CRANK_QUEUE_FILE || path.join(__dirname, "output", "crank_queue.jsonl")
@@ -369,7 +422,8 @@ async function main() {
 
   log(`Starting — DRY_RUN=${DRY_RUN} PILOT=${PILOT_MODE ? PILOT_N : "no"}`);
   log(`  Program:       ${PROGRAM_ID.toBase58()}`);
-  log(`  RPC:           ${RPC_URL}`);
+  log(`  RPC:           ${RPC_SOURCE}  (host ${urlHost(RPC_URL)})`);
+  if (RPC_WARNING) warn(`RPC: ${RPC_WARNING}`);
   log(`  Queue file:    ${QUEUE_FILE}`);
   log(`  Inter-tx gap:  ${INTER_TX_MS}ms`);
   log(`  Scan interval: ${SCAN_INTERVAL / 60000}min`);

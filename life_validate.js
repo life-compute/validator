@@ -1,7 +1,12 @@
 /**
  * life_validate.js — call validate_result on-chain via Anchor.
- * Args: JSON string { rpc, validatorKeypair, payerKeypair, idlPath, programId,
- *                     resultPubkey, rescoredAffinity }
+ * Args: JSON string { rpcSource, heliusEnvPath, validatorKeypair, payerKeypair,
+ *                     idlPath, programId, resultPubkey, rescoredAffinity }
+ *
+ * The RPC URL is NOT passed in argv: a Helius endpoint carries ?api-key=… and
+ * argv is world-readable via /proc/<pid>/cmdline.  This script resolves the
+ * endpoint itself with the same priority as validator_daemon.py and
+ * life_crank.js: SOLANA_RPC → HELIUS_API_KEY in ~/.helius.env → public devnet.
  *
  * Account layout for validate_result (9 accounts, deployed program):
  *   0  payer              (mut, signer)
@@ -20,10 +25,33 @@ const anchor   = require("@coral-xyz/anchor");
 const web3     = require("@solana/web3.js");
 const fs       = require("fs");
 
+// ── RPC resolution (key never enters argv, env, or any log line) ─────────────
+function readHeliusKey(p) {
+  try {
+    for (const raw of fs.readFileSync(p, "utf8").split("\n")) {
+      let line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      if (line.startsWith("export ")) line = line.slice(7).trim();
+      const i = line.indexOf("=");
+      if (i < 0) continue;
+      if (line.slice(0, i).trim() !== "HELIUS_API_KEY") continue;
+      return line.slice(i + 1).trim().replace(/^['"]|['"]$/g, "");
+    }
+  } catch (_) { /* missing/unreadable → caller falls back */ }
+  return "";
+}
+
+function resolveRpc(heliusEnvPath) {
+  if (process.env.SOLANA_RPC) return process.env.SOLANA_RPC;
+  const key = readHeliusKey(heliusEnvPath || `${process.env.HOME}/.helius.env`);
+  if (key) return `https://devnet.helius-rpc.com/?api-key=${key}`;
+  return "https://api.devnet.solana.com";
+}
+
 async function main() {
   const args = JSON.parse(process.argv[2]);
 
-  const connection  = new web3.Connection(args.rpc, "confirmed");
+  const connection  = new web3.Connection(resolveRpc(args.heliusEnvPath), "confirmed");
   const validatorKP = web3.Keypair.fromSecretKey(
     Uint8Array.from(JSON.parse(fs.readFileSync(args.validatorKeypair, "utf8")))
   );

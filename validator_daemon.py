@@ -46,7 +46,67 @@ def _env(key, default=""):
     return os.environ.get(key, default)
 
 PROGRAM_ID        = _env("PROGRAM_ID",        "74RHjg1zYgN9zuVykde4SK2ERiRgNkouATW9MmQDLRWf")
-SOLANA_RPC        = _env("SOLANA_RPC",        "https://api.devnet.solana.com")
+
+# ── RPC endpoint resolution ───────────────────────────────────────────────────
+# Priority (must match the crank and life_validate.js):
+#   1. explicit SOLANA_RPC env var          — operator override, always wins
+#   2. HELIUS_API_KEY read from ~/.helius.env  (read in-process, NEVER exported)
+#   3. public devnet                        — last resort, logged as such
+#
+# The key is read straight off disk into a local; it is deliberately NOT placed
+# in os.environ, so it cannot leak to child processes, and NEVER appears in a
+# log line or in argv.  Only _RPC_SOURCE ("helius-devnet" / "public-devnet …")
+# is ever printed.
+HELIUS_ENV_PATH = Path(_env("HELIUS_ENV_PATH", str(Path.home() / ".helius.env")))
+_RPC_SOURCE  = "public-devnet (no key file)"
+_RPC_WARNING = ""          # non-empty → emitted as a WARNING at startup
+
+
+def _read_helius_key(path: Path) -> str:
+    """Return HELIUS_API_KEY from *path*, or "" if absent/unreadable.
+
+    Never logs or returns the surrounding file content.  A missing or
+    unreadable file sets _RPC_WARNING so the fallback is loud, never silent.
+    """
+    global _RPC_WARNING
+    try:
+        if not path.exists():
+            _RPC_WARNING = f"key file {path} not found — falling back to public devnet"
+            return ""
+        for raw in path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            k, _, v = line.partition("=")
+            if k.strip() == "HELIUS_API_KEY":
+                key = v.strip().strip('"').strip("'")
+                if key:
+                    return key
+                _RPC_WARNING = f"HELIUS_API_KEY in {path} is empty — falling back to public devnet"
+                return ""
+        _RPC_WARNING = f"HELIUS_API_KEY not present in {path} — falling back to public devnet"
+        return ""
+    except Exception as e:
+        _RPC_WARNING = f"could not read {path} ({type(e).__name__}) — falling back to public devnet"
+        return ""
+
+
+def _resolve_rpc() -> str:
+    global _RPC_SOURCE
+    explicit = _env("SOLANA_RPC", "")
+    if explicit:
+        _RPC_SOURCE = "explicit SOLANA_RPC"
+        return explicit
+    key = _read_helius_key(HELIUS_ENV_PATH)
+    if key:
+        _RPC_SOURCE = "helius-devnet"
+        return f"https://devnet.helius-rpc.com/?api-key={key}"
+    return "https://api.devnet.solana.com"
+
+
+SOLANA_RPC        = _resolve_rpc()
 VALIDATOR_KEYPAIR = _env("VALIDATOR_KEYPAIR", str(Path.home() / ".life-compute/wallet.json"))
 PAYER_KEYPAIR     = _env("PAYER_KEYPAIR",     str(Path.home() / ".life-compute/wallet.json"))
 TARGETS_URL       = _env("TARGETS_URL",       "https://raw.githubusercontent.com/life-compute/targets/master/targets.json")
@@ -63,6 +123,21 @@ def _rpc_to_ws(http_url: str) -> str:
     return http_url
 
 SOLANA_WS = _env("SOLANA_WS", _rpc_to_ws(SOLANA_RPC))
+
+
+def _url_host(url: str) -> str:
+    """Return just scheme://host of *url* — never the path, never the query.
+
+    Helius endpoints carry the API key in the query string (?api-key=…), so any
+    log line touching an endpoint MUST route through this.  Logging the bare URL
+    would write the key into the PM2 logs on every reconnect.
+    """
+    try:
+        from urllib.parse import urlsplit
+        p = urlsplit(url)
+        return f"{p.scheme}://{p.hostname}" if p.hostname else "<unparseable>"
+    except Exception:
+        return "<unparseable>"
 
 # Keepalive: if no pong is received within PING_TIMEOUT seconds after a ping,
 # the connection is considered dead and the listener reconnects.
@@ -2376,7 +2451,7 @@ async def _ws_subscription_loop():
                 max_size=10 * 1024 * 1024,   # 10 MB: headroom for account data batches
             ) as ws:
                 attempt = 0   # reset backoff on successful connect
-                log.info(f"[WS] Connected → {SOLANA_WS}")
+                log.info(f"[WS] Connected → {_url_host(SOLANA_WS)}")
                 _ws_connected_since = time.time()
 
                 # programSubscribe — dataSize filter keeps noise down; status and
@@ -2706,8 +2781,13 @@ def _validation_record_exists(submission_pubkey: str) -> bool:
 # ── On-chain validate call ────────────────────────────────────────────────────
 def validate_on_chain(submission_pubkey: str, rescored_affinity: float) -> dict | None:
     """Call validate_result via Node.js. Returns {tx:..., confirmed:bool} or None."""
+    # NOTE: the RPC URL is deliberately NOT passed here.  A Helius URL carries
+    # ?api-key=… and argv is world-readable via /proc/<pid>/cmdline and `ps`.
+    # We pass only a source flag; life_validate.js resolves the endpoint itself
+    # using the identical SOLANA_RPC → ~/.helius.env → public-devnet priority.
     args = {
-        "rpc":              SOLANA_RPC,
+        "rpcSource":        _RPC_SOURCE,
+        "heliusEnvPath":    str(HELIUS_ENV_PATH),
         "validatorKeypair": VALIDATOR_KEYPAIR,
         "payerKeypair":     PAYER_KEYPAIR,
         "idlPath":          str(IDL_PATH),
@@ -2811,6 +2891,11 @@ def fetch_network_validator_info() -> dict:
 def main():
     global _VALIDATOR_PUBKEY, _gpu_bias_tracker, _miner_gpu_model
     print("\033[96m    L I F E  C O M P U T E  —  V A L I D A T O R  \033[0m\n")
+
+    # Endpoint provenance — exactly one line, source only, never the URL.
+    log.info(f"RPC: {_RPC_SOURCE}  (host {_url_host(SOLANA_RPC)})")
+    if _RPC_WARNING:
+        log.warning(f"RPC: {_RPC_WARNING}")
 
     # Load validator pubkey once at startup (used for self-validation checks)
     _VALIDATOR_PUBKEY = _load_validator_pubkey()

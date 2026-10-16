@@ -39,9 +39,13 @@ module.exports = {
       script: 'life_crank.js',
       interpreter: 'node',
       cwd: __dirname,
+      // SOLANA_RPC is deliberately NOT set here.  Setting it would take
+      // priority over the ~/.helius.env key file and silently pin the crank to
+      // public devnet.  A keyed URL must never be written into this tracked
+      // file either — the crank reads HELIUS_API_KEY from ~/.helius.env itself.
+      // Set SOLANA_RPC in the environment only for a deliberate override.
       env: {
         LIFE_PROGRAM_ID:     '74RHjg1zYgN9zuVykde4SK2ERiRgNkouATW9MmQDLRWf',
-        SOLANA_RPC:          'https://api.devnet.solana.com',
         CRANK_KEYPAIR:       '/root/.life-compute/wallet.json',
         INTER_TX_DELAY_MS:   '2000',
         SCAN_INTERVAL_MS:    '1800000',   // 30 min periodic full scan
