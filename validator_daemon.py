@@ -1316,8 +1316,16 @@ SPCAS9_REC1_200AA: str = (
 
 # Canonical SpCas9 sgRNA scaffold (76 nt), appended after the 20-nt spacer.
 # Spacer (chain B) = spacer_seq + SGRNA_SCAFFOLD_RNA  (96 nt total).
+#
+# RNA ALPHABET (U, not T).  Chain B is declared `rna:` in the Boltz2 YAML, so it
+# must be spelled in RNA letters.  This constant previously carried DNA letters
+# (T), which Boltz2 does not coerce — it scored a materially worse complex and
+# depressed iptm, making every rescore less negative than the miner's claim by a
+# systematic +0.15 relative error across 12,504 audit rows.  Measured A/B on 10
+# spacers x 10 targets: median signed error +0.16596 (T) -> +0.00139 (U), median
+# iptm 0.3632 -> 0.8307.  Chain C stays in DNA letters (it is declared `dna:`).
 SGRNA_SCAFFOLD_RNA: str = (
-    "GTTTTAGAGCTAGAAATAGCAAGTTAAAATAAGGCTAGTCCGTTATCAACTTGAAAAAGTGGCACCGAGTCGGTGC"
+    "GUUUUAGAGCUAGAAAUAGCAAGUUAAAAUAAGGCUAGUCCGUUAUCAACUUGAAAAAGUGGCACCGAGUCGGUGC"
 )
 
 # Complement map for building the DNA target strand (chain C).
@@ -1335,15 +1343,21 @@ def _write_crispr_boltz_yaml(in_dir: Path, mol_id: int, target_id: str,
     Build the 3-chain Boltz2 YAML for a CRISPR gRNA submission.
 
     Chain A — protein  : SPCAS9_REC1_200AA (SpCas9 recognition lobe, msa=empty)
-    Chain B — rna      : grna_seq (20 nt spacer) + SGRNA_SCAFFOLD_RNA (76 nt)
-    Chain C — dna      : revcomp(grna_seq) + "NGG" (23 nt target strand + PAM)
+    Chain B — rna      : grna_seq (20 nt spacer) + SGRNA_SCAFFOLD_RNA (76 nt),
+                         transcribed to RNA letters (T -> U) because the chain
+                         is declared `rna:`.  Boltz2 does not coerce the
+                         alphabet; feeding T here depresses iptm (see the
+                         SGRNA_SCAFFOLD_RNA comment).
+    Chain C — dna      : revcomp(grna_seq) + "NGG" (23 nt target strand + PAM),
+                         left in DNA letters — it is declared `dna:`.
 
     No properties block → structure-only mode → Boltz2 writes confidence_*.json
     with top-level "iptm" field.
     """
     import yaml as _yaml
     spacer   = grna_seq.upper()
-    rna_seq  = spacer + SGRNA_SCAFFOLD_RNA          # 20 + 76 = 96 nt
+    # Chain B is RNA: transcribe the spacer and use the U-form scaffold.
+    rna_seq  = spacer.replace("T", "U") + SGRNA_SCAFFOLD_RNA   # 20 + 76 = 96 nt
     dna_seq  = _revcomp(spacer) + "NGG"             # 20 + 3 = 23 nt
     data = {
         "version": 1,
@@ -1400,10 +1414,12 @@ def run_boltz2_crispr_iptm(grna_seq: str, target: dict,
             log.warning("  [CRISPR-BOLTZ] SECURITY: no rna block in written YAML — skip")
             return None
         written_spacer = rna_blocks[0].get("sequence", "")[:20]
-        if written_spacer.upper() != grna_seq:
+        # Chain B is written in RNA letters, so compare against the transcribed
+        # spacer.  (Comparing against the T-form would fail every submission.)
+        if written_spacer.upper() != grna_seq.replace("T", "U"):
             log.warning(
                 f"  [CRISPR-BOLTZ] SECURITY: spacer mismatch after write "
-                f"(expected={grna_seq} actual={written_spacer}) — skip"
+                f"(expected={grna_seq.replace('T', 'U')} actual={written_spacer}) — skip"
             )
             return None
 
