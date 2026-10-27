@@ -29,6 +29,48 @@ EMPTY_MSA = "empty"
 # sha256 of the empty string — the pinned value a modality with no MSA uses.
 SHA256_EMPTY = hashlib.sha256(b"").hexdigest()
 
+# ── receptor "material" builders ─────────────────────────────────────────────
+#
+# The pinned receptor hash must cover EVERY coordinator-side input the scorer
+# feeds Boltz for that modality — not just the first chain.  Each builder
+# returns a canonical, domain-separated string; changing any component changes
+# the hash, and a string from one modality can never collide with another's.
+#
+# protein: the receptor material IS the query sequence read from the a3m (it is
+# the literal chain-A input), so no builder is needed — the alignment file
+# itself is covered separately by the MSA hash.
+
+CRISPR_PIN_VERSION = "crispr-pin-v1"
+MRNA_PIN_VERSION = "mrna-pin-v1"
+
+
+def crispr_receptor_material(cas9_fragment: str, sgrna_scaffold: str) -> str:
+    """Every constant the CRISPR path feeds Boltz, as one pinnable string.
+
+    chain A = the SpCas9 REC1 fragment, chain B = <spacer> + sgRNA scaffold.
+    The spacer (and the chain-C protospacer derived from it by revcomp) comes
+    from the miner's submission, is not coordinator-side, and is covered by
+    ligand_smiles_sha256 on the verdict — but the scaffold is a constant that
+    silently changes every iptm if edited, so it is pinned here.
+    """
+    return "\n".join((CRISPR_PIN_VERSION,
+                      f"cas9_rec1:{cas9_fragment}",
+                      f"sgrna_scaffold:{sgrna_scaffold}"))
+
+
+def mrna_receptor_material(rna_sequence: str) -> str:
+    """The mRNA chain-A sequence, domain-separated from the other modalities."""
+    return "\n".join((MRNA_PIN_VERSION, f"rna:{rna_sequence}"))
+
+
+# Why a modality legitimately has no alignment file.  Written beside an empty
+# MSA pin so an empty hash is never ambiguous with a lookup that silently
+# failed.  A modality NOT listed here must never pin SHA256_EMPTY.
+NO_ALIGNMENT_REASON = {
+    "mrna": "no alignment: chain A is an RNA chain, Boltz is given no a3m",
+    "crispr": "no alignment: chain A is scored with msa=\"empty\" (fixed fragment)",
+}
+
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()

@@ -17,7 +17,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from coordinator_client import hashpin  # noqa: E402
-from coordinator_client.rescore import SPCAS9_REC1_200AA  # noqa: E402
+from coordinator_client.rescore import (  # noqa: E402
+    SGRNA_SCAFFOLD_RNA, SPCAS9_REC1_200AA,
+)
 
 DATA = Path(__file__).parent / "data"
 
@@ -57,7 +59,11 @@ def protein_pins(msa_dir: Path) -> dict[str, str]:
 
 @pytest.fixture
 def crispr_pins() -> dict[str, str]:
-    return {"pinned_receptor_sha256": hashpin.sha256_text(SPCAS9_REC1_200AA),
+    # The CRISPR receptor pin covers BOTH fixed chains the scorer builds:
+    # the Cas9 REC1 fragment (chain A) and the sgRNA scaffold (chain B).
+    return {"pinned_receptor_sha256": hashpin.sha256_text(
+                hashpin.crispr_receptor_material(SPCAS9_REC1_200AA,
+                                                 SGRNA_SCAFFOLD_RNA)),
             "pinned_msa_sha256": hashpin.SHA256_EMPTY}
 
 

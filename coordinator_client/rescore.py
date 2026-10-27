@@ -237,7 +237,8 @@ class Rescorer:
             raise RescoreFailed("INTERNAL_ERROR",
                                 f"no RNA sequence known for target {item.target}")
         receptor_sha, msa_sha = hashpin.verify_pins(
-            receptor_sequence=sequence, msa_path=None,
+            receptor_sequence=hashpin.mrna_receptor_material(sequence),
+            msa_path=None,
             pinned_receptor_sha256=item.pinned_receptor_sha256,
             pinned_msa_sha256=item.pinned_msa_sha256, target=item.target)
 
@@ -264,10 +265,15 @@ class Rescorer:
         if not grna:
             raise RescoreFailed("INTERNAL_ERROR", "empty gRNA sequence")
 
-        # Chain A is a fixed SpCas9 fragment with msa="empty": the receptor
-        # the coordinator pins for a CRISPR target IS that fragment.
+        # Chain A is a fixed SpCas9 fragment with msa="empty" and chain B is
+        # <spacer> + a fixed sgRNA scaffold: the receptor the coordinator pins
+        # for a CRISPR target is BOTH constants, so editing either one (as
+        # commit 01c6ab2 did to the scaffold) trips the fail-closed gate
+        # instead of silently shifting every iptm.
         receptor_sha, msa_sha = hashpin.verify_pins(
-            receptor_sequence=SPCAS9_REC1_200AA, msa_path=None,
+            receptor_sequence=hashpin.crispr_receptor_material(
+                SPCAS9_REC1_200AA, SGRNA_SCAFFOLD_RNA),
+            msa_path=None,
             pinned_receptor_sha256=item.pinned_receptor_sha256,
             pinned_msa_sha256=item.pinned_msa_sha256, target=item.target)
 

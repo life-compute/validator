@@ -113,7 +113,8 @@ def test_mrna_rescore_end_to_end(golden, msa_dir):
                  timeout_s=1200, target_sequences={"KRAS_mRNA": rna})
     item = PendingResult.from_dict(pending_row(
         3, modality="mrna", target="KRAS_mRNA",
-        pinned_receptor_sha256=hashpin.sha256_text(rna),
+        pinned_receptor_sha256=hashpin.sha256_text(
+            hashpin.mrna_receptor_material(rna)),
         pinned_msa_sha256=hashpin.SHA256_EMPTY))
 
     out = r.rescore(item)
