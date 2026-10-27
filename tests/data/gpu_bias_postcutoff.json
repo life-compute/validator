@@ -1,0 +1,24 @@
+{
+  "cutoff_utc": "2026-09-18T12:00:00Z",
+  "source": "validator_audit.jsonl",
+  "rows_used": 25332,
+  "table": {
+    "RTX 5060": {
+      "CRISPR": {
+        "n": 11785,
+        "bias_factor": 0.889298,
+        "median": 0.871717
+      },
+      "PROTEIN": {
+        "n": 2193,
+        "bias_factor": 0.979225,
+        "median": 0.977695
+      },
+      "RNA": {
+        "n": 11345,
+        "bias_factor": 1.000503,
+        "median": 1.000397
+      }
+    }
+  }
+}

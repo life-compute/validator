@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
 """
-LIFE Compute — Validator Daemon (devnet)
+LIFE Compute — Validator Daemon (coordinator client)
 
-Event-driven architecture (WS-first):
-  1. programSubscribe WebSocket → notified within seconds when a ResultSubmission
-     account is created or changes state; parsed and enqueued immediately.
-  2. A dispatcher thread routes items to _crispr_queue or _protein_queue.
-  3. CRISPR worker drains _crispr_queue (analytical, no Boltz2).
-     Protein/mRNA worker (main thread) drains _protein_queue (Boltz2 rescore).
-  4. validate_result on-chain — confirm if |rescored - claimed| / |claimed| ≤ tol.
-  5. getProgramAccounts catch-up sweep every 5 min recovers any submissions
-     missed during WS disconnects or silent RPC notification drops.
+Pull-based architecture:
+  1. GET /results/pending  (Ed25519-signed) returns up to 50 accepted results.
+  2. Each row is re-scored with the existing Boltz2 paths, using EXACTLY the
+     scorer profile carried on the lease.
+  3. Inputs are pinned: the MSA folder must exist, and the receptor sequence
+     and MSA file must hash to the coordinator's pinned values.  Any mismatch
+     is logged and the target is skipped — never scored with other inputs.
+  4. POST /verdicts (signed) with the validator score, the error and an
+     input-hash record.  A failed or >20-minute re-score POSTs a
+     validator_error with a contract reason code instead.
+  5. Progress is persisted to disk, so a restart never re-scores a result
+     that was already handled.
 
-On-chain call uses the same Node.js / Anchor stack as the miner.
-Boltz2 scoring runs directly via the boltz Python API (pip boltz==2.2.1).
-Results logged to output/validator_log.jsonl and output/validator_audit.jsonl.
+Removed in the coordinator migration (C2):
+  - programSubscribe WebSocket, the catch-up sweep and the dispatcher queues
+  - validate_on_chain and the Node/Anchor hop (life_validate.js)
+  - append_crank_queue, its call sites and the crank itself: the
+    coordinator's payout batches mint LIFE now (confirming on-chain never did)
+  - the local tolerance; the coordinator's tolerance is the only one
+
+Verdicts are signed in Python (coordinator_client.signing).  No key material
+and no endpoint query string ever reaches a log line or argv.
+
+Boltz2 scoring runs via the boltz Python API (pip boltz==2.2.1).
 Stats written to stats.json for the dashboard.
 
-Security hardening (2026-08-13):
-  - Pipeline injection prevention: UUID tmpdir per validation (chmod 700),
-    SHA256 SMILES hash verified after write, affinity file mtime verified
-    post-Boltz2 start.
-  - Rate limiting: max 100 validations/hr per instance (rolling window).
-  - Self-validation prevention: miner pubkey ≠ validator pubkey.
+Security hardening (2026-08-13, retained):
+  - Pipeline injection prevention: private tmpdir per validation (chmod 700),
+    affinity file mtime verified post-Boltz2 start.
+  - Self-validation prevention: miner pubkey != validator pubkey.
   - Input sanitization: SMILES length < 500 chars, valid chemical chars only.
-  - Audit log: every validation decision → output/validator_audit.jsonl.
 """
-import asyncio, json, time, logging, os, queue, re, shutil, stat, subprocess, sys, threading
+import json, time, logging, os, re, shutil, stat, subprocess
 import urllib.request, hashlib, uuid
 from collections import deque
 from pathlib import Path
@@ -112,17 +120,6 @@ PAYER_KEYPAIR     = _env("PAYER_KEYPAIR",     str(Path.home() / ".life-compute/w
 TARGETS_URL       = _env("TARGETS_URL",       "https://raw.githubusercontent.com/life-compute/targets/master/targets.json")
 POLL_SECONDS      = int(_env("POLL_SECONDS", "30"))
 
-# ── WebSocket subscription config ─────────────────────────────────────────────
-# Derive WS endpoint from the HTTP RPC URL (https→wss, http→ws).
-# Override with SOLANA_WS env var for custom RPC providers (e.g. Helius, QuickNode).
-def _rpc_to_ws(http_url: str) -> str:
-    if http_url.startswith("https://"):
-        return "wss://" + http_url[len("https://"):]
-    if http_url.startswith("http://"):
-        return "ws://" + http_url[len("http://"):]
-    return http_url
-
-SOLANA_WS = _env("SOLANA_WS", _rpc_to_ws(SOLANA_RPC))
 
 
 def _url_host(url: str) -> str:
@@ -139,74 +136,14 @@ def _url_host(url: str) -> str:
     except Exception:
         return "<unparseable>"
 
-# Keepalive: if no pong is received within PING_TIMEOUT seconds after a ping,
-# the connection is considered dead and the listener reconnects.
-WS_PING_INTERVAL = 20   # seconds between pings
-WS_PING_TIMEOUT  = 10   # seconds to wait for pong
-WS_MAX_BACKOFF   = 60   # cap on exponential reconnect backoff (seconds)
 
-# Catch-up poll interval (seconds).
-# Protects against two real failure modes even with the WS "connected":
-#   (a) Silent notification drops from public devnet RPC nodes under load —
-#       the WS appears healthy but notifications simply don't arrive.
-#   (b) Submissions that existed before subscribe time (daemon restart) —
-#       Solana does NOT replay historical states on (re)subscription.
-# 5 minutes: worst-case delay for a missed submission is 5 min, not 30.
-# The sweep is a no-op when nothing new exists, so overhead is negligible.
-CATCHUP_POLL_INTERVAL = 300   # seconds (5 minutes)
-
-# ── Shared submission work queues ─────────────────────────────────────────────
-# WS listener and catch-up poller both write to _submission_queue.
-# Dispatcher thread routes items to the appropriate typed sub-queue.
-_submission_queue: queue.Queue = queue.Queue()   # raw events from WS / sweep
-_protein_queue:    queue.Queue = queue.Queue()   # protein + mRNA items → main worker
-_crispr_queue:     queue.Queue = queue.Queue()   # CRISPR items → crispr worker
-
-# ── Pipeline de-duplication ───────────────────────────────────────────────────
-# The same pubkey is delivered many times: the WS fires on create AND again on
-# each status flip, and every catch-up sweep re-reports every actionable
-# account.  Unguarded, those duplicates stack in _protein_queue far faster than
-# the worker drains it (~1 item/60s with Boltz2), so genuinely new submissions
-# sit behind thousands of copies of already-seen ones and are never reached.
-#
-# Invariant: a pubkey is present in the pipeline (raw queue + typed queue) at
-# most once.  Added at ingress by _enqueue_submission(); released by
-# _release_pipeline() when a worker pops the item and begins real work.
-_pending_pubkeys: set = set()
-_pending_lock = threading.Lock()
-_dupes_suppressed: int = 0       # cumulative, telemetry only
-
-
-def _enqueue_submission(sub: dict) -> bool:
-    """Enqueue a submission unless that pubkey is already in the pipeline.
-
-    Returns True if it was enqueued, False if suppressed as a duplicate.
-    """
-    global _dupes_suppressed
-    pk = sub.get("pubkey", "")
-    if not pk:
-        return False
-    with _pending_lock:
-        if pk in _pending_pubkeys:
-            _dupes_suppressed += 1
-            return False
-        _pending_pubkeys.add(pk)
-    _submission_queue.put_nowait(sub)
-    return True
-
-
-def _release_pipeline(pubkey: str) -> None:
-    """Allow a future sweep to re-report this pubkey (called when work starts)."""
-    with _pending_lock:
-        _pending_pubkeys.discard(pubkey)
-
-
-def _pipeline_depth() -> tuple:
-    """(raw, protein, crispr, tracked, dupes_suppressed) — for telemetry."""
-    with _pending_lock:
-        tracked = len(_pending_pubkeys)
-    return (_submission_queue.qsize(), _protein_queue.qsize(),
-            _crispr_queue.qsize(), tracked, _dupes_suppressed)
+# ── Submission work queues — REMOVED (C2) ───────────────────────────────────
+# The WS listener, the catch-up sweep and the dispatcher that fed these
+# queues are all gone.  GET /results/pending returns a batch directly and
+# each row carries its own modality, so there is nothing to route and
+# nothing to de-duplicate in memory: the on-disk progress store
+# (coordinator_client.progress) is the single source of truth for what has
+# already been handled, and it survives a restart.
 
 # ── Miner allowlist — only process submissions from this wallet ───────────────
 # Set to empty string to accept all miners (open mode).
@@ -217,7 +154,6 @@ WORK_DIR    = Path(__file__).parent
 STATS_PATH  = WORK_DIR / "stats.json"
 LOG_JSONL        = WORK_DIR / "output" / "validator_log.jsonl"
 AUDIT_JSONL      = WORK_DIR / "output" / "validator_audit.jsonl"
-CRANK_QUEUE_FILE = WORK_DIR / "output" / "crank_queue.jsonl"
 (WORK_DIR / "output").mkdir(exist_ok=True)
 
 # ── Boltz2 / MSA paths ────────────────────────────────────────────────────────
@@ -309,7 +245,6 @@ _CRISPR_GRNA_HISTORY: dict[int, list[str]] = {}
 # ── Anchor / JS paths ─────────────────────────────────────────────────────────
 ANCHOR_DIR  = Path(_env("ANCHOR_DIR", "/tmp/life-compute/core"))
 IDL_PATH    = ANCHOR_DIR / "target/idl/life_core.json"
-VALIDATE_JS = WORK_DIR / "life_validate.js"
 
 # ── ResultSubmission discriminator (from IDL) ─────────────────────────────────
 RESULT_DISCRIMINATOR = bytes([214, 115, 165, 103, 67, 211, 47, 88])
@@ -437,28 +372,6 @@ def append_audit(row: dict) -> None:
     row.setdefault("ts", datetime.now(timezone.utc).isoformat())
     with AUDIT_JSONL.open("a") as f:
         f.write(json.dumps(row) + "\n")
-
-
-# ── Crank queue ───────────────────────────────────────────────────────────────
-
-def append_crank_queue(submission_pubkey: str) -> None:
-    """
-    Signal life_crank.js to mint reward for a freshly-confirmed ResultSubmission.
-
-    The crank reads new lines from CRANK_QUEUE_FILE using a byte-offset pointer
-    (crank_queue.jsonl.pos) so no line is ever re-processed after a restart.
-    The on-chain reward_minted flag is the real idempotency guard; this queue is
-    just a low-latency hint to avoid waiting for the next periodic scan.
-    """
-    try:
-        with CRANK_QUEUE_FILE.open("a") as f:
-            f.write(json.dumps({
-                "pubkey": submission_pubkey,
-                "ts":     datetime.now(timezone.utc).isoformat(),
-            }) + "\n")
-    except Exception as _e:
-        # Never let a queue-write failure block the validator loop
-        log.warning(f"  [CRANK-QUEUE] write failed ({_e}) — crank will pick up via scan")
 
 
 # ── Today-counter helpers ──────────────────────────────────────────────────────
@@ -2441,402 +2354,6 @@ def _parse_result_submission(pubkey: str, data: bytes) -> dict | None:
         return None
 
 
-# ── WebSocket subscription loop (async, runs in its own thread) ───────────────
-
-async def _ws_subscription_loop():
-    """
-    Maintain a persistent programSubscribe WebSocket connection to the Solana
-    cluster.  Every time a ResultSubmission account (dataSize=938) is created
-    or updated the RPC pushes the full account data here; we parse it and place
-    it on _submission_queue so the workers pick it up within seconds.
-
-    Reconnects with exponential backoff on any error, forever.
-    No state is carried across reconnects — the catch-up poll covers the gap.
-    """
-    global _ws_connected_since, _ws_last_notification_time
-    import base64
-    import websockets
-
-    attempt = 0
-    while True:
-        try:
-            async with websockets.connect(
-                SOLANA_WS,
-                ping_interval=WS_PING_INTERVAL,
-                ping_timeout=WS_PING_TIMEOUT,
-                max_size=10 * 1024 * 1024,   # 10 MB: headroom for account data batches
-            ) as ws:
-                attempt = 0   # reset backoff on successful connect
-                log.info(f"[WS] Connected → {_url_host(SOLANA_WS)}")
-                _ws_connected_since = time.time()
-
-                # programSubscribe — dataSize filter keeps noise down; status and
-                # discriminator filters are applied client-side after parse so we
-                # never miss an account that changes from Pending→Validating.
-                await ws.send(json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "programSubscribe",
-                    "params": [
-                        PROGRAM_ID,
-                        {
-                            "encoding":    "base64",
-                            "commitment":  "confirmed",
-                            "filters":     [{"dataSize": 938}],
-                        },
-                    ],
-                }))
-
-                raw = await ws.recv()
-                resp = json.loads(raw)
-                log.info(f"[WS] Subscription confirmed  id={resp.get('result')}")
-
-                async for raw_msg in ws:
-                    try:
-                        msg = json.loads(raw_msg)
-                        if msg.get("method") != "programNotification":
-                            continue
-
-                        val    = msg["params"]["result"]["value"]
-                        pubkey = val["pubkey"]
-                        acct   = val["account"]
-                        data   = base64.b64decode(acct["data"][0])
-
-                        # Fast pre-checks before full parse
-                        if data[:8] != RESULT_DISCRIMINATOR:
-                            continue
-                        if len(data) > 576 and data[576] not in (STATUS_PENDING, STATUS_VALIDATING):
-                            continue   # already Confirmed/Rejected — ignore
-
-                        sub = _parse_result_submission(pubkey, data)
-                        if sub is None:
-                            continue
-
-                        log.debug(
-                            f"[WS] Queuing {pubkey[:16]}…  "
-                            f"target={sub['target_id']}  status={sub['status']}"
-                        )
-                        _enqueue_submission(sub)
-                        _ws_last_notification_time = time.time()
-
-                    except Exception as e:
-                        log.debug(f"[WS] message parse error: {e}")
-
-        except Exception as e:
-            attempt += 1
-            backoff = min(2 ** attempt, WS_MAX_BACKOFF)
-            log.warning(
-                f"[WS] Disconnected ({type(e).__name__}: {e}) — "
-                f"reconnecting in {backoff}s (attempt {attempt})"
-            )
-            await asyncio.sleep(backoff)
-
-
-def _start_ws_listener():
-    """
-    Launch _ws_subscription_loop in a dedicated OS thread with its own asyncio
-    event loop.  The rest of the daemon stays purely synchronous.
-    """
-    def _runner():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_ws_subscription_loop())   # runs forever
-
-    t = threading.Thread(target=_runner, daemon=True, name="ws-listener")
-    t.start()
-    log.info("[WS] Listener thread started")
-    return t
-
-
-# ── Dispatcher thread: routes _submission_queue → typed sub-queues ─────────────
-
-def _start_dispatcher():
-    """
-    Read items from _submission_queue and route them to either _crispr_queue
-    (target_id 3000–3009) or _protein_queue (all others).
-    Dedup against _SEEN_SUBMISSIONS here so neither worker sees duplicates:
-    the WS can deliver multiple notifications for the same account (e.g. on
-    creation and again when status flips to Validating).
-    """
-    def _dispatcher():
-        while True:
-            try:
-                sub = _submission_queue.get(timeout=5)
-            except queue.Empty:
-                continue
-            except Exception as e:
-                log.error(f"[DISPATCHER] queue.get error: {e}")
-                continue
-
-            pubkey = sub["pubkey"]
-
-            # Dedup: if already tracked (processed or max-retried) skip silently
-            if _SEEN_SUBMISSIONS.get(pubkey, 0) > _MAX_RETRY_ATTEMPTS:
-                log.debug(f"[DISPATCHER] {pubkey[:16]}… already at max retries — dropped")
-                _release_pipeline(pubkey)   # dropped, not queued — stop tracking
-                continue
-
-            if 3000 <= sub["target_id"] <= 3009:
-                _crispr_queue.put_nowait(sub)
-            else:
-                _protein_queue.put_nowait(sub)
-
-    t = threading.Thread(target=_dispatcher, daemon=True, name="dispatcher")
-    t.start()
-    log.info("[DISPATCHER] Routing thread started")
-    return t
-
-
-# ── Catch-up poll (safety net for WS gaps and post-restart warm-up) ──────────
-
-# Adaptive catchup interval state — shared between _catchup_poll_once() and main loop.
-# On a 429 failure the interval shrinks so the next window is caught quickly.
-# On success it resets to the full 5-minute cadence.
-_catchup_interval: int = CATCHUP_POLL_INTERVAL   # starts at 300s
-
-# WS silence detector — track when the WS last delivered a submission notification.
-# If the WS has been connected for > WS_SILENCE_THRESHOLD seconds without delivering
-# anything, _catchup_poll_once() is triggered immediately (outside its normal timer).
-WS_SILENCE_THRESHOLD = 90   # seconds: force catchup if WS silent this long after connect
-# Minimum spacing between silence-forced sweeps.  Previously the silence branch
-# used a hardcoded 10 s floor, so a permanently-throttled WS (the normal state
-# on public devnet) triggered ~6 sweeps/minute — each one two full
-# getProgramAccounts calls that re-enqueued every actionable account.
-WS_SILENCE_CATCHUP_INTERVAL = 60   # seconds
-_ws_last_notification_time: float = 0.0   # updated whenever WS enqueues a submission
-_ws_connected_since: float = 0.0          # updated on each [WS] Connected event
-
-
-def _catchup_poll_once() -> bool:
-    """
-    Run a full getProgramAccounts sweep and enqueue any pending submissions
-    not already in _SEEN_SUBMISSIONS.  Called every _catchup_interval seconds
-    from the main worker loop, or immediately when WS silence is detected.
-
-    Returns True on success (even if no new submissions), False on failure.
-    On 429 failure the global _catchup_interval is shortened to 60 s so the
-    next open RPC window is caught quickly.  On success it resets to 300 s.
-
-    Recovers submissions missed due to:
-      - Silent notification throttling on public devnet RPC under load (primary)
-      - Submissions that existed before the WS subscribed (daemon restart)
-      - Brief disconnect windows between ping detection and reconnect (~30–60s)
-    """
-    global _catchup_interval
-    try:
-        subs = fetch_pending_submissions(crispr_only=False)
-        subs += fetch_pending_submissions(crispr_only=True)
-        new = 0
-        dup = 0
-        skipped = 0
-        for sub in subs:
-            if _SEEN_SUBMISSIONS.get(sub["pubkey"], 0) > _MAX_RETRY_ATTEMPTS:
-                skipped += 1
-                continue
-            if _enqueue_submission(sub):
-                new += 1
-            else:
-                dup += 1
-        raw_q, prot_q, cris_q, tracked, _dupes = _pipeline_depth()
-        if new or dup:
-            log.info(
-                f"[CATCHUP-POLL] swept {len(subs)} account(s): "
-                f"enqueued {new}, suppressed {dup} duplicate(s), "
-                f"skipped {skipped} at-max-retries  "
-                f"[queues raw={raw_q} protein={prot_q} crispr={cris_q} tracked={tracked}]"
-            )
-        else:
-            log.debug("[CATCHUP-POLL] No new submissions — WS delivery healthy")
-        # Success: restore full 5-minute interval
-        if _catchup_interval != CATCHUP_POLL_INTERVAL:
-            log.info(f"[CATCHUP-POLL] RPC recovered — resetting interval to {CATCHUP_POLL_INTERVAL}s")
-            _catchup_interval = CATCHUP_POLL_INTERVAL
-        return True
-    except Exception as e:
-        log.warning(f"[CATCHUP-POLL] sweep failed: {e}")
-        # Shorten interval so we retry within 60 s instead of waiting the full 5 min
-        _catchup_interval = 60
-        log.warning(f"[CATCHUP-POLL] rate-limited — next attempt in {_catchup_interval}s")
-        return False
-
-
-def fetch_pending_submissions(crispr_only: bool = False) -> list[dict]:
-    """
-    getProgramAccounts filtered to ResultSubmission accounts.
-    Returns list of dicts with keys: pubkey, miner, target_id, epoch,
-    smiles, claimed_affinity, status.
-
-    Three RPC-side filters (all must pass):
-      1. dataSize=938        — exact account size for ResultSubmission
-      2. memcmp offset=0     — 8-byte Anchor discriminator (base58)
-      3. memcmp offset=576   — is_validated=0x00 (Pending/Validating only)
-         Layout: 8+32+1+8+512+2+4+8+1 = 576 bytes before the status byte
-         (938-byte accounts have 1 extra byte vs legacy 937-byte layout)
-
-    crispr_only=True  → return only target_ids 3000–3009 (client-side filter)
-    crispr_only=False → return only non-CRISPR target_ids (protein + mRNA)
-    """
-    import base64, base58
-    disc_b58        = base58.b58encode(RESULT_DISCRIMINATOR).decode()
-    # Build filters list — optionally restrict to a single miner wallet at the RPC level
-    # to avoid fetching/processing corrupt submissions from other (old) wallets.
-    # NOTE: we do NOT filter by status byte here — Pending (0x00) and Validating (0x01)
-    # both need to be returned.  The status=0x00 memcmp would miss all Validating accounts,
-    # which may still need an additional validator vote to reach validators_required.
-    # Status filtering is applied client-side below after parsing.
-    filters = [
-        {"dataSize": 938},
-        {"memcmp": {"offset": 0, "bytes": disc_b58}},
-    ]
-    if MINER_WALLET:
-        miner_wallet_b58 = base58.b58encode(base58.b58decode(MINER_WALLET)).decode()
-        # miner pubkey sits at offset 8 (after 8-byte discriminator)
-        filters.append({"memcmp": {"offset": 8, "bytes": miner_wallet_b58}})
-        log.debug(f"fetch_pending_submissions: filtering to miner wallet {MINER_WALLET[:16]}…")
-    try:
-        resp = _rpc("getProgramAccounts", [
-            PROGRAM_ID,
-            {
-                "encoding": "base64",
-                "filters": filters,
-            },
-        ])
-    except Exception as e:
-        log.warning(f"getProgramAccounts failed: {e}")
-        return []
-
-    results = []
-    for item in resp.get("result", []) or []:
-        try:
-            pubkey  = item["pubkey"]
-            data    = base64.b64decode(item["account"]["data"][0])
-            # Parse ResultSubmission fields after 8-byte discriminator
-            # Layout: [8 disc][32 miner][2 target_id u16][8 epoch][512 smiles][2 smiles_len]
-            #         [4 claimed_affinity f32][8 submitted_slot i64][1 status]...
-            # (938-byte accounts: target_id expanded from u8 to u16 vs legacy 937-byte layout)
-            off = 8
-            miner      = data[off:off+32]; off += 32
-            target_id  = int.from_bytes(data[off:off+2], "little"); off += 2
-            epoch      = int.from_bytes(data[off:off+8], "little"); off += 8
-            smiles_raw = data[off:off+512]; off += 512
-            smiles_len = int.from_bytes(data[off:off+2], "little"); off += 2
-            import struct
-            claimed    = struct.unpack_from("<f", data, off)[0]; off += 4
-            off += 8  # submitted_slot
-            status     = data[off]
-            if status not in (STATUS_PENDING, STATUS_VALIDATING):
-                continue
-            import base58 as _b58
-            smiles = smiles_raw[:smiles_len].decode("utf-8", errors="replace").strip("\x00")
-            if not smiles:
-                continue
-            results.append({
-                "pubkey":           pubkey,
-                "miner":            _b58.b58encode(miner).decode(),
-                "target_id":        target_id,
-                "epoch":            epoch,
-                "smiles":           smiles,
-                "claimed_affinity": float(claimed),
-                "status":           status,
-                "miner_gpu":        _parse_gpu_model(data),
-            })
-        except Exception as e:
-            log.debug(f"  parse error {item.get('pubkey','?')[:16]}: {e}")
-    # Client-side type filter: split CRISPR (3000-3009) from protein/mRNA
-    if crispr_only:
-        return [r for r in results if 3000 <= r["target_id"] <= 3009]
-    else:
-        return [r for r in results if not (3000 <= r["target_id"] <= 3009)]
-
-
-# ── ValidationRecord pre-check (unwinnable-vote guard) ───────────────────────
-# validate_result initialises a ValidationRecord PDA seeded on
-# (b"validation", result_pubkey, validator_pubkey).  Anchor `init` fails with
-# system_program custom error 0x0 ("already in use") if it exists, so once this
-# validator has voted on a submission it can NEVER vote again — regardless of
-# score.  A submission left at validation_count>=1, confirmed_count=0 (our vote
-# was outside the on-chain tolerance) is therefore permanently unwinnable for
-# this keypair.  Retrying burns a full Boltz2 run, a rate-limit slot and a
-# retry attempt on a transaction that cannot succeed.
-#
-# Cache is keyed by pubkey; only positive results are cached (a record that
-# exists can never stop existing).  Unknown/RPC-failure returns False so we
-# fall through to the normal path rather than skipping real work.
-_VR_EXISTS_CACHE: set = set()
-
-
-def _validation_record_exists(submission_pubkey: str) -> bool:
-    """True if this validator already has a ValidationRecord for *submission_pubkey*.
-
-    Returns False on any RPC/derivation failure — callers must treat False as
-    "proceed normally", never as a guarantee that the vote will land.
-    """
-    if not _VALIDATOR_PUBKEY:
-        return False
-    if submission_pubkey in _VR_EXISTS_CACHE:
-        return True
-    try:
-        from solders.pubkey import Pubkey as _Pk
-        program = _Pk.from_string(PROGRAM_ID)
-        sub_pk  = _Pk.from_string(submission_pubkey)
-        val_pk  = _Pk.from_string(_VALIDATOR_PUBKEY)
-        vr, _bump = _Pk.find_program_address(
-            [b"validation", bytes(sub_pk), bytes(val_pk)], program
-        )
-        resp = _rpc("getAccountInfo", [str(vr), {"encoding": "base64",
-                                                 "commitment": "confirmed"}])
-        exists = bool(resp.get("result", {}).get("value"))
-        if exists:
-            _VR_EXISTS_CACHE.add(submission_pubkey)
-        return exists
-    except Exception as e:
-        log.debug(f"  [VR-PRECHECK] {submission_pubkey[:16]}…: probe failed ({e}) — proceeding")
-        return False
-
-
-# ── On-chain validate call ────────────────────────────────────────────────────
-def validate_on_chain(submission_pubkey: str, rescored_affinity: float) -> dict | None:
-    """Call validate_result via Node.js. Returns {tx:..., confirmed:bool} or None."""
-    # NOTE: the RPC URL is deliberately NOT passed here.  A Helius URL carries
-    # ?api-key=… and argv is world-readable via /proc/<pid>/cmdline and `ps`.
-    # We pass only a source flag; life_validate.js resolves the endpoint itself
-    # using the identical SOLANA_RPC → ~/.helius.env → public-devnet priority.
-    args = {
-        "rpcSource":        _RPC_SOURCE,
-        "heliusEnvPath":    str(HELIUS_ENV_PATH),
-        "validatorKeypair": VALIDATOR_KEYPAIR,
-        "payerKeypair":     PAYER_KEYPAIR,
-        "idlPath":          str(IDL_PATH),
-        "programId":        PROGRAM_ID,
-        "resultPubkey":     submission_pubkey,
-        "rescoredAffinity": rescored_affinity,
-    }
-    try:
-        r = subprocess.run(
-            ["node", str(VALIDATE_JS), json.dumps(args)],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(ANCHOR_DIR),
-        )
-        if r.returncode != 0:
-            # life_validate.js writes errors to stdout as JSON {error: "..."}
-            err_detail = r.stdout.strip()[-400:] or r.stderr.strip()[-400:]
-            log.error(f"  validate_result node error: {err_detail}")
-            return None
-        for line in reversed(r.stdout.strip().splitlines()):
-            try:
-                return json.loads(line)
-            except Exception:
-                continue
-        log.warning(f"  validate stdout: {r.stdout[:200]}")
-        return None
-    except subprocess.TimeoutExpired:
-        log.error("  validate_result timed out")
-        return None
-    except Exception as e:
-        log.error(f"  validate_result exception: {e}")
-        return None
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def fetch_targets() -> list:
     try:
@@ -2903,1035 +2420,84 @@ def fetch_network_validator_info() -> dict:
     return result
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
-def main():
-    global _VALIDATOR_PUBKEY, _gpu_bias_tracker, _miner_gpu_model
-    print("\033[96m    L I F E  C O M P U T E  —  V A L I D A T O R  \033[0m\n")
+# ── Coordinator client entry point (C2) ─────────────────────────────────────
+# REMOVED with the coordinator migration:
+#   * _ws_subscription_loop / _start_ws_listener — the programSubscribe
+#     WebSocket.  Work now arrives by polling GET /results/pending.
+#   * _catchup_poll_once and the adaptive catch-up timer — they existed only
+#     to recover submissions the WS dropped.  With a pull model there is
+#     nothing to miss: an unscored result simply stays in /results/pending.
+#   * _start_dispatcher and the typed sub-queues — the pending list is
+#     already a batch; each row carries its own modality.
+#   * validate_on_chain / life_validate.js — see above.
+#   * the crank and its queue file — the coordinator's payout batches mint
+#     LIFE now (confirming on-chain never did).
+#
+# What remains below is the scoring code itself (run_boltz2*, validate_*),
+# which the coordinator client calls through coordinator_client.rescore.
 
-    # Endpoint provenance — exactly one line, source only, never the URL.
-    log.info(f"RPC: {_RPC_SOURCE}  (host {_url_host(SOLANA_RPC)})")
-    if _RPC_WARNING:
-        log.warning(f"RPC: {_RPC_WARNING}")
+def main() -> None:
+    """Run the validator against the coordinator."""
+    import logging as _logging
 
-    # Load validator pubkey once at startup (used for self-validation checks)
-    _VALIDATOR_PUBKEY = _load_validator_pubkey()
-    if _VALIDATOR_PUBKEY:
-        log.info(f"Validator pubkey: {_VALIDATOR_PUBKEY[:16]}…")
-    else:
-        log.warning("Self-validation check DISABLED (keypair unreadable)")
+    from coordinator_client import config as _cfg
+    from coordinator_client.client import build_service
 
-    # Detect GPU model at startup — written to .env for miner reuse
-    _miner_gpu_model = detect_gpu_model()
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-    # Initialise GPU bias tracker (loads existing model from disk)
-    _gpu_bias_tracker = GpuBiasTracker()
+    service = build_service(runner=BoltzDaemonRunner())
+    service.run_forever(poll_seconds=_cfg.POLL_SECONDS)
 
-    targets_by_id: dict[int, dict] = {}
-    last_refresh    = 0.0
-    life_earned     = 0.0
 
-    # Warm up the dedup tracker from today's audit log so a restart doesn't
-    # re-process submissions that already landed a tx.
-    _load_seen_from_audit()
-    if _SEEN_SUBMISSIONS:
-        log.info(f"Restored {len(_SEEN_SUBMISSIONS)} already-processed submission(s) from audit log")
+class BoltzDaemonRunner:
+    """Adapter: coordinator_client.BoltzRunner → this module's Boltz2 code.
 
-    # Load confirmed gRNA history for similarity-based reward decay
-    _load_crispr_grna_history()
+    Kept in the daemon (not in coordinator_client) so the client package has
+    no GPU/boltz import at all and stays unit-testable with a mock.
+    """
 
-    # Initialize today-counters from today's log so a restart doesn't zero the display
-    today_date = _today_date_utc()
-    validated_today, accepted, rejected = _count_today_from_log()
-    if validated_today:
-        log.info(f"Restored today's counters from log: total={validated_today} confirmed={accepted} rejected={rejected}")
+    def run(self, *, yaml_inputs: dict, flags: list, seed: int,
+            timeout_s: float) -> dict:
+        import tempfile
 
-    # Restore life_commission from today's audit log
-    _today = _today_date_utc()
-    life_earned = 0.0
-    if AUDIT_JSONL.exists():
-        try:
-            with AUDIT_JSONL.open() as _af:
-                for _line in _af:
-                    try:
-                        _r = json.loads(_line)
-                        if _r.get("ts", "").startswith(_today):
-                            life_earned += float(_r.get("life_earned", 0) or 0)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    if life_earned:
-        log.info(f"Restored life_commission from audit log: ${life_earned:.1f} $LIFE")
+        import yaml as _yaml
+        from boltz.main import predict
 
-    stats = {
-        "status":          "ONLINE",
-        "validated_today": validated_today,
-        "confirmed":       accepted,
-        "rejected":        rejected,
-        "accept_rate":     round(accepted / max(validated_today, 1) * 100, 1) if validated_today else 0.0,
-        "life_commission": life_earned,
-        "last_heartbeat":  datetime.now(timezone.utc).isoformat(),
-        "current_target":  None,
-        "current_smiles":  None,
-        "active_validators":    0,
-        "self_reputation_pct":  100.0,
-        "started_at":      datetime.now(timezone.utc).isoformat(),
-        "last_updated":    "",
-        "gpu_model":       _miner_gpu_model,
-        "gpu_bias":        {},
-    }
-    write_stats(stats)
+        with tempfile.TemporaryDirectory(prefix="life-validator-") as root:
+            in_dir = Path(root) / "inputs"
+            out_dir = Path(root) / "outputs"
+            in_dir.mkdir()
+            out_dir.mkdir()
+            os.chmod(root, stat.S_IRWXU)   # 700: owner-only
 
-    # Heartbeat thread — updates last_heartbeat every 30s independent of validation work
-    def _heartbeat():
-        while True:
-            time.sleep(30)
-            stats["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
-            stats["last_updated"]   = stats["last_heartbeat"]
-            write_stats(stats)
-    threading.Thread(target=_heartbeat, daemon=True).start()
+            (in_dir / "input.yaml").write_text(
+                _yaml.safe_dump(yaml_inputs, sort_keys=False,
+                                default_flow_style=False))
 
-    # ── Event-driven infrastructure ───────────────────────────────────────────
-    # Start WS listener (pushes to _submission_queue on every account change),
-    # dispatcher (routes to _crispr_queue or _protein_queue), and CRISPR worker.
-    # The main thread becomes the protein/mRNA worker draining _protein_queue.
-    _start_ws_listener()
-    _start_dispatcher()
+            boltz_start = time.time()
+            predict.main([str(in_dir), "--out_dir", str(out_dir),
+                          "--seed", str(seed), *flags],
+                         standalone_mode=False)
 
-    # ── CRISPR worker — drains _crispr_queue, never touches Boltz2 ───────────
-    def _crispr_worker():
-        nonlocal validated_today, accepted, rejected, life_earned
-        log.info("[CRISPR-WORKER] Started — waiting for queue items")
-        while True:
-            try:
-                # Block up to 5s so the thread stays responsive to daemon exit
+            pred_dir = out_dir / "boltz_results_inputs" / "predictions" / "input"
+            metrics: dict = {}
+            for fp in pred_dir.iterdir() if pred_dir.exists() else []:
+                if not fp.name.startswith(("affinity", "confidence")):
+                    continue
+                # Mtime guard: a file predating this run is a stale artifact.
+                if fp.stat().st_mtime <= boltz_start:
+                    log.warning("SECURITY WARNING  %s predates run start — ignoring",
+                                fp.name)
+                    continue
                 try:
-                    sub = _crispr_queue.get(timeout=5)
-                except queue.Empty:
-                    continue
-                crispr_subs = [sub]
-                for sub in crispr_subs:
-                    pubkey        = sub["pubkey"]
-                    # Item has left the queue and is now being worked; allow a
-                    # future sweep to re-report it if this attempt doesn't finish.
-                    _release_pipeline(pubkey)
-                    smiles        = sub["smiles"]
-                    miner_wallet  = sub["miner"]
-                    target_id_int = sub["target_id"]
-                    claimed       = sub["claimed_affinity"]
-                    # Per-submission GPU identity parsed from the account bytes.
-                    # NOT _miner_gpu_model (that is this validator's own card).
-                    submission_gpu = sub.get("miner_gpu") or "UNKNOWN"
-                    if submission_gpu == "UNKNOWN":
-                        log.info(f"  [GPU-ID-MISS] {pubkey[:16]}… no GPU field — "
-                                 f"bias bypassed, raw tolerance")
-                    else:
-                        log.info(f"  [GPU-ID] {pubkey[:16]}… miner_gpu={submission_gpu}")
-
-                    # Dedup guard (dispatcher already checked, but be defensive
-                    # in case a catch-up poll re-queued an item between checks)
-                    if _SEEN_SUBMISSIONS.get(pubkey, 0) > _MAX_RETRY_ATTEMPTS:
-                        continue
-
-                    # Security gates (mirrors main loop)
-                    if MINER_WALLET and miner_wallet != MINER_WALLET:
-                        continue
-                    # Unwinnable-vote guard: if we already hold a ValidationRecord
-                    # for this submission the tx can never land (Anchor init →
-                    # system_program 0x0).  Skip permanently BEFORE charging a
-                    # rate-limit slot or running the scorer.
-                    if _validation_record_exists(pubkey):
-                        log.info(
-                            f"  [VR-PRECHECK] {pubkey[:16]}…: ValidationRecord already "
-                            f"exists — this validator has voted; permanent skip"
-                        )
-                        _SEEN_SUBMISSIONS[pubkey] = _MAX_RETRY_ATTEMPTS + 1
-                        append_audit({
-                            "ts":                datetime.now(timezone.utc).isoformat(),
-                            "submission_pubkey": pubkey,
-                            "miner_wallet":      miner_wallet,
-                            "miner_gpu":         submission_gpu,
-                            "claimed_score":     claimed,
-                            "rescored":          None,
-                            "decision":          "ALREADY_VOTED",
-                            "rel_err":           None,
-                            "target_id":         target_id_int,
-                            "target_type":       "CRISPR",
-                        })
-                        continue
-                    if not _rate_limit_check():
-                        break
-                    if not _check_self_validation(miner_wallet, pubkey):
-                        continue
-                    if abs(claimed) > 50.0:
-                        continue
-                    if not _sanitize_smiles(smiles, pubkey):
-                        continue
-
-                    target = targets_by_id.get(target_id_int)
-                    if not target:
-                        continue
-
-                    target = dict(target)
-                    target["difficulty_tier"] = 3  # CRISPR always tier 3
-
-                    log.info(f"  [CRISPR-THREAD] Validating {pubkey[:16]}…  target={target.get('id','?')}  claimed={claimed:.3f}")
-
-                    # Expose current CRISPR work to dashboard (mirrors main loop lines 1725-1729)
-                    stats["current_target"] = target.get("id") or str(target_id_int)
-                    stats["current_smiles"]  = smiles
-                    stats["last_updated"]    = datetime.now(timezone.utc).isoformat()
-                    write_stats(stats)
-
-                    t0 = time.time()
-                    rescored, grna_scores = run_crispr_validation(smiles, target)
-                    elapsed = time.time() - t0
-
-                    if rescored is None:
-                        log.warning(f"  [CRISPR] Invalid gRNA for {pubkey[:16]}… — skip")
-                        _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                        # Clear dashboard "PROCESSING" state — this submission is done,
-                        # not in progress.  Mirrors the clear done on confirm/reject paths.
-                        stats["current_target"] = None
-                        stats["current_smiles"]  = None
-                        stats["last_updated"]    = datetime.now(timezone.utc).isoformat()
-                        write_stats(stats)
-                        continue
-
-                    _crispr_tgt_name = _CRISPR_ID_TO_NAME.get(target_id_int, target.get("id", "") or "")
-
-                    # ── Stage-3: validate_crispr() ───────────────────────────────
-                    vc = validate_crispr(
-                        grna_seq=smiles,
-                        target={**target, "id": _crispr_tgt_name},
-                        claimed=claimed,
-                        gpu_model=submission_gpu,
-                        bias_tracker=_gpu_bias_tracker,
-                    )
-                    # Charge a rate-limit slot only if Boltz2 actually produced a score.
-                    if vc["rescored"] is not None:
-                        _rate_limit_commit("CRISPR")
-                    rescored   = vc["rescored"] if vc["rescored"] is not None else rescored
-                    rel_err    = vc["rel_err"] or 0.0
-                    within_tol = vc["within_tol"]   # Boltz2 tolerance is the sole gate
-                    verdict    = "CONFIRM" if within_tol else "REJECT"
-                    _crispr_tol = CRISPR_TOL
-                    adjusted_claimed = claimed  # validate_crispr does not apply bias
-
-                    if vc["verdict"] == "VALIDATOR_ERROR":
-                        # Sanity gate or invalid gRNA — skip on-chain
-                        _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                        stats["current_target"] = None
-                        stats["current_smiles"]  = None
-                        write_stats(stats)
-                        continue
-
-                    current_epoch = fetch_current_epoch()
-                    tier_reward   = _halved_reward(BASE_TIER_REWARDS.get(3, 7), current_epoch)
-                    log.info(f"  [CRISPR] reward: base={BASE_TIER_REWARDS.get(3,7)} epoch={current_epoch} halvings={current_epoch//HALVING_INTERVAL} → {tier_reward} $LIFE")
-
-                    # ── Similarity-based reward decay (mirrors miner, deployed 2026-09-02) ──
-                    grna_reward_factor, grna_max_sim = _grna_similarity_reward_factor(
-                        smiles, target_id_int
-                    )
-                    effective_reward = int(tier_reward * grna_reward_factor)
-                    log.info(
-                        f"  [GRNA-DECAY] target={target_id_int}  gRNA={smiles[:16]}…"
-                        f"  history_size={len(_CRISPR_GRNA_HISTORY.get(target_id_int, []))}"
-                        f"  max_sim={grna_max_sim:.3f}  factor={grna_reward_factor}x"
-                        f"  tier_reward={tier_reward} → effective_reward={effective_reward}"
-                    )
-
-                    result = validate_on_chain(pubkey, rescored)
-                    tx     = result.get("tx") if result else None
-                    if tx:
-                        log.info(f"  ✔ [CRISPR] tx: {tx}")
-                        validated_today += 1
-                        # Signal crank to mint reward for this confirmed submission.
-                        # Only when within_tol (CONFIRM) — REJECTs never reach Confirmed status.
-                        if within_tol:
-                            append_crank_queue(pubkey)
-                        # Commission = (miner_amount/20)/confirming_count  [mint_reward.rs]
-                        # mRNA/CRISPR/protein-Hard all use the same 25 LIFE miner base.
-                        # grna_reward_factor (novelty decay) applies to the MINER reward only;
-                        # validator commission is always the flat formula — no decay applied.
-                        commission = _validator_commission(difficulty_tier=3,
-                                                           total_minted_raw=0,
-                                                           hit_count=0)
-                        if within_tol:
-                            accepted    += 1
-                            life_earned += commission
-                            log.info(
-                                f"  +{commission:.4f} $LIFE commission"
-                                f"  (CRISPR tier=3, formula=25/20/{_VALIDATORS_REQUIRED})"
-                                f"  total={life_earned:.4f}"
-                                f"  [miner grna_decay={grna_reward_factor:.2f}x — not applied to validator]"
-                            )
-                            # Register gRNA in history so subsequent submissions are compared against it
-                            grna_upper = smiles.upper().strip()
-                            if len(grna_upper) == 20 and grna_upper not in _CRISPR_GRNA_HISTORY.get(target_id_int, []):
-                                _CRISPR_GRNA_HISTORY.setdefault(target_id_int, []).append(grna_upper)
-                        else:
-                            rejected += 1
-                        _SEEN_SUBMISSIONS.pop(pubkey, None)
-                        append_audit({
-                            "ts":               datetime.now(timezone.utc).isoformat(),
-                            "submission_pubkey": pubkey,
-                            "miner_wallet":     miner_wallet,
-                            "miner_gpu":        submission_gpu,
-                            "claimed_score":    claimed,
-                            "rescored":         rescored,
-                            "decision":         "CONFIRM" if within_tol else "REJECT",
-                            "rel_err":          round(rel_err, 4),
-                            "tolerance_used":   _crispr_tol,
-                            "bias_factor_used": None,  # bias not applied for CRISPR
-                            "bias_factor":      None,  # alias — keep both names in sync
-                            "adjusted_claimed": round(adjusted_claimed, 4),
-                            "tx":               tx,
-                            "target_id":        target_id_int,
-                            "target_type":      "CRISPR",
-                            "difficulty_tier":  3,
-                            "life_earned":      round(commission, 6) if within_tol else 0,
-                            "grna_on_target":   grna_scores.get("on_target"),
-                            "grna_off_target":  grna_scores.get("off_target"),
-                            "grna_delivery":    grna_scores.get("delivery"),
-                            "grna_combined":    grna_scores.get("combined"),
-                            "smiles":           smiles,
-                            "grna_reward_factor": grna_reward_factor,
-                            "grna_max_sim":       round(grna_max_sim, 4),
-                        })
-                        append_log({
-                            "ts":               datetime.now(timezone.utc).isoformat(),
-                            "pubkey":           pubkey,
-                            "smiles":           smiles,
-                            "grna_seq":         smiles,
-                            "target_id":        target_id_int,
-                            "claimed":          claimed,
-                            "rescored":         rescored,
-                            "rel_err":          round(rel_err, 4),
-                            "within_tolerance": within_tol,
-                            "verdict":          verdict,
-                            "tx":               tx,
-                            "elapsed_s":        round(elapsed, 3),
-                            "difficulty_tier":  3,
-                            "target_type":      "CRISPR",
-                            "grna_combined":    grna_scores.get("combined"),
-                            "life_earned":      round(commission, 6) if within_tol else 0,
-                        })
-                    else:
-                        log.warning(f"  [CRISPR] validate_on_chain returned no tx")
-                        # Same classification as the protein path: an existing
-                        # ValidationRecord makes this permanently unwinnable, so
-                        # pin above the cap instead of counting a retry.
-                        if _validation_record_exists(pubkey):
-                            log.info(
-                                f"  [VR-PRECHECK] {pubkey[:16]}…: tx failed because a "
-                                f"ValidationRecord already exists — unwinnable, permanent skip"
-                            )
-                            _SEEN_SUBMISSIONS[pubkey] = _MAX_RETRY_ATTEMPTS + 1
-                        else:
-                            _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-            except Exception as e:
-                log.error(f"[CRISPR-WORKER] unhandled error: {e}")
-            # No sleep — loop immediately back to queue.get(timeout=5)
-    threading.Thread(target=_crispr_worker, daemon=True, name="crispr-worker").start()
-
-    # ── Protein/mRNA worker (main thread) — drains _protein_queue ────────────
-    last_catchup = time.time()
-    _catchup_poll_once()   # immediate warm-up sweep on startup
-
-    while True:
-        now = time.time()
-
-        # Catch-up poll: adaptive interval (60 s when rate-limited, 300 s when healthy).
-        # Also fires immediately if the WS has been connected for > WS_SILENCE_THRESHOLD
-        # seconds without delivering any notification — the public devnet RPC silently
-        # throttles programSubscribe under load, keeping TCP alive but sending no events.
-        ws_connected = _ws_connected_since > 0
-        ws_silence = (
-            ws_connected
-            and (now - _ws_connected_since) > WS_SILENCE_THRESHOLD
-            and (now - _ws_last_notification_time) > WS_SILENCE_THRESHOLD
-        )
-        # A silent WS means the sweep is our ONLY source of work, so we poll on
-        # the shortened WS_SILENCE_CATCHUP_INTERVAL instead of the full 300 s.
-        # It must never be faster than that floor: each sweep is two full
-        # getProgramAccounts calls (~9.4k accounts) and firing every 10 s both
-        # self-inflicts HTTP 429s and re-stacks the queue with duplicates.
-        effective_interval = _catchup_interval
-        if ws_silence:
-            effective_interval = min(_catchup_interval, WS_SILENCE_CATCHUP_INTERVAL)
-        if now - last_catchup >= effective_interval:
-            if ws_silence:
-                log.info(
-                    f"[CATCHUP-POLL] WS silent for >{WS_SILENCE_THRESHOLD}s — "
-                    f"sweeping (cadence {effective_interval}s)"
-                )
-            _catchup_poll_once()
-            last_catchup = now
-
-        # Reset today-counters at midnight UTC
-        new_date = _today_date_utc()
-        if new_date != today_date:
-            log.info(f"New UTC day ({new_date}) — resetting today's validation counters")
-            today_date      = new_date
-            validated_today = 0
-            accepted        = 0
-            rejected        = 0
-
-        # Refresh target list every 5 min
-        if now - last_refresh > 300 or not targets_by_id:
-            targets = fetch_targets()
-            targets_by_id = {t.get("target_id_num", i): t for i, t in enumerate(targets)}
-            # Also index by target_id integer from on-chain (0-indexed per TARGET_ID_MAP)
-            for i, t in enumerate(targets):
-                targets_by_id.setdefault(i, t)
-            # mRNA targets occupy on-chain IDs 2000-2029, mapping to list indices 30-59.
-            # Register each mRNA target under its on-chain ID so submissions with
-            # target_id_int in [2000, 2029] resolve correctly instead of being skipped.
-            _mrna_base_onchain = 2000
-            _mrna_base_list    = 30
-            _mrna_count        = 30
-            for _j in range(_mrna_count):
-                _list_idx   = _mrna_base_list + _j
-                _onchain_id = _mrna_base_onchain + _j
-                _t = targets[_list_idx] if _list_idx < len(targets) else None
-                if _t is not None and _is_mrna_target(_t):
-                    targets_by_id.setdefault(_onchain_id, _t)
-            _mrna_registered = sum(
-                1 for k in range(_mrna_base_onchain, _mrna_base_onchain + _mrna_count)
-                if k in targets_by_id
-            )
-            # CRISPR targets occupy on-chain IDs 3000-3009, mapping to list indices 60-69.
-            # Register each CRISPR target under its on-chain ID so submissions with
-            # target_id_int in [3000, 3009] resolve correctly instead of being skipped.
-            _crispr_base_onchain = 3000
-            _crispr_base_list    = 60
-            _crispr_count        = 10
-            for _j in range(_crispr_count):
-                _list_idx   = _crispr_base_list + _j
-                _onchain_id = _crispr_base_onchain + _j
-                _t = targets[_list_idx] if _list_idx < len(targets) else None
-                if _t is not None:
-                    targets_by_id.setdefault(_onchain_id, _t)
-            _crispr_registered = sum(
-                1 for k in range(_crispr_base_onchain, _crispr_base_onchain + _crispr_count)
-                if k in targets_by_id
-            )
-            log.info(f"Targets loaded: {len(targets)}  (mRNA on-chain IDs registered: {_mrna_registered})  (CRISPR on-chain IDs registered: {_crispr_registered})")
-            last_refresh = now
-
-        # Step 1: Wait for the next protein/mRNA submission from the queue.
-        # Block up to 10s so the catch-up timer and target refresh above can fire.
-        try:
-            sub = _protein_queue.get(timeout=10)
-        except queue.Empty:
-            continue   # no work yet — loop back for timer checks
-
-        submissions = [sub]
-        for sub in submissions:
-            pubkey        = sub["pubkey"]
-            # Item has left the queue and is now being worked; allow a future
-            # sweep to re-report it if this attempt doesn't finish.
-            _release_pipeline(pubkey)
-            smiles        = sub["smiles"]
-            miner_wallet  = sub["miner"]
-            target_id_int = sub["target_id"]
-            claimed       = sub["claimed_affinity"]
-            # Per-submission GPU identity parsed from the account bytes.
-            # NOT _miner_gpu_model (that is this validator's own card).
-            submission_gpu = sub.get("miner_gpu") or "UNKNOWN"
-            if submission_gpu == "UNKNOWN":
-                log.info(f"  [GPU-ID-MISS] {pubkey[:16]}… no GPU field — "
-                         f"bias bypassed, raw tolerance")
-            else:
-                log.info(f"  [GPU-ID] {pubkey[:16]}… miner_gpu={submission_gpu}")
-
-            # ── Dedup: skip already-processed or over-retried submissions ─────
-            attempts = _SEEN_SUBMISSIONS.get(pubkey, 0)
-            if attempts > _MAX_RETRY_ATTEMPTS:
-                log.debug(
-                    f"  {pubkey[:16]}…: skipping — already attempted "
-                    f"{attempts}x (tx kept failing); will clear when RPC drops it"
-                )
-                continue
-
-            # ── Security gate 0: miner wallet allowlist ───────────────────────
-            if MINER_WALLET and miner_wallet != MINER_WALLET:
-                log.warning(
-                    f"  {pubkey[:16]}…: miner wallet {miner_wallet[:16]}… "
-                    f"not in allowlist — skipping (old/unknown wallet)"
-                )
-                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                append_audit({
-                    "ts":               datetime.now(timezone.utc).isoformat(),
-                    "submission_pubkey": pubkey,
-                    "miner_wallet":     miner_wallet,
-                    "miner_gpu":        submission_gpu,
-                    "claimed_score":    claimed,
-                    "rescored":         None,
-                    "decision":         "WALLET_NOT_ALLOWED",
-                    "rel_err":          None,
-                })
-                continue
-
-            # ── Security gate 0b: unwinnable-vote guard ──────────────────────
-            # A ValidationRecord PDA that already exists means this validator
-            # voted on this submission before and the on-chain tolerance check
-            # failed (validation_count>=1, confirmed_count=0).  The PDA blocks
-            # any re-vote with the same keypair, so the tx can never succeed.
-            # Skip permanently here — before a rate-limit slot or a ~60s Boltz2
-            # run is spent on it.
-            if _validation_record_exists(pubkey):
-                log.info(
-                    f"  [VR-PRECHECK] {pubkey[:16]}…: ValidationRecord already exists "
-                    f"— this validator has voted; permanent skip (no slot charged)"
-                )
-                _SEEN_SUBMISSIONS[pubkey] = _MAX_RETRY_ATTEMPTS + 1
-                append_audit({
-                    "ts":                datetime.now(timezone.utc).isoformat(),
-                    "submission_pubkey": pubkey,
-                    "miner_wallet":      miner_wallet,
-                    "miner_gpu":         submission_gpu,
-                    "claimed_score":     claimed,
-                    "rescored":          None,
-                    "decision":          "ALREADY_VOTED",
-                    "rel_err":           None,
-                    "target_id":         target_id_int,
-                })
-                continue
-
-            # ── Security gate 1: rate limiting ───────────────────────────────
-            if not _rate_limit_check():
-                append_audit({
-                    "ts":               datetime.now(timezone.utc).isoformat(),
-                    "submission_pubkey": pubkey,
-                    "miner_wallet":     miner_wallet,
-                    "miner_gpu":        submission_gpu,
-                    "claimed_score":    claimed,
-                    "rescored":         None,
-                    "decision":         "RATE_LIMITED",
-                    "rel_err":          None,
-                })
-                break  # stop processing this poll cycle entirely
-
-            # ── Security gate 2: self-validation prevention ───────────────────
-            if not _check_self_validation(miner_wallet, pubkey):
-                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                append_audit({
-                    "ts":               datetime.now(timezone.utc).isoformat(),
-                    "submission_pubkey": pubkey,
-                    "miner_wallet":     miner_wallet,
-                    "miner_gpu":        submission_gpu,
-                    "claimed_score":    claimed,
-                    "rescored":         None,
-                    "decision":         "SELF_VALIDATION_REJECTED",
-                    "rel_err":          None,
-                })
-                continue
-
-            # ── Security gate 3: corrupted claimed_score filter ───────────────
-            # Valid Boltz2 affinities are in the range [-15, +5] kcal/mol.
-            # Anything with |claimed_score| > 50 is physically impossible (e.g.
-            # 788604923813036032, -5.732e+33, or 51.456) and signals corrupted
-            # on-chain data.  Skip immediately — Boltz2 would never confirm
-            # these and running the GPU wastes time while the loop stalls.
-            _CLAIMED_SCORE_MAX = 50.0
-            if abs(claimed) > _CLAIMED_SCORE_MAX:
-                log.warning(
-                    f"  {pubkey[:16]}…: claimed_score {claimed:.6g} exceeds "
-                    f"|{_CLAIMED_SCORE_MAX}| — corrupted submission, skipping"
-                )
-                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                append_audit({
-                    "ts":               datetime.now(timezone.utc).isoformat(),
-                    "submission_pubkey": pubkey,
-                    "miner_wallet":     miner_wallet,
-                    "miner_gpu":        submission_gpu,
-                    "claimed_score":    claimed,
-                    "rescored":         None,
-                    "decision":         "CORRUPTED_SCORE",
-                    "rel_err":          None,
-                })
-                continue
-
-            # ── Security gate 4: SMILES input sanitization ────────────────────
-            if not _sanitize_smiles(smiles, pubkey):
-                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                append_audit({
-                    "ts":               datetime.now(timezone.utc).isoformat(),
-                    "submission_pubkey": pubkey,
-                    "miner_wallet":     miner_wallet,
-                    "miner_gpu":        submission_gpu,
-                    "claimed_score":    claimed,
-                    "rescored":         None,
-                    "decision":         "SMILES_INVALID",
-                    "rel_err":          None,
-                })
-                continue
-
-            target = targets_by_id.get(target_id_int)
-            if not target:
-                log.warning(f"  {pubkey[:16]}…: unknown target_id={target_id_int} — skip")
-                _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                append_audit({
-                    "ts":               datetime.now(timezone.utc).isoformat(),
-                    "submission_pubkey": pubkey,
-                    "miner_wallet":     miner_wallet,
-                    "miner_gpu":        submission_gpu,
-                    "claimed_score":    claimed,
-                    "rescored":         None,
-                    "decision":         "UNKNOWN_TARGET",
-                    "rel_err":          None,
-                })
-                continue
-
-            log.info(f"  Validating {pubkey[:16]}…  target={target.get('id','?')}  "
-                     f"claimed={claimed:.3f}  smiles={smiles[:40]}")
-
-            # ── mRNA target: enforce tier 3 regardless of what the on-chain record says
-            is_mrna = _is_mrna_target(target)
-            if is_mrna and target.get("difficulty_tier") != 3:
-                # Safety override — all mRNA_ targets are hard (25 $LIFE commission)
-                target = dict(target)
-                target["difficulty_tier"] = 3
-
-            # ── CRISPR target: enforce tier 3 regardless of what the on-chain record says
-            is_crispr = _is_crispr_target(target) or (3000 <= target_id_int <= 3009)
-            if is_crispr and target.get("difficulty_tier") != 3:
-                # Safety override — all CRISPR targets are hard (25 $LIFE commission)
-                target = dict(target)
-                target["difficulty_tier"] = 3
-
-            # Expose current work to dashboard
-            stats["current_target"] = target.get("id") or str(target_id_int)
-            stats["current_smiles"] = smiles
-            stats["last_updated"]   = datetime.now(timezone.utc).isoformat()
-            write_stats(stats)
-
-            # ── CRISPR path: three-score analytical validation (no Boltz2) ───
-            if is_crispr:
-                t0 = time.time()
-                rescored, grna_scores = run_crispr_validation(smiles, target)
-                elapsed = time.time() - t0
-
-                if rescored is None:
-                    # Invalid gRNA sequence — skip and cap retries
-                    log.warning(f"  [CRISPR] Invalid gRNA for {pubkey[:16]}… — skip")
-                    _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                    attempt_n = _SEEN_SUBMISSIONS[pubkey]
-                    if attempt_n < _MAX_RETRY_ATTEMPTS:
-                        append_audit({
-                            "ts":               datetime.now(timezone.utc).isoformat(),
-                            "submission_pubkey": pubkey,
-                            "miner_wallet":     miner_wallet,
-                            "miner_gpu":        submission_gpu,
-                            "claimed_score":    claimed,
-                            "rescored":         None,
-                            "decision":         "BOLTZ2_FAILED",
-                            "rel_err":          None,
-                        })
-                    else:
-                        log.info(f"  [CRISPR] {pubkey[:16]}…: failed {attempt_n}x — submitting on-chain REJECT to clear from queue")
-                        result = validate_on_chain(pubkey, 0.0)
-                        tx = result.get("tx") if result else None
-                        if tx:
-                            log.info(f"  ✔ CRISPR BOLTZ2_REJECT tx: {tx}")
-                            _SEEN_SUBMISSIONS.pop(pubkey, None)
-                        else:
-                            log.warning(f"  CRISPR BOLTZ2_REJECT on-chain call failed — will retry next poll")
-                        append_audit({
-                            "ts":               datetime.now(timezone.utc).isoformat(),
-                            "submission_pubkey": pubkey,
-                            "miner_wallet":     miner_wallet,
-                            "miner_gpu":        submission_gpu,
-                            "claimed_score":    claimed,
-                            "rescored":         None,
-                            "decision":         "BOLTZ2_FAILED" if not tx else "BOLTZ2_REJECT",
-                            "rel_err":          None,
-                            "tx":               tx,
-                        })
-                    continue
-
-                combined   = grna_scores.get("combined", 0.0)   # telemetry only — no longer a gate
-                # Stage-3: validate_crispr()
-                _crispr_tgt_name = _CRISPR_ID_TO_NAME.get(target_id_int, target.get("id", "") or "")
-
-                vc = validate_crispr(
-                    grna_seq=smiles,
-                    target={**target, "id": _crispr_tgt_name},
-                    claimed=claimed,
-                    gpu_model=submission_gpu,
-                    bias_tracker=_gpu_bias_tracker,
-                )
-                # Charge a rate-limit slot only if Boltz2 actually produced a score.
-                if vc["rescored"] is not None:
-                    _rate_limit_commit("CRISPR")
-                rescored         = vc["rescored"] if vc["rescored"] is not None else rescored
-                rel_err          = vc["rel_err"] or 0.0
-                within_tol       = vc["within_tol"]   # Boltz2 tolerance is the sole gate
-                verdict          = "CONFIRM" if within_tol else "REJECT"
-                _crispr_tol      = CRISPR_TOL
-                adjusted_claimed = claimed
-
-                if vc["verdict"] == "VALIDATOR_ERROR":
-                    _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                    continue
-
-                TIER_REWARDS = BASE_TIER_REWARDS
-                difficulty   = target.get("difficulty_tier", 3)
-                current_epoch = fetch_current_epoch()
-                tier_reward  = _halved_reward(TIER_REWARDS.get(difficulty, 7), current_epoch)
-                log.info(f"  [CRISPR] reward: base={TIER_REWARDS.get(difficulty,7)} epoch={current_epoch} halvings={current_epoch//HALVING_INTERVAL} → {tier_reward} $LIFE")
-
-                # ── Similarity-based reward decay (mirrors miner, deployed 2026-09-02) ──
-                grna_reward_factor, grna_max_sim = _grna_similarity_reward_factor(
-                    smiles, target_id_int
-                )
-                effective_reward = int(tier_reward * grna_reward_factor)
-                log.info(
-                    f"  [GRNA-DECAY] target={target_id_int}  gRNA={smiles[:16]}…"
-                    f"  history_size={len(_CRISPR_GRNA_HISTORY.get(target_id_int, []))}"
-                    f"  max_sim={grna_max_sim:.3f}  factor={grna_reward_factor}x"
-                    f"  tier_reward={tier_reward} → effective_reward={effective_reward}"
-                )
-
-                # Commission = (miner_amount/20)/confirming_count  [mint_reward.rs]
-                # grna_reward_factor (novelty decay) applies to the MINER reward only.
-                commission = _validator_commission(difficulty_tier=difficulty,
-                                                   total_minted_raw=0,
-                                                   hit_count=0)
-                result = validate_on_chain(pubkey, rescored)
-                tx = result.get("tx") if result else None
-                if tx:
-                    log.info(f"  ✔ tx: {tx}")
-                    if within_tol:
-                        append_crank_queue(pubkey)
-                        life_earned += commission
-                        log.info(
-                            f"  +{commission:.4f} $LIFE commission"
-                            f"  (tier={difficulty}, formula={ONCHAIN_MINER_BASE.get(difficulty,1)}/20/{_VALIDATORS_REQUIRED})"
-                            f"  total={life_earned:.4f}"
-                            f"  [miner grna_decay={grna_reward_factor:.2f}x — not applied to validator]"
-                        )
-                        # Register gRNA in history so subsequent submissions are compared against it
-                        grna_upper = smiles.upper().strip()
-                        if len(grna_upper) == 20 and grna_upper not in _CRISPR_GRNA_HISTORY.get(target_id_int, []):
-                            _CRISPR_GRNA_HISTORY.setdefault(target_id_int, []).append(grna_upper)
-                    _SEEN_SUBMISSIONS.pop(pubkey, None)
-                else:
-                    log.warning(f"  validate_on_chain returned no tx")
-                    _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-
-                validated_today += 1
-                if within_tol:
-                    accepted += 1
-                else:
-                    rejected += 1
-
-                crispr_audit_decision = verdict if tx else f"{verdict}_TX_FAILED"
-                append_audit({
-                    "ts":               datetime.now(timezone.utc).isoformat(),
-                    "submission_pubkey": pubkey,
-                    "miner_wallet":     miner_wallet,
-                    "miner_gpu":        submission_gpu,
-                    "claimed_score":    claimed,
-                    "rescored":         rescored,
-                    "decision":         crispr_audit_decision,
-                    "rel_err":          round(rel_err, 4),
-                    "tolerance_used":   _crispr_tol,
-                    "bias_factor_used": None,  # bias not applied for CRISPR
-                    "bias_factor":      None,  # alias — keep both names in sync
-                    "adjusted_claimed": round(adjusted_claimed, 4),
-                    "difficulty_tier":  difficulty,
-                    "target_type":      "CRISPR",
-                    "life_earned":      round(commission, 6) if (within_tol and tx) else 0,
-                    "grna_on_target":   grna_scores.get("on_target"),
-                    "grna_off_target":  grna_scores.get("off_target"),
-                    "grna_delivery":    grna_scores.get("delivery"),
-                    "grna_combined":    combined,
-                    "smiles":           smiles,        # gRNA sequence stored in smiles field
-                    "target_id":        target_id_int,
-                    "grna_reward_factor": grna_reward_factor,
-                    "grna_max_sim":       round(grna_max_sim, 4),
-                })
-                append_log({
-                    "ts":               datetime.now(timezone.utc).isoformat(),
-                    "pubkey":           pubkey,
-                    "smiles":           smiles,
-                    "grna_seq":         smiles,            # gRNA sequence is stored in smiles field
-                    "target_id":        target_id_int,
-                    "claimed":          claimed,
-                    "rescored":         rescored,
-                    "rel_err":          round(rel_err, 4),
-                    "within_tolerance": within_tol,
-                    "verdict":          verdict,
-                    "tx":               tx,
-                    "elapsed_s":        round(elapsed, 3),
-                    "difficulty_tier":  difficulty,
-                    "target_type":      "CRISPR",
-                    "grna_combined":    combined,
-                    "life_earned":      round(commission, 6) if (within_tol and tx) else 0,
-                })
-                stats.update({
-                    "validated_today": validated_today,
-                    "confirmed":       accepted,
-                    "rejected":        rejected,
-                    "accept_rate":     round(accepted / max(validated_today, 1) * 100, 1),
-                    "life_commission": life_earned,
-                    "last_heartbeat":  datetime.now(timezone.utc).isoformat(),
-                    "current_target":  None,
-                    "current_smiles":  None,
-                    "last_updated":    datetime.now(timezone.utc).isoformat(),
-                    "gpu_model":       _miner_gpu_model,
-                    "gpu_bias":        _gpu_bias_tracker.summary() if _gpu_bias_tracker else {},
-                })
-                write_stats(stats)
-                continue   # done with this CRISPR submission — skip Boltz2 path
-
-            # Step 2 + 3 + 4: modality dispatch — each function owns its own Boltz2 call
-            # (validate_protein and validate_mrna both call Boltz2 internally,
-            # so we no longer run a separate top-level run_boltz2 here)
-            _seed = sub.get("boltz_seed", BOLTZ_SEED)
-            t0 = time.time()
-            rescored = None   # will be set by the modality function below
-            if not is_mrna:
-                vp = validate_protein(
-                    smiles=smiles,
-                    target=target,
-                    claimed=claimed,
-                    seed=_seed,
-                    gpu_model=submission_gpu,
-                    bias_tracker=_gpu_bias_tracker,
-                )
-                rescored       = vp["rescored"] if vp["rescored"] is not None else rescored
-                adjusted_claimed = vp["adjusted_claimed"]
-                bias_factor    = vp["bias_factor"]
-                tol            = vp["tol"]
-                rel_err        = vp["rel_err"] if vp["rel_err"] is not None else 0.0
-                within_tol     = vp["within_tol"]
-                verdict        = vp["verdict"]
-                if verdict == "VALIDATOR_ERROR":
-                    # Sanity gate or Boltz2 failure — skip on-chain, mark for retry
-                    _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                    append_audit({
-                        "ts":               datetime.now(timezone.utc).isoformat(),
-                        "submission_pubkey": pubkey,
-                        "miner_wallet":     miner_wallet,
-                        "miner_gpu":        submission_gpu,
-                        "claimed_score":    claimed,
-                        "adjusted_claimed": adjusted_claimed,
-                        "bias_factor":      bias_factor,
-                        "bias_factor_used": bias_factor,  # alias — see main audit writer
-                        "rescored":         rescored,
-                        "decision":         "VALIDATOR_ERROR",
-                        "rel_err":          rel_err,
-                        "tolerance_used":   tol,
-                        "difficulty_tier":  target.get("difficulty_tier", 1),
-                        "target_type":      "PROTEIN",
-                        "life_earned":      0,
-                        "sanity_note":      vp.get("sanity_note", ""),
-                    })
-                    continue
-            else:
-                # Stage 2: validate_mrna() — Option C ramp-up
-                vm = validate_mrna(
-                    smiles=smiles,
-                    target=target,
-                    claimed=claimed,
-                    seed=_seed,
-                    gpu_model=submission_gpu,
-                    bias_tracker=_gpu_bias_tracker,
-                )
-                rescored         = vm["rescored"] if vm["rescored"] is not None else rescored
-                adjusted_claimed = vm["adjusted_claimed"]
-                bias_factor      = vm["bias_factor"]
-                tol              = vm["tol"]
-                rel_err          = vm["rel_err"] if vm["rel_err"] is not None else 0.0
-                within_tol       = vm["within_tol"]
-                verdict          = vm["verdict"]
-                if verdict == "VALIDATOR_ERROR":
-                    _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                    append_audit({
-                        "ts":               datetime.now(timezone.utc).isoformat(),
-                        "submission_pubkey": pubkey,
-                        "miner_wallet":     miner_wallet,
-                        "miner_gpu":        submission_gpu,
-                        "claimed_score":    claimed,
-                        "adjusted_claimed": adjusted_claimed,
-                        "bias_factor":      bias_factor,
-                        "bias_factor_used": bias_factor,  # alias — see main audit writer
-                        "rescored":         rescored,
-                        "decision":         "VALIDATOR_ERROR",
-                        "rel_err":          rel_err,
-                        "tolerance_used":   tol,
-                        "difficulty_tier":  target.get("difficulty_tier", 3),
-                        "target_type":      "RNA",
-                        "life_earned":      0,
-                        "sanity_note":      vm.get("sanity_note", ""),
-                    })
-                    continue
-
-            # Real scoring work completed for this item — charge one slot now.
-            if rescored is not None:
-                _rate_limit_commit("mRNA" if is_mrna else "PROTEIN")
-
-            # ── Validator commission — exact on-chain formula from mint_reward.rs ──
-            # commission = (miner_amount / 20) / confirming_count
-            # miner_amount = calculate_reward(base, total_minted, hit_count)
-            # At devnet launch: total_minted ≈ 0 (L1=100%), hit_count ≈ 0 (L2=100%)
-            # → commission = ONCHAIN_MINER_BASE[tier] / 20 / _VALIDATORS_REQUIRED
-            difficulty = target.get("difficulty_tier", 1)
-            commission = _validator_commission(difficulty_tier=difficulty,
-                                               total_minted_raw=0,
-                                               hit_count=0)
-            miner_base = ONCHAIN_MINER_BASE.get(difficulty, 1)
-            log.info(
-                f"  commission: miner_base={miner_base} LIFE"
-                f"  → {miner_base}/20/{_VALIDATORS_REQUIRED} = {commission:.4f} $LIFE/validator"
-            )
-
-            elapsed = time.time() - t0
-
-            # Step 4: Submit on-chain
-            unwinnable = False   # set when a failure is provably un-retryable
-            result = validate_on_chain(pubkey, rescored or 0.0)
-            tx = result.get("tx") if result else None
-            if tx:
-                log.info(f"  ✔ tx: {tx}")
-                if within_tol:
-                    append_crank_queue(pubkey)
-                    life_earned += commission
-                    log.info(
-                        f"  +{commission:.4f} $LIFE commission  (tier={difficulty})  "
-                        f"total={life_earned:.4f}"
-                    )
-                # Tx landed — account will flip to Validating; remove from retry
-                # tracker so we don't needlessly hold the pubkey in memory forever.
-                _SEEN_SUBMISSIONS.pop(pubkey, None)
-            else:
-                log.warning(f"  validate_on_chain returned no tx")
-                # Classify the failure instead of blindly counting it.  If a
-                # ValidationRecord now exists, this validator has already voted
-                # and no retry can ever succeed → pin above the cap (permanent
-                # skip) rather than burning two more attempts to learn nothing.
-                if _validation_record_exists(pubkey):
-                    log.info(
-                        f"  [VR-PRECHECK] {pubkey[:16]}…: tx failed because a "
-                        f"ValidationRecord already exists — unwinnable, permanent skip"
-                    )
-                    _SEEN_SUBMISSIONS[pubkey] = _MAX_RETRY_ATTEMPTS + 1
-                    unwinnable = True
-                else:
-                    # Genuinely transient (RPC 429, blockhash expiry, node hiccup).
-                    _SEEN_SUBMISSIONS[pubkey] = _SEEN_SUBMISSIONS.get(pubkey, 0) + 1
-                    attempt_n = _SEEN_SUBMISSIONS[pubkey]
-                    if attempt_n < _MAX_RETRY_ATTEMPTS:
-                        log.info(
-                            f"  {pubkey[:16]}…: attempt {attempt_n}/{_MAX_RETRY_ATTEMPTS} "
-                            f"— will retry up to {_MAX_RETRY_ATTEMPTS - attempt_n} more time(s)"
-                        )
-                    else:
-                        log.info(f"  {pubkey[:16]}…: max retries reached — will skip next polls")
-
-            # Count every verdict (confirm or reject), regardless of tx success
-            validated_today += 1
-            if within_tol:
-                accepted += 1
-            else:
-                rejected += 1
-
-            # ── Audit log (every decision) ────────────────────────────────────
-            # Use CONFIRM/REJECT only when the tx actually landed on-chain.
-            # When the on-chain call fails the account stays Pending and will
-            # re-appear in future polls; recording CONFIRM/REJECT here would
-            # cause _load_seen_from_audit() on restart to mark the submission
-            # at max-attempts and block it permanently despite no tx landing.
-            if tx:
-                audit_decision = verdict
-            elif unwinnable:
-                # Distinct from *_TX_FAILED: structurally unwinnable, never retried.
-                audit_decision = "ALREADY_VOTED"
-            else:
-                audit_decision = f"{verdict}_TX_FAILED"
-            append_audit({
-                "ts":               datetime.now(timezone.utc).isoformat(),
-                "submission_pubkey": pubkey,
-                "miner_wallet":     miner_wallet,
-                "miner_gpu":        submission_gpu,
-                "claimed_score":    claimed,
-                "adjusted_claimed": round(adjusted_claimed, 4),
-                "bias_factor":      round(bias_factor, 4) if bias_factor is not None else None,
-                # Emit BOTH key names. The CRISPR writers use "bias_factor_used"
-                # while the protein/mRNA writers historically used only
-                # "bias_factor", so any cross-modality query on one name silently
-                # returned null for the other's rows (observed 2026-09-16:
-                # 2,415 PROTEIN + 7,791 RNA rows invisible to a
-                # "bias_factor_used" query). Keep both in sync here.
-                "bias_factor_used": round(bias_factor, 4) if bias_factor is not None else None,
-                "rescored":         rescored,
-                "decision":         audit_decision,
-                "rel_err":          round(rel_err, 4),
-                "tolerance_used":   round(tol, 4),
-                "difficulty_tier":  difficulty,
-                "target_type":      "CRISPR" if is_crispr else ("RNA" if is_mrna else "PROTEIN"),
-                "life_earned":      round(commission, 6) if (within_tol and tx) else 0,
-            })
-
-            append_log({
-                "ts":               datetime.now(timezone.utc).isoformat(),
-                "pubkey":           pubkey,
-                "smiles":           smiles,
-                "target_id":        target_id_int,
-                "claimed":          claimed,
-                "rescored":         rescored,
-                "rel_err":          round(rel_err, 4),
-                "within_tolerance": within_tol,
-                "verdict":          verdict,
-                "tx":               tx,
-                "elapsed_s":        round(elapsed, 1),
-                "difficulty_tier":  difficulty,
-                "target_type":      "CRISPR" if is_crispr else ("RNA" if is_mrna else "PROTEIN"),
-                "life_earned":      round(commission, 6) if (within_tol and tx) else 0,
-            })
-
-            # Write stats immediately after each validation so dashboard is live
-            stats.update({
-                "validated_today": validated_today,
-                "confirmed":       accepted,
-                "rejected":        rejected,
-                "accept_rate":     round(accepted / max(validated_today, 1) * 100, 1),
-                "life_commission": life_earned,
-                "last_heartbeat":  datetime.now(timezone.utc).isoformat(),
-                "current_target":  None,
-                "current_smiles":  None,
-                "last_updated":    datetime.now(timezone.utc).isoformat(),
-                "gpu_model":       _miner_gpu_model,
-                "gpu_bias":        _gpu_bias_tracker.summary() if _gpu_bias_tracker else {},
-            })
-            write_stats(stats)
-
-        accept_rate = round(accepted / max(validated_today, 1) * 100, 1)
-        net_info = fetch_network_validator_info()
-        stats.update({
-            "status":          "ONLINE",
-            "validated_today": validated_today,
-            "confirmed":       accepted,
-            "rejected":        rejected,
-            "accept_rate":     accept_rate,
-            "life_commission": life_earned,
-            "last_heartbeat":  datetime.now(timezone.utc).isoformat(),
-            "current_target":  None,
-            "current_smiles":  None,
-            "active_validators":   net_info.get("active_validators", 0),
-            "self_reputation_pct": round(net_info.get("self_reputation_bps", 10000) / 100, 1),
-            "last_updated":    datetime.now(timezone.utc).isoformat(),
-            "gpu_model":       _miner_gpu_model,
-            "gpu_bias":        _gpu_bias_tracker.summary() if _gpu_bias_tracker else {},
-        })
-        write_stats(stats)
-        log.info(f"Validated={validated_today}  Accept={accept_rate}%  $LIFE={life_earned:.1f}  Validators={net_info.get('active_validators',0)}")
-        # No sleep — loop back immediately to queue.get(timeout=10)
+                    metrics.update(json.loads(fp.read_text()))
+                except Exception as e:
+                    log.warning("  could not parse %s: %s", fp.name, e)
+            return metrics
 
 
 if __name__ == "__main__":

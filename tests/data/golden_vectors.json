@@ -1,0 +1,466 @@
+{
+  "_source": "stored pm2 life-validator-error.log runs \u2014 NO GPU was used to build these",
+  "_excluded": "35 mRNA rows 2026-09-04T15:27-15:55 used the legacy -prob*30 formula",
+  "_affinity_tolerance": 0.05,
+  "formulas": {
+    "protein": "round(1.364247*(pred-6.0),3)",
+    "mrna_affinity": "round(-((prob-pred)/ha)*30.0,3)",
+    "crispr_structure": "round(-6.0-3.0*iptm,4)"
+  },
+  "protein": [
+    {
+      "pred": -4.505,
+      "expected": -14.331
+    },
+    {
+      "pred": -4.392,
+      "expected": -14.177
+    },
+    {
+      "pred": -4.3157,
+      "expected": -14.073
+    },
+    {
+      "pred": -3.6712,
+      "expected": -13.194
+    },
+    {
+      "pred": -3.6222,
+      "expected": -13.127
+    },
+    {
+      "pred": -3.3973,
+      "expected": -12.82
+    },
+    {
+      "pred": -3.2446,
+      "expected": -12.612
+    },
+    {
+      "pred": -3.1486,
+      "expected": -12.481
+    },
+    {
+      "pred": -1.7136,
+      "expected": -10.523
+    },
+    {
+      "pred": -1.656,
+      "expected": -10.445
+    },
+    {
+      "pred": -1.6218,
+      "expected": -10.398
+    },
+    {
+      "pred": -1.531,
+      "expected": -10.274
+    },
+    {
+      "pred": -1.485,
+      "expected": -10.211
+    },
+    {
+      "pred": -1.4485,
+      "expected": -10.162
+    },
+    {
+      "pred": -1.3928,
+      "expected": -10.086
+    },
+    {
+      "pred": -1.2813,
+      "expected": -9.933
+    },
+    {
+      "pred": -1.0557,
+      "expected": -9.626
+    },
+    {
+      "pred": -1.019,
+      "expected": -9.576
+    },
+    {
+      "pred": -0.5732,
+      "expected": -8.967
+    },
+    {
+      "pred": -0.5341,
+      "expected": -8.914
+    },
+    {
+      "pred": -0.4433,
+      "expected": -8.79
+    },
+    {
+      "pred": 0.0621,
+      "expected": -8.101
+    },
+    {
+      "pred": 0.1027,
+      "expected": -8.045
+    },
+    {
+      "pred": 0.1475,
+      "expected": -7.984
+    },
+    {
+      "pred": 0.2271,
+      "expected": -7.876
+    },
+    {
+      "pred": 0.3273,
+      "expected": -7.739
+    },
+    {
+      "pred": 0.7629,
+      "expected": -7.145
+    },
+    {
+      "pred": 0.8168,
+      "expected": -7.071
+    },
+    {
+      "pred": 0.8876,
+      "expected": -6.975
+    },
+    {
+      "pred": 2.535,
+      "expected": -4.727
+    }
+  ],
+  "mrna": [
+    {
+      "prob": 0.9989,
+      "pred": -3.0515,
+      "ha": 16,
+      "expected": -7.595
+    },
+    {
+      "prob": 0.9012,
+      "pred": -2.5234,
+      "ha": 20,
+      "expected": -5.137
+    },
+    {
+      "prob": 0.9563,
+      "pred": -1.7838,
+      "ha": 17,
+      "expected": -4.835
+    },
+    {
+      "prob": 0.9549,
+      "pred": -2.0126,
+      "ha": 20,
+      "expected": -4.451
+    },
+    {
+      "prob": 0.9965,
+      "pred": -2.5682,
+      "ha": 26,
+      "expected": -4.113
+    },
+    {
+      "prob": 0.9279,
+      "pred": -1.6576,
+      "ha": 22,
+      "expected": -3.526
+    },
+    {
+      "prob": 0.9839,
+      "pred": -2.9683,
+      "ha": 37,
+      "expected": -3.204
+    },
+    {
+      "prob": 0.9226,
+      "pred": -3.14,
+      "ha": 42,
+      "expected": -2.902
+    },
+    {
+      "prob": 0.7771,
+      "pred": -0.9052,
+      "ha": 19,
+      "expected": -2.656
+    },
+    {
+      "prob": 0.9593,
+      "pred": -0.5991,
+      "ha": 19,
+      "expected": -2.461
+    },
+    {
+      "prob": 0.4391,
+      "pred": -0.468,
+      "ha": 15,
+      "expected": -1.814
+    },
+    {
+      "prob": 0.657,
+      "pred": -0.5502,
+      "ha": 26,
+      "expected": -1.393
+    },
+    {
+      "prob": 0.3699,
+      "pred": -1.3414,
+      "ha": 41,
+      "expected": -1.252
+    },
+    {
+      "prob": 0.1662,
+      "pred": -1.3538,
+      "ha": 41,
+      "expected": -1.112
+    },
+    {
+      "prob": 0.4441,
+      "pred": -0.4049,
+      "ha": 26,
+      "expected": -0.98
+    },
+    {
+      "prob": 0.0807,
+      "pred": -1.0839,
+      "ha": 41,
+      "expected": -0.852
+    },
+    {
+      "prob": 0.5427,
+      "pred": -0.1395,
+      "ha": 40,
+      "expected": -0.512
+    },
+    {
+      "prob": 0.3834,
+      "pred": 0.2138,
+      "ha": 40,
+      "expected": -0.127
+    },
+    {
+      "prob": 0.143,
+      "pred": 0.2152,
+      "ha": 33,
+      "expected": 0.066
+    },
+    {
+      "prob": 0.1407,
+      "pred": 0.257,
+      "ha": 33,
+      "expected": 0.106
+    },
+    {
+      "prob": 0.1407,
+      "pred": 0.2731,
+      "ha": 33,
+      "expected": 0.12
+    },
+    {
+      "prob": 0.1428,
+      "pred": 0.2873,
+      "ha": 33,
+      "expected": 0.131
+    },
+    {
+      "prob": 0.1425,
+      "pred": 0.3008,
+      "ha": 33,
+      "expected": 0.144
+    },
+    {
+      "prob": 0.1405,
+      "pred": 0.312,
+      "ha": 33,
+      "expected": 0.156
+    },
+    {
+      "prob": 0.1456,
+      "pred": 0.334,
+      "ha": 33,
+      "expected": 0.171
+    },
+    {
+      "prob": 0.1462,
+      "pred": 0.3769,
+      "ha": 33,
+      "expected": 0.21
+    },
+    {
+      "prob": 0.1624,
+      "pred": 0.4144,
+      "ha": 12,
+      "expected": 0.63
+    },
+    {
+      "prob": 0.3218,
+      "pred": 1.2606,
+      "ha": 20,
+      "expected": 1.408
+    },
+    {
+      "prob": 0.4698,
+      "pred": 1.5658,
+      "ha": 15,
+      "expected": 2.192
+    },
+    {
+      "prob": 0.3727,
+      "pred": 3.9494,
+      "ha": 10,
+      "expected": 10.73
+    }
+  ],
+  "crispr": [
+    {
+      "grna_prefix": "CGTGCTGCACCTGACG",
+      "iptm": 0.9186,
+      "expected": -8.7559
+    },
+    {
+      "grna_prefix": "GATTCAGGGAGCCGCG",
+      "iptm": 0.8522,
+      "expected": -8.5565
+    },
+    {
+      "grna_prefix": "GCTTCCCGTCGCTATC",
+      "iptm": 0.8371,
+      "expected": -8.5113
+    },
+    {
+      "grna_prefix": "ACCTCAGGGAGCCGCG",
+      "iptm": 0.8252,
+      "expected": -8.4756
+    },
+    {
+      "grna_prefix": "GACCCAGTTCCTTACG",
+      "iptm": 0.8132,
+      "expected": -8.4397
+    },
+    {
+      "grna_prefix": "ACACTCCAAGGACTAT",
+      "iptm": 0.7912,
+      "expected": -8.3737
+    },
+    {
+      "grna_prefix": "TTGGAGCTGGTGGCGT",
+      "iptm": 0.7039,
+      "expected": -8.1118
+    },
+    {
+      "grna_prefix": "GGAGGCACCTGCCTAC",
+      "iptm": 0.6484,
+      "expected": -7.9453
+    },
+    {
+      "grna_prefix": "ACCAGAGACATGCCCA",
+      "iptm": 0.6142,
+      "expected": -7.8425
+    },
+    {
+      "grna_prefix": "GGGGCCCTGGAGCCCT",
+      "iptm": 0.5831,
+      "expected": -7.7493
+    },
+    {
+      "grna_prefix": "CGCGCAAATGCGAGCT",
+      "iptm": 0.5535,
+      "expected": -7.6606
+    },
+    {
+      "grna_prefix": "CCCGTCGCTATCAAGG",
+      "iptm": 0.5303,
+      "expected": -7.5909
+    },
+    {
+      "grna_prefix": "GACCAGAGACATGCCC",
+      "iptm": 0.5081,
+      "expected": -7.5243
+    },
+    {
+      "grna_prefix": "GATATAAACTTGTGGT",
+      "iptm": 0.4885,
+      "expected": -7.4656
+    },
+    {
+      "grna_prefix": "TAGAGGCCCCGGCCTG",
+      "iptm": 0.4679,
+      "expected": -7.4037
+    },
+    {
+      "grna_prefix": "GTTGGAGCTGGTGGCG",
+      "iptm": 0.4494,
+      "expected": -7.3481
+    },
+    {
+      "grna_prefix": "CAGCTGCACCTGACGC",
+      "iptm": 0.4328,
+      "expected": -7.2984
+    },
+    {
+      "grna_prefix": "CTTTCCCGTCGCTATC",
+      "iptm": 0.417,
+      "expected": -7.2511
+    },
+    {
+      "grna_prefix": "CAGCATCTCCGAAAGC",
+      "iptm": 0.399,
+      "expected": -7.1971
+    },
+    {
+      "grna_prefix": "CACCTGCCTACGGGAT",
+      "iptm": 0.3827,
+      "expected": -7.1482
+    },
+    {
+      "grna_prefix": "GGATGACTGAGTACCT",
+      "iptm": 0.3656,
+      "expected": -7.0969
+    },
+    {
+      "grna_prefix": "CCCCGGCCTGGGAGCA",
+      "iptm": 0.35,
+      "expected": -7.05
+    },
+    {
+      "grna_prefix": "CTTCAGGGAAATGCCT",
+      "iptm": 0.3347,
+      "expected": -7.0041
+    },
+    {
+      "grna_prefix": "TCGTATCCTGAGCAGA",
+      "iptm": 0.3188,
+      "expected": -6.9565
+    },
+    {
+      "grna_prefix": "CTATCTACAGAGCCCA",
+      "iptm": 0.3026,
+      "expected": -6.9077
+    },
+    {
+      "grna_prefix": "GCCGCCTCGCTGCAGG",
+      "iptm": 0.2866,
+      "expected": -6.8598
+    },
+    {
+      "grna_prefix": "GTCTTCAAGTCCTACG",
+      "iptm": 0.2693,
+      "expected": -6.808
+    },
+    {
+      "grna_prefix": "TTCATGGCCTTGGAGT",
+      "iptm": 0.249,
+      "expected": -6.7471
+    },
+    {
+      "grna_prefix": "AATGCGAGCTTCGAGT",
+      "iptm": 0.2255,
+      "expected": -6.6764
+    },
+    {
+      "grna_prefix": "AGTTCATGGCCTTGGA",
+      "iptm": 0.1594,
+      "expected": -6.4782
+    }
+  ]
+}
