@@ -198,6 +198,53 @@ All settings have sensible defaults. See `.env.example` for the full list.
 
 ---
 
+## Payout batch checker — daily run
+
+The payout checker verifies a day's payout batch independently and signs it
+only if it is accepted. It is a separate command from the validator daemon and
+touches no verdict path.
+
+```bash
+# Required: the payout key is SEPARATE from the validator's verdict key.
+# The command refuses to start if PAYOUT_KEYPAIR is unset, or if its public
+# key equals VALIDATOR_KEYPAIR's.  It never creates or rotates a key.
+export PAYOUT_KEYPAIR=/secure/payout_key.json
+export VALIDATOR_KEYPAIR=/secure/validator_key.json
+export PROGRAM_ID=BU7WVCvy9CqypB7Hqhw6RJakAeSieVsWNapytQpFgi18
+export LIFE_MINT=CVDFLCAjXhVWiPXH9nTCTpCgVzmDVoiPzNJYuccr1dqB
+export TARGETS_TABLE=/path/to/targets_table.json   # SHA-verified (§12)
+export PAYOUT_ANCHORS=/path/to/anchors.json        # day -> anchored logHash (§9)
+export PAYOUT_STATE_DIR=/var/lib/life/payout_state # the replay ledger
+
+# Write the signature file only (does NOT contact the signature route):
+python -m payout.cli sign \
+  --coordinator https://api.example.org \
+  --day 20002 \
+  --out /var/lib/life/signatures/day_20002.json
+
+# Same, and submit it to POST /payout/{day}/signature:
+python -m payout.cli sign --coordinator https://api.example.org \
+  --day 20002 --out /var/lib/life/signatures/day_20002.json --post
+```
+
+Exit codes: `0` accepted and signed, `2` refused (no file written — the first
+failing rule is printed to stdout), `3` refused to start (bad configuration).
+
+What it does before signing, in order (BATCH_SPEC §C5r.3):
+
+1. Requires `GET /log/{day}` to say `closed: true` **explicitly** — for the
+   batch day and every day of the §6a replay range. A missing `closed` key is
+   refused, not assumed.
+2. Fetches `GET /payout/{day}` and takes the batch out of the envelope.
+3. Recomputes every batch hash from the canonical log and applies all §5.0
+   rules in order; the hash the envelope advertises is never trusted.
+4. Signs the raw 32 bytes of each chunk's batch hash, and never signs a
+   `batchId` that the ledger has already signed.
+
+A refused batch writes no file. Run it once per closed day, after day-close.
+
+---
+
 ## Related Repos
 
 - [life-compute/miner](https://github.com/life-compute/miner) — GPU miner

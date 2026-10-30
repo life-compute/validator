@@ -111,6 +111,15 @@ class PayoutSigner:
         """Base58 payout public key.  Safe to log."""
         return str(self._kp.pubkey())
 
+    @property
+    def pubkey_hex(self) -> str:
+        """Hex payout public key — the `signerPubkeyHex` of §C5r.1.
+
+        The signature file uses HEX, not base58 (API_CONTRACT §C5r.1).
+        Public key only; no secret material.  Safe to log.
+        """
+        return bytes(self._kp.pubkey()).hex()
+
     # ── signing ─────────────────────────────────────────────────────────────
     def sign_batch_hash(self, batch_hash: bytes) -> str:
         """§8: sign the 32 RAW bytes of SHA-256(preimage). Returns hex (128 chars)."""

@@ -287,11 +287,21 @@ class DayLog:
 
 
 class LogSource:
-    """HTTP reader for the public log.  No auth: the routes are public."""
+    """HTTP reader for the public log.  No auth: the routes are public.
 
-    def __init__(self, base_url: str, timeout: float = 15.0):
+    `strict_closed` implements the §C5r.3 / §C5r.1 day-close gate used by the
+    payout signing CLI: the manifest must say `closed: true` EXPLICITLY.  A
+    manifest that merely omits the key is refused, because "not stated" is
+    not a proof of closure and an unclosed day's log can still change.  The
+    older callers keep the lenient behaviour (only an explicit `false` is an
+    open day) so existing verdicts do not move.
+    """
+
+    def __init__(self, base_url: str, timeout: float = 15.0,
+                 strict_closed: bool = False):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.strict_closed = bool(strict_closed)
 
     # ── transport ───────────────────────────────────────────────────────────
     def _get(self, path: str) -> bytes:
@@ -344,10 +354,17 @@ class LogSource:
         into the same DayNotClosed refusal.
         """
         manifest = self.log_manifest(day)
-        if manifest.get("closed") is False:
+        closed = manifest.get("closed")
+        if closed is False:
             raise DayNotClosed(
                 f"GET /log/{day_to_iso(day)} reports closed=false: day {day} "
                 f"is still open, so its canonical log is not final (§13.6)")
+        if self.strict_closed and closed is not True:
+            raise DayNotClosed(
+                f"GET /log/{day_to_iso(day)} does not state closed=true "
+                f"(closed={closed!r}): §C5r.3 requires the manifest to prove "
+                f"the day is closed EXPLICITLY before a payout signature; a "
+                f"missing `closed` key is not a proof of closure")
         raw = self.canonical_log_bytes(day)
         records: list[LogRecord] = []
         events: list[LogEvent] = []

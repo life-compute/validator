@@ -33,9 +33,13 @@ TAMPERED = FIXTURES / "tampered"
 TARGETS_TABLE = BUNDLE / "targets_table.json"
 
 VALID_DAYS = (20000, 20001, 20002)
+# The bundle's own open-day fixture (§13.6): closed:false, canonical -> 409.
+OPEN_DAY = 20003
 
 
 def day_dir(day: int) -> Path:
+    if int(day) == OPEN_DAY:
+        return FIXTURES / f"day_{OPEN_DAY}_open"
     return FIXTURES / f"day_{day}"
 
 
@@ -71,6 +75,17 @@ def anchored_hashes(days=VALID_DAYS) -> dict[int, str]:
             for d in days}
 
 
+def load_payout_envelope(day: int) -> dict:
+    """The bundle's `GET /payout/{day}` response fixture (§C5r.4 envelope)."""
+    return json.loads((day_dir(day) / "payout" / "batch.json").read_text())
+
+
+def load_online_signature_bytes(day: int) -> bytes:
+    """The bundle's sample online signature file, EXACT bytes."""
+    return (day_dir(day) / "payout" / "online_signature.json").read_bytes()
+
+
+
 def iso_for_day(day: int) -> str:
     return json.loads((day_dir(day) / "log_get_response.json").read_text())["day"]
 
@@ -87,8 +102,18 @@ class _State:
         # Days the archive refuses to serve at all (§6a replay gap).
         self.hidden_days: set[int] = set()
         # Days that are still OPEN (§13.6): /canonical -> 409, manifest ->
-        # closed:false.  A closed day is served normally.
-        self.open_days: set[int] = set()
+        # closed:false.  A closed day is served normally.  The bundle's own
+        # open-day fixture is open by definition.
+        self.open_days: set[int] = {OPEN_DAY} & set(self.days)
+        # ── C5p payout routes (§8.2 / §C5r) ────────────────────────────────
+        # day -> the GET /payout/{day} envelope actually served.  Defaults to
+        # the bundle's payout/batch.json fixture.
+        self.override_payout: dict[int, dict] = {}
+        # Days with no batch built yet -> 404.
+        self.no_payout_days: set[int] = set()
+        # Every POST /payout/{day}/signature received, as EXACT bytes.
+        self.posted_signatures: list[tuple[str, bytes]] = []
+        self.signature_status: int = 200
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -157,6 +182,51 @@ class _Handler(BaseHTTPRequestHandler):
                     raw = (day_dir(day) / "canonical_log.ndjson").read_bytes()
                 return self._send_bytes(200, raw, "application/x-ndjson")
 
+        # ── GET /payout/{YYYY-MM-DD} (§8.2) ────────────────────────────────
+        if len(parts) == 2 and parts[0] == "payout":
+            day = self.state.iso_to_day.get(parts[1])
+            if day is None or day in self.state.no_payout_days:
+                return self._send_json(404, {"error": "no batch for that day"})
+            env = self.state.override_payout.get(day)
+            if env is None:
+                env = load_payout_envelope(day)
+            body = json.dumps(env).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            etag = (env.get("chunks") or [{}])[0].get("batchHash", "")
+            self.send_header("ETag", f'"{etag}"')
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return self.wfile.write(body)
+
+        return self._send_json(404, {"error": "Not found"})
+
+    def do_POST(self):  # noqa: N802
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        self.state.request_log.append(f"POST {path}")
+
+        if self.state.offline or path in self.state.fail_paths:
+            return self._send_json(503, {"error": "Service Unavailable"})
+
+        parts = [p for p in path.split("/") if p]
+        # POST /payout/{YYYY-MM-DD}/signature (§C5r.1)
+        if len(parts) == 3 and parts[0] == "payout" and parts[2] == "signature":
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            # Record the EXACT bytes received, so a test can prove the file
+            # and the request body are identical.
+            self.state.posted_signatures.append((path, raw))
+            if self.state.signature_status != 200:
+                return self._send_json(self.state.signature_status,
+                                       {"error": "rejected"})
+            try:
+                obj = json.loads(raw)
+                ids = [c["batchId"] for c in obj["chunks"]]
+            except Exception:
+                return self._send_json(400, {"error": "malformed body"})
+            return self._send_json(200, {"accepted": ids, "rejected": []})
+
         return self._send_json(404, {"error": "Not found"})
 
 
@@ -199,6 +269,22 @@ class MockPayoutCoordinator:
 
     def close_day(self, day: int) -> None:
         self.state.open_days.discard(int(day))
+
+    # ── C5p payout routes ──────────────────────────────────────────────────
+    def set_payout(self, day: int, envelope: dict) -> None:
+        """Serve a different GET /payout/{day} envelope (post-fetch tamper)."""
+        self.state.override_payout[int(day)] = envelope
+
+    def drop_payout(self, day: int) -> None:
+        """No batch built for that day -> 404."""
+        self.state.no_payout_days.add(int(day))
+
+    def posted(self) -> list[tuple[str, bytes]]:
+        """Every (path, exact body bytes) received on the signature route."""
+        return list(self.state.posted_signatures)
+
+    def set_signature_status(self, status: int) -> None:
+        self.state.signature_status = int(status)
 
     def __enter__(self) -> "MockPayoutCoordinator":
         self.thread.start()
