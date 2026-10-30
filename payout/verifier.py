@@ -1,38 +1,45 @@
 """Verify a coordinator-supplied batch against an independent recomputation.
 
-Rules are evaluated in a FIXED PRECEDENCE and the first rule that fires names
-the refusal.  Precedence matters because a tampered batch usually violates
-several rules at once: the order below goes from "this batch is not even
-addressed to our chain" outward to per-entry arithmetic, so the reported rule
-is the most fundamental violation rather than an incidental downstream one.
+Rule order is NOT ours to choose.  BATCH_SPEC §5.0 ("Checker Rule Order")
+numbers the rules 1..17 and requires that a batch violating several of them is
+refused for the FIRST one, so that every independent implementation returns
+the same reason for the same bad batch.  RULE_PRECEDENCE below is that
+numbered list, transcribed in order; nothing is reordered on judgement.
 
-Precedence (BATCH_SPEC.md section in brackets):
-   1 wrong_program_id_or_mint     [§4, §16]  not our program/mint at all
-   2 chunk_above_entry_limit      [§5.4/§14] more than 4 wallet entries
-   3 batch_total_above_cap        [§5.3]     entry sum over CAP_PER_BATCH
-   4 total_above_day_cap          [§5.3]     declared/day total over CAP_PER_DAY
-   5 duplicate_recipient          [§4]       same wallet twice (on-chain reject)
-   6 sort_contract_violated       [§4]       entries not strictly ascending
-   7 inflated_amount              [§7]       entry total != sum(results[])
-   8 target_not_in_table          [§12]      target absent from targets table
-   9 no_wallet_first_seen         [§13.1]    wallet age unprovable
-  10 flagged_wallet_paid          [§13.2]    flagged with no later unflag
-  11 forfeited_wallet_paid         [§13.4]    permanent holdback forfeiture
-  12 held_wallet_paid              [§5.1.3]   still inside the 7-day holdback
+BATCH_SPEC §5.0, verbatim order:
+   1 program_id_or_mint       programId/lifeMint != configured values
+   2 batch_total_above_cap    totalRaw over CAP_PER_BATCH
+   3 chunk_above_entry_limit  entry count over MAX_BATCH_ENTRIES (4)
+   4 total_above_day_cap      day's accumulated total over CAP_PER_DAY
+   5 duplicate_recipient      two entries share a recipient
+   6 sort_contract_violated   entries not strictly ascending by pubkey bytes
+   7 inflated_amount          amountRaw != sum(results[*].amountRaw)
+   8 target_not_in_table      a result's target absent from targets_table.json
+   9 no_wallet_first_seen     recipient has no wallet_first_seen event
+  10 flagged_wallet_paid      wallet_flagged with no later wallet_unflagged
+  11 held_wallet_paid         first_seen within HOLDBACK_MS of nowMs
+  12 forfeited_wallet_paid    holdback_forfeit event present
+  13 no_confirmed_result      resultId has no confirmed verdict in the log
+  14 repeated_batch_id        batchId already recorded (BatchReplay / ledger)
+  15 log_hash_mismatch        batch.logHash != SHA-256(canonical log)
+  16 reward_mismatch          per-result amount != calcReward(base, hitsBefore)
+  17 total_mismatch           totalRaw != sum of entry amountRaw values
 
-  Forfeiture outranks holdback: a wallet inside its first week that was
-  forfeited is BOTH held and forfeited, and forfeiture is the permanent,
-  strictly stronger condition (§5.1.5), so it must name the refusal.
-  13 no_confirmed_result          [§9]       result_id absent from the log
-  14 repeated_batch_id            [§10]      batchId already signed by us
-  15 log_hash_mismatch            [§9]       batch.logHash != SHA-256(canonical)
-  16 anchor_hash_mismatch         [§9]       anchored hash != SHA-256(canonical)
-  17 reward_mismatch              [§6.1/6.2] per-result reward off the rules
-  18 validator_fee_mismatch       [§6.3]     fee != floor(reward*750/10000)
-  19 everything else (ordering, missing entries, totals, batch hash, replay)
+NOTE on 11 before 12 (changed this revision): the previous spec had no stated
+order and this checker ranked forfeiture above holdback, reasoning that
+forfeiture is permanent and therefore stronger.  §5.0 now says otherwise, and
+the spec wins.  The consequence is load-bearing and is NOT cosmetic: a wallet
+that is both held and forfeited now reports `held_wallet_paid`, so fixture 07
+(`forfeited_wallet_paid`) only reaches its published rule when the wallet has
+already matured out of holdback.  See CHECKER_NOW_MS in tests/conftest_payout.py.
+
+Codes with no §5.0 number (anchor_hash_mismatch, batch_hash_mismatch, the
+cross-chunk duplicate guards, …) are checks this checker makes beyond the
+spec's list.  They are ranked AFTER all 17 numbered rules so they can never
+pre-empt a spec-numbered reason, while still refusing the batch.
 
 A batch is signable only when NO rule fired.  Every finding is collected for
-the decision log; `primary_rule` is the highest-precedence one.
+the decision log; `primary_rule` is the first one in this order.
 """
 from __future__ import annotations
 
@@ -67,6 +74,7 @@ from .errors import (
     MISSING_PAYABLE_ENTRY,
     NO_CONFIRMED_RESULT,
     NO_WALLET_FIRST_SEEN,
+    OUT_OF_SCOPE_REWARD_PAID,
     RECIPIENT_NOT_IN_LOG,
     REPEATED_BATCH_ID,
     RESULT_ALREADY_PAID,
@@ -82,38 +90,46 @@ from .errors import (
 from .recompute import ComputedEntry, DayComputation
 from .sources import DayLog, Settings, TargetsTable, WalletFacts
 
-# The precedence order above, as data.  Lower index = reported first.
-RULE_PRECEDENCE = (
-    WRONG_PROGRAM_ID_OR_MINT,
-    CHUNK_ABOVE_ENTRY_LIMIT,
-    BATCH_TOTAL_ABOVE_CAP,
-    TOTAL_ABOVE_DAY_CAP,
-    DUPLICATE_RECIPIENT,
-    SORT_CONTRACT_VIOLATED,
-    INFLATED_AMOUNT,
-    TARGET_NOT_IN_TABLE,
-    NO_WALLET_FIRST_SEEN,
-    FLAGGED_WALLET_PAID,
-    FORFEITED_WALLET_PAID,
-    HELD_WALLET_PAID,
-    NO_CONFIRMED_RESULT,
-    REPEATED_BATCH_ID,
-    LOG_HASH_MISMATCH,
-    ANCHOR_HASH_MISMATCH,
-    REWARD_MISMATCH,
+# ── BATCH_SPEC §5.0, rules 1..17, transcribed in the spec's own order ───────
+SPEC_RULE_ORDER = (
+    WRONG_PROGRAM_ID_OR_MINT,    # 1  program_id_or_mint
+    BATCH_TOTAL_ABOVE_CAP,       # 2
+    CHUNK_ABOVE_ENTRY_LIMIT,     # 3
+    TOTAL_ABOVE_DAY_CAP,         # 4
+    DUPLICATE_RECIPIENT,         # 5
+    SORT_CONTRACT_VIOLATED,      # 6
+    INFLATED_AMOUNT,             # 7
+    TARGET_NOT_IN_TABLE,         # 8
+    NO_WALLET_FIRST_SEEN,        # 9
+    FLAGGED_WALLET_PAID,         # 10
+    HELD_WALLET_PAID,            # 11  (before 12 — the spec's order, not ours)
+    FORFEITED_WALLET_PAID,       # 12
+    NO_CONFIRMED_RESULT,         # 13
+    REPEATED_BATCH_ID,           # 14
+    LOG_HASH_MISMATCH,           # 15
+    REWARD_MISMATCH,             # 16
+    TOTAL_NOT_SUM_OF_ENTRIES,    # 17 total_mismatch
+)
+
+# Checks this checker makes beyond §5.0's list.  Ranked strictly after every
+# numbered rule so they refuse a batch without ever pre-empting a spec reason.
+EXTRA_RULE_ORDER = (
+    OUT_OF_SCOPE_REWARD_PAID,
     VALIDATOR_FEE_MISMATCH,
+    ANCHOR_HASH_MISMATCH,
     RECIPIENT_NOT_IN_LOG,
     DUPLICATE_RESULT_IN_BATCH,
     DUPLICATE_RESULT_ACROSS_CHUNKS,
     RESULT_ALREADY_PAID,
     MISSING_PAYABLE_ENTRY,
     DAILY_MINER_CAP_EXCEEDED,
-    TOTAL_NOT_SUM_OF_ENTRIES,
     BATCH_HASH_MISMATCH,
     BATCH_ID_MISMATCH,
     CHUNK_SEQUENCE_INVALID,
     LOG_INCONSISTENT,
 )
+
+RULE_PRECEDENCE = SPEC_RULE_ORDER + EXTRA_RULE_ORDER
 _RULE_RANK = {code: i for i, code in enumerate(RULE_PRECEDENCE)}
 
 
@@ -295,6 +311,15 @@ def verify_batch(
             amount = 0
         entry_sum += amount
 
+        # §6.1 / §10a — an ENTRY that pays an out-of-scope reward outright.
+        entry_oos = C.out_of_scope_reward(amount)
+        if entry_oos is not None:
+            findings.append(Finding(
+                OUT_OF_SCOPE_REWARD_PAID,
+                f"entry {recipient[:8]}…: amountRaw {amount} is the "
+                f"{entry_oos}, which is not payable via payout_batch "
+                f"(§6.1, §10a)", wallet=recipient))
+
         results = ent.get("results")
         results = results if isinstance(results, list) else []
 
@@ -343,6 +368,22 @@ def verify_batch(
                     f"target {target!r} is not present in targets_table.json — "
                     f"the builder must only pay for targets in the table (§12)",
                     rid, recipient))
+
+            # §6.1 / §10a — the reference reward and the weekly discovery
+            # bonus are NOT payable through payout_batch at all.  Neither
+            # appears in REWARD_BY_TIER, so a result paying either is refused
+            # on sight, whatever target it names.
+            r_amount_raw = _as_int(r.get("amountRaw"))
+            if r_amount_raw is not None:
+                oos = C.out_of_scope_reward(r_amount_raw)
+                if oos is not None:
+                    findings.append(Finding(
+                        OUT_OF_SCOPE_REWARD_PAID,
+                        f"result_id {rid}: amountRaw {r_amount_raw} is the "
+                        f"{oos}, which is out of scope for payout_batch — it "
+                        f"appears in no tier of REWARD_BY_TIER and is claimed "
+                        f"on-chain, never through this pipeline (§6.1, §10a)",
+                        rid, recipient))
 
             # §9 — the result must be a confirmed result in the canonical log.
             rec = log_by_id.get(rid)

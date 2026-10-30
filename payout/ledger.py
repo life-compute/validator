@@ -6,6 +6,11 @@ Two jobs:
   * audit trail — every decision is logged with the findings that produced it,
     including refusals.
 
+It also keeps the §6.2 taper baseline: for every day this checker signed, the
+per-target confirmed-hit counts IT derived from that day's canonical log.  The
+next day's taper is computed from those recorded counts plus the earlier days'
+logs, so the hit count never comes from the coordinator.
+
 Storage is a JSONL file plus a small JSON index, both under the service's
 state directory.  No secret material is ever written: signatures are public,
 keys are not stored.
@@ -36,10 +41,12 @@ class DecisionLedger:
                 if isinstance(obj, dict):
                     obj.setdefault("signed_batch_ids", [])
                     obj.setdefault("paid_result_ids", [])
+                    obj.setdefault("day_target_hits", {})
                     return obj
             except json.JSONDecodeError:
                 pass
-        return {"signed_batch_ids": [], "paid_result_ids": []}
+        return {"signed_batch_ids": [], "paid_result_ids": [],
+                "day_target_hits": {}}
 
     def _save_index(self) -> None:
         tmp = tempfile.NamedTemporaryFile(
@@ -66,6 +73,23 @@ class DecisionLedger:
     def was_signed(self, batch_id: int) -> bool:
         return int(batch_id) in self.signed_batch_ids
 
+    # ── §6.2 taper baseline ─────────────────────────────────────────────────
+    @property
+    def day_target_hits(self) -> dict[int, dict[str, int]]:
+        """day -> {target: confirmed hits}, as THIS checker counted them."""
+        return {int(d): {str(t): int(n) for t, n in counts.items()}
+                for d, counts in self._index.get("day_target_hits", {}).items()}
+
+    def target_hits_before(self, day: int) -> dict[str, int]:
+        """Confirmed hits per target recorded for all days before *day*."""
+        out: dict[str, int] = {}
+        for d, counts in self.day_target_hits.items():
+            if d >= int(day):
+                continue
+            for tgt, n in counts.items():
+                out[tgt] = out.get(tgt, 0) + n
+        return out
+
     # ── writes ──────────────────────────────────────────────────────────────
     def record_decision(self, record: dict[str, Any]) -> dict[str, Any]:
         entry = dict(record)
@@ -76,7 +100,9 @@ class DecisionLedger:
             os.fsync(fh.fileno())
         return entry
 
-    def mark_signed(self, batch_id: int, result_ids: list[int]) -> None:
+    def mark_signed(self, batch_id: int, result_ids: list[int],
+                    day: int | None = None,
+                    day_target_hits: dict[str, int] | None = None) -> None:
         signed = self.signed_batch_ids
         bid = int(batch_id)
         if bid in signed:
@@ -85,6 +111,11 @@ class DecisionLedger:
         self._index["signed_batch_ids"] = sorted(signed | {bid})
         self._index["paid_result_ids"] = sorted(
             self.paid_result_ids | {int(r) for r in result_ids})
+        # Record the day's own confirmed-hit counts so the next day's taper
+        # baseline survives a restart without re-reading every earlier log.
+        if day is not None and day_target_hits is not None:
+            self._index.setdefault("day_target_hits", {})[str(int(day))] = {
+                str(t): int(n) for t, n in day_target_hits.items()}
         self._save_index()
 
     # ── reads ───────────────────────────────────────────────────────────────

@@ -111,7 +111,10 @@ class PayoutSignerService:
         try:
             day_log, anchored = self._load_verified_day_log(day)
             history: list[DayLog] = []
-            for d in sorted(set(history_days) | {day}):
+            # §6.2: the taper baseline is derived from the canonical logs of
+            # EARLIER days only, taken in order.  A later day's log is not an
+            # earlier hit, so it is never fetched for this purpose.
+            for d in sorted({d for d in history_days if d < day} | {day}):
                 history.append(day_log if d == day
                                else self._load_verified_day_log(d)[0])
         except CoordinatorUnreachable as exc:
@@ -122,6 +125,7 @@ class PayoutSignerService:
         computation = compute_day(
             day_log, targets=self.targets, now_ms=now_ms, history=history,
             already_paid_result_ids=self.ledger.paid_result_ids,
+            recorded_day_hits=self.ledger.day_target_hits,
         )
 
         results = verify_day(
@@ -177,7 +181,9 @@ class PayoutSignerService:
             if all_ok and r.signable:
                 self.ledger.mark_signed(
                     b.batch_id,
-                    [rid for e in r.expected_entries for rid in e.result_ids])
+                    [rid for e in r.expected_entries for rid in e.result_ids],
+                    day=day,
+                    day_target_hits=computation.day_target_hits)
 
         return DayDecision(day=day, signed=all_ok, results=list(results),
                            signatures=signatures, summary=summary)

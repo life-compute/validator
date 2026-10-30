@@ -1,27 +1,22 @@
-"""C5b2 payout signer — verified against the c5b-bundle fixtures.
+"""C5b3 payout signer — verified against the c5b-bundle fixtures.
 
 Everything here runs against the mock coordinator serving the bundle and a
 MOCK of the anchored hashes.  No chain, no PM2 process, no real key.
 
-KNOWN BUNDLE DEFECTS
+NO EXPECTED FAILURES
 --------------------
-Two fixtures in the bundle are internally inconsistent.  Both are listed by
-name in KNOWN_BUNDLE_DEFECTS and are the ONLY tolerated mismatches; every
-other fixture must match its published verdict exactly, so a defect entry
-cannot hide an unrelated regression.
+There is no defect-allowance list and no xfail in this suite.  Every one of
+the 19 bundle fixtures must match its published verdict exactly; any mismatch
+fails the run.  The previous revision carried two allowances and this bundle
+resolves both:
 
-  day_20001 — result 7 (TP53) is paid 300,000 raw, but targets_table.json
-      makes TP53 protein/hard = 900,000 and the result has no prior confirmed
-      hits (taper 4/4).  EGFR on day_20000 is byte-identically protein/hard
-      and IS paid 900,000.  Task 1(g) requires the reward the spec's rules
-      give, enforced in BOTH directions, so this day is refused with
-      reward_mismatch rather than weakening the rule.
-
-  13_chunk_above_entry_limit — its verdict claims "entry count 4 exceeds
-      MAX_BATCH_ENTRIES=4", which is arithmetically impossible; 4 does not
-      exceed 4, and variants 04/05/08 carry 4 entries while expecting other
-      rules.  The batch is still refused, by the next reachable rule
-      (no_wallet_first_seen: wallet 68kN4bLG… has no wallet_first_seen event).
+  * day_20001 — the old table priced every protein target `hard`, so TP53's
+    900,000 clashed with a 300,000 payment.  The new table prices protein by
+    difficulty (4 easy / 15 medium / 11 hard) and TP53 is `hard` = 900,000,
+    which is exactly what the fixture pays.
+  * 13_chunk_above_entry_limit — its batch now carries FIVE entries, so
+    `chunk_above_entry_limit` is reachable (5 > MAX_BATCH_ENTRIES=4) instead
+    of the arithmetically impossible "4 exceeds 4".
 """
 from __future__ import annotations
 
@@ -70,11 +65,9 @@ from payout.constants import (  # noqa: E402
     validator_fee,
 )
 from payout.errors import (  # noqa: E402
-    NO_WALLET_FIRST_SEEN,
     PayoutConfigError,
     PayoutKeyError,
     REPEATED_BATCH_ID,
-    REWARD_MISMATCH,
     ANCHOR_HASH_MISMATCH,
 )
 from payout.ledger import DecisionLedger  # noqa: E402
@@ -84,32 +77,13 @@ from payout.sources import Settings, TargetsTable  # noqa: E402
 
 BUNDLE = Path("/root/api/c5b-bundle")
 
-# ── the only tolerated fixture mismatches, named explicitly ─────────────────
-KNOWN_BUNDLE_DEFECTS: dict[str, dict[str, str]] = {
-    "day_20001": {
-        "expected": "sign",
-        "actual": "refuse",
-        "actual_rule": REWARD_MISMATCH,
-        "why": ("result 7 (TP53) is paid 300,000 but targets_table.json makes "
-                "TP53 protein/hard = 900,000 with taper 4/4; EGFR is "
-                "identically protein/hard and is paid 900,000 on day_20000"),
-    },
-    "13_chunk_above_entry_limit": {
-        "expected_rule": "chunk_above_entry_limit",
-        "actual_rule": NO_WALLET_FIRST_SEEN,
-        "why": ("the published rule is unreachable: entry count 4 does not "
-                "exceed MAX_BATCH_ENTRIES=4. The batch is still refused, by "
-                "the next reachable rule"),
-    },
-}
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # 0. Bundle integrity
 # ════════════════════════════════════════════════════════════════════════════
 def test_bundle_tarball_sha256_matches_the_published_value():
     """The whole bundle must be the exact archive we were given."""
-    expected = "fcfbc0bcb89a4fe7a30c8f1ec239fa3fcabaccd0005e2368d84c2b9ae15d3bc2"
+    expected = "1510b839a95739d2c2d3987942a00b2bdc050e772c40c1b177a12fad36f84f95"
     raw = Path("/root/api/c5b-bundle.tar.gz").read_bytes()
     assert hashlib.sha256(raw).hexdigest() == expected
 
@@ -291,10 +265,47 @@ def test_a_tampered_targets_table_is_refused(tmp_path):
 
 
 def test_tier_lookup_comes_from_the_table(targets):
-    assert targets.get("CDK4").tier == "hard"
+    """All FIVE tiers are present and protein is no longer blanket-hard."""
+    assert targets.get("CDK4").tier == "easy"       # §6.1: 4 easy proteins
+    assert targets.get("EGFR").tier == "medium"     # §6.1: 15 medium proteins
+    assert targets.get("TP53").tier == "hard"       # §6.1: 11 hard proteins
     assert targets.get("ATM_mRNA").tier == "mrna"
     assert targets.get("BCL2_CRISPR").tier == "crispr"
     assert targets.get("UNKNOWN_TARGET_XYZ") is None
+
+
+def test_table_distribution_is_the_one_the_spec_publishes(targets):
+    """§12: 30 protein (4 easy, 15 medium, 11 hard), 30 mRNA, 10 CRISPR."""
+    assert (len(targets.by_tier("easy")), len(targets.by_tier("medium")),
+            len(targets.by_tier("hard"))) == (4, 15, 11)
+    assert len(targets.by_tier("mrna")) == 30
+    assert len(targets.by_tier("crispr")) == 10
+    assert len(targets) == 70
+
+
+def test_every_tier_in_the_table_is_priced(targets):
+    """No target may reach pricing through an unknown tier (§6.1, §12)."""
+    from payout.constants import BASE_REWARD_BY_TIER, base_reward_for_tier
+    tiers = {targets.get(t).tier for t in targets.ids()}
+    assert tiers == set(BASE_REWARD_BY_TIER)
+    for tier in tiers:
+        assert base_reward_for_tier(tier) > 0
+
+
+def test_base_rewards_are_the_spec_table_values():
+    """§6.1 / §12 tier -> base reward, including the new `medium` tier."""
+    from payout.constants import base_reward_for_tier
+    assert base_reward_for_tier("easy") == 300_000
+    assert base_reward_for_tier("medium") == 700_000
+    assert base_reward_for_tier("hard") == 900_000
+    assert base_reward_for_tier("mrna") == 900_000
+    assert base_reward_for_tier("crispr") == 252_000
+
+
+def test_an_unknown_tier_is_refused_never_guessed():
+    from payout.constants import base_reward_for_tier
+    with pytest.raises(KeyError):
+        base_reward_for_tier("legendary")
 
 
 def test_no_operator_supplied_payout_inputs_remain():
@@ -312,16 +323,16 @@ def test_no_operator_supplied_payout_inputs_remain():
 # ════════════════════════════════════════════════════════════════════════════
 def test_wallet_facts_are_derived_from_log_events(log_source):
     facts = log_source.day_log(20000).wallet_facts()
-    flagged = "HxVGHok2ih71XHPc33oPZAuXMzbHL3yVtoM8jUfJt3ct"
+    flagged = "B8ByrxZGu86M5wBeVyQVFf4M9FaDSQxD9fxjPhHQ891B"
     assert facts[flagged].flagged is True
-    assert facts["DSGkASCoHtJwXCphy9CBHaPzUB3yJt7CqSVFqkcTYyq7"].first_seen_ms \
+    assert facts["EJusumS5jpWXyAZHk3VAe75Veewh82z1gGjZk3hjFN5C"].first_seen_ms \
         == 1_726_790_400_000
 
 
 def test_unflag_event_clears_an_earlier_flag(log_source):
     from payout.sources import LogEvent
     dl = log_source.day_log(20000)
-    w = "HxVGHok2ih71XHPc33oPZAuXMzbHL3yVtoM8jUfJt3ct"
+    w = "B8ByrxZGu86M5wBeVyQVFf4M9FaDSQxD9fxjPhHQ891B"
     dl.events.append(LogEvent(event="wallet_unflagged", wallet=w,
                               time_ms=1_728_000_002_000))
     assert dl.wallet_facts()[w].flagged is False
@@ -329,7 +340,7 @@ def test_unflag_event_clears_an_earlier_flag(log_source):
 
 def test_forfeit_event_is_picked_up(log_source):
     facts = log_source.day_log(20001).wallet_facts()
-    assert facts["BHiHpARJUVFZ11SbvoHoxMbVBr23nuT5WGhH5udQoXCx"].forfeited is True
+    assert facts["BbTNoDCYCQf1FoFj6LXiQEjFJ6YbSUhGrJRweoRYP6kG"].forfeited is True
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -470,13 +481,190 @@ def test_validator_fee_is_seven_point_five_percent_floored(reward, fee):
     assert validator_fee(reward) == fee
 
 
+@pytest.mark.parametrize("hits,num", [
+    (0, 4), (1, 4), (98, 4), (99, 4),        # first 99 confirmed hits: 100%
+    (100, 3), (101, 3), (998, 3), (999, 3),  # 100th..999th: 75%
+    (1000, 2), (1001, 2), (50_000, 2),       # from the 1,000th: 50%
+])
+def test_taper_boundaries_are_the_spec_boundaries(hits, num):
+    """§6.2: 99th hit 100%, 100th 75%, 999th 75%, 1,000th 50%."""
+    from payout.constants import taper_numerator
+    assert taper_numerator(hits) == num
+    assert final_reward(900_000, hits) == 900_000 * num // 4
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1b. The taper count is DERIVED from earlier days' logs, never supplied
+# ════════════════════════════════════════════════════════════════════════════
+def test_hit_count_before_is_counted_from_earlier_days_in_order(log_source):
+    """§6.2: each result sees only hits confirmed BEFORE it, across days."""
+    from payout.recompute import hit_counts_before
+    hist = [log_source.day_log(d) for d in VALID_DAYS]
+    hcb, _ = hit_counts_before(hist, day=20002)
+    # CDK4 is hit by results 1,3,5 (day 20000), 8 (20001) and 9 (20002).
+    assert [hcb[r] for r in (1, 3, 5, 8, 9)] == [0, 1, 2, 3, 4]
+    # MYC: result 2 on day 20000, result 6 on day 20001.
+    assert (hcb[2], hcb[6]) == (0, 1)
+    # EGFR: result 4 on day 20000, result 10 on day 20002.
+    assert (hcb[4], hcb[10]) == (0, 1)
+
+
+def test_a_later_days_hits_never_count_as_earlier_ones(log_source):
+    """Counting day 20000 must not be changed by days 20001/20002 existing."""
+    from payout.recompute import hit_counts_before
+    hist = [log_source.day_log(d) for d in VALID_DAYS]
+    only_first, _ = hit_counts_before([hist[0]], day=20000)
+    with_future, _ = hit_counts_before(hist, day=20000)
+    assert with_future[1] == only_first[1] == 0
+    assert with_future[3] == only_first[3] == 1
+    assert with_future[5] == only_first[5] == 2
+    # Results of later days are not priced into day 20000's baseline at all.
+    assert 8 not in with_future and 9 not in with_future
+
+
+def test_the_checker_keeps_its_own_hit_counts_with_the_signed_batches(
+        tmp_path, log_source, anchors, settings, targets, signer):
+    """1(b): the count is persisted with the signed-batch record."""
+    state = tmp_path / "state"
+    svc = PayoutSignerService(log_source, anchors, settings, targets,
+                              DecisionLedger(state), signer)
+    assert svc.process_day(20000, [load_batch(20000)], now_ms=NOW_MS,
+                           history_days=VALID_DAYS).signed
+    # A fresh ledger over the same directory still knows day 20000's counts.
+    reread = DecisionLedger(state)
+    assert reread.day_target_hits[20000] == {"CDK4": 3, "MYC": 1, "EGFR": 1}
+    assert reread.target_hits_before(20001) == {"CDK4": 3, "MYC": 1, "EGFR": 1}
+    assert reread.target_hits_before(20000) == {}
+
+
+def test_the_recorded_count_carries_the_taper_without_refetching_the_log(
+        tmp_path, log_source, targets):
+    """The baseline can come from our own record alone — no coordinator count."""
+    from payout.recompute import compute_day
+    dl = log_source.day_log(20001)
+    # No history at all, but our own record of day 20000 is supplied.
+    comp = compute_day(dl, targets=targets, now_ms=NOW_MS, history=[dl],
+                       recorded_day_hits={20000: {"CDK4": 3, "MYC": 1, "EGFR": 1}})
+    assert comp.carried_in_hits == {"CDK4": 3, "MYC": 1, "EGFR": 1}
+    assert comp.hit_counts_before[6] == 1        # MYC already hit once
+    assert comp.hit_counts_before[8] == 3        # CDK4 already hit three times
+    assert comp.hit_counts_before[7] == 0        # TP53 is brand new
+
+
+def test_a_rewritten_earlier_log_invalidates_the_taper_baseline(
+        log_source, targets):
+    """Our record and the served log must agree about an earlier day."""
+    from payout.recompute import compute_day
+    from payout.errors import LOG_INCONSISTENT
+    hist = [log_source.day_log(d) for d in (20000, 20001)]
+    comp = compute_day(hist[1], targets=targets, now_ms=NOW_MS, history=hist,
+                       recorded_day_hits={20000: {"CDK4": 99, "MYC": 1, "EGFR": 1}})
+    assert any(f.code == LOG_INCONSISTENT for f in comp.findings), \
+        [f.code for f in comp.findings]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1c. Rules are applied in the numbered order of BATCH_SPEC §5.0
+# ════════════════════════════════════════════════════════════════════════════
+def test_rule_order_is_the_spec_numbered_list_verbatim():
+    """§5.0 numbers rules 1..17; the checker's order must BE that list."""
+    from payout.verifier import EXTRA_RULE_ORDER, RULE_PRECEDENCE, SPEC_RULE_ORDER
+    assert SPEC_RULE_ORDER == (
+        "wrong_program_id_or_mint",   # 1  (spec calls it program_id_or_mint)
+        "batch_total_above_cap",      # 2
+        "chunk_above_entry_limit",    # 3
+        "total_above_day_cap",        # 4
+        "duplicate_recipient",        # 5
+        "sort_contract_violated",     # 6
+        "inflated_amount",            # 7
+        "target_not_in_table",        # 8
+        "no_wallet_first_seen",       # 9
+        "flagged_wallet_paid",        # 10
+        "held_wallet_paid",           # 11
+        "forfeited_wallet_paid",      # 12
+        "no_confirmed_result",        # 13
+        "repeated_batch_id",          # 14
+        "log_hash_mismatch",          # 15
+        "reward_mismatch",            # 16
+        "total_not_sum_of_entries",   # 17 total_mismatch
+    )
+    # Extra checks never pre-empt a spec-numbered reason.
+    assert RULE_PRECEDENCE == SPEC_RULE_ORDER + EXTRA_RULE_ORDER
+    assert not set(SPEC_RULE_ORDER) & set(EXTRA_RULE_ORDER)
+
+
+def test_held_outranks_forfeited_because_the_spec_says_so():
+    """§5.0 puts held (11) before forfeited (12) — the reverse of C5b2."""
+    from payout.verifier import SPEC_RULE_ORDER
+    assert SPEC_RULE_ORDER.index("held_wallet_paid") < \
+        SPEC_RULE_ORDER.index("forfeited_wallet_paid")
+
+
+def test_a_batch_breaking_several_rules_is_refused_for_the_first_one(
+        log_source, settings, targets):
+    """A batch that violates 6, 9 and 16 at once must report rule 6."""
+    from payout.recompute import compute_day
+    from payout.verifier import Batch, verify_batch
+    dl = log_source.day_log(20000)
+    hist = [log_source.day_log(d) for d in VALID_DAYS]
+    comp = compute_day(dl, targets=targets, now_ms=NOW_MS, history=hist)
+
+    raw = load_batch(20000)
+    raw["entries"] = list(reversed(raw["entries"]))        # rule 6: unsorted
+    raw["entries"][0]["results"][0]["amountRaw"] = "999999"  # rule 16: reward
+    raw["entries"][0]["amountRaw"] = "999999"
+    res = verify_batch(Batch.from_json(raw), comp, dl, anchored_hashes()[20000],
+                       settings, targets, set(), now_ms=NOW_MS)
+    assert not res.signable
+    fired = {f.code for f in res.findings}
+    assert "sort_contract_violated" in fired and "reward_mismatch" in fired
+    assert res.primary_rule == "sort_contract_violated"   # the FIRST rule
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1d. Reference and discovery rewards are not payable (§6.1, §10a)
+# ════════════════════════════════════════════════════════════════════════════
+def test_the_out_of_scope_rewards_are_in_no_tier():
+    from payout.constants import (BASE_REWARD_BY_TIER, REWARD_DISCOVERY,
+                                  REWARD_REFERENCE, out_of_scope_reward)
+    assert REWARD_REFERENCE == 108_000          # 0.108 LIFE
+    assert REWARD_DISCOVERY == 100_000_000      # 100 LIFE
+    assert REWARD_REFERENCE not in BASE_REWARD_BY_TIER.values()
+    assert REWARD_DISCOVERY not in BASE_REWARD_BY_TIER.values()
+    assert out_of_scope_reward(108_000) and out_of_scope_reward(100_000_000)
+    assert out_of_scope_reward(300_000) is None
+
+
+@pytest.mark.parametrize("amount", [108_000, 100_000_000])
+def test_a_batch_paying_an_out_of_scope_reward_is_refused(
+        log_source, settings, targets, amount):
+    """§10a: reference (0.108) and discovery (100 LIFE) are never payable."""
+    from payout.errors import OUT_OF_SCOPE_REWARD_PAID
+    from payout.recompute import compute_day
+    from payout.verifier import Batch, verify_batch
+    dl = log_source.day_log(20000)
+    hist = [log_source.day_log(d) for d in VALID_DAYS]
+    comp = compute_day(dl, targets=targets, now_ms=NOW_MS, history=hist)
+
+    raw = load_batch(20000)
+    ent = raw["entries"][0]                      # 4pmn7PJu… / result 3 / CDK4
+    ent["results"][0]["amountRaw"] = str(amount)
+    ent["amountRaw"] = str(amount)
+    res = verify_batch(Batch.from_json(raw), comp, dl, anchored_hashes()[20000],
+                       settings, targets, set(), now_ms=NOW_MS)
+    assert not res.signable
+    assert OUT_OF_SCOPE_REWARD_PAID in {f.code for f in res.findings}, \
+        res.reasons()
+
+
 def test_entry_total_must_equal_the_sum_of_its_breakdown():
     """§7 aggregation: day_20000's minerA entry is 2 results summed."""
     b = load_batch(20000)
     for e in b["entries"]:
         assert int(e["amountRaw"]) == sum(int(r["amountRaw"]) for r in e["results"])
     agg = [e for e in b["entries"] if len(e["results"]) == 2][0]
-    assert int(agg["amountRaw"]) == 1_800_000
+    # CDK4 (easy, 300,000) + MYC (hard, 900,000), both at taper 4/4.
+    assert int(agg["amountRaw"]) == 1_200_000
 
 
 # ════════════════════════════════════════════════════════════════════════════

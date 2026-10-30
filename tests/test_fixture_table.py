@@ -1,10 +1,13 @@
 """Step 2 — run EVERY bundle fixture through the checker and compare.
 
-This module is the acceptance gate: the three valid days must be signed and
-every tampered variant must be refused with the rule named in its verdict
-file.  The run fails on ANY difference, except the two entries in
-KNOWN_BUNDLE_DEFECTS, which are listed by name so a defect allowance can
-never silently absorb an unrelated regression.
+This module is the acceptance gate: the three valid days must be SIGNED and
+every tampered variant must be REFUSED for exactly the rule named in its
+`.verdict.json`.  The run fails on ANY difference.
+
+There are no expected failures, no xfails and no defect allowances: with the
+current bundle every one of the 19 fixtures matches its published verdict, so
+nothing needs tolerating.  If a fixture ever stops matching, this run fails —
+which is the point.
 
 Running this file directly prints the comparison table:
 
@@ -20,6 +23,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from conftest_payout import (  # noqa: E402,F401
+    HOLDBACK_WINDOW_MAX_MS,
+    HOLDBACK_WINDOW_MIN_MS,
     LIFE_MINT,
     NOW_MS,
     PROGRAM_ID,
@@ -44,7 +49,6 @@ from mock_payout_coordinator import (  # noqa: E402
     load_tampered_verdict,
     tampered_names,
 )
-from test_payout_signer import KNOWN_BUNDLE_DEFECTS  # noqa: E402
 
 from payout.ledger import DecisionLedger  # noqa: E402
 from payout.service import PayoutSignerService  # noqa: E402
@@ -103,20 +107,11 @@ def _valid_day_outcome(day: int, state_dir: Path) -> tuple[str, str | None]:
 # ── valid days ──────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("day", VALID_DAYS)
 def test_valid_day(day, tmp_path):
-    name = f"day_{day}"
+    """Every valid day must be signed — no allowance, no xfail."""
     expected = load_expected_verdict(day)["verdict"]
     actual, rule = _valid_day_outcome(day, tmp_path)
-    defect = KNOWN_BUNDLE_DEFECTS.get(name)
-
-    if defect:
-        assert actual == defect["actual"], (
-            f"{name} is a KNOWN_BUNDLE_DEFECT expected to be "
-            f"{defect['actual']}, got {actual}")
-        assert rule == defect["actual_rule"], (
-            f"{name} defect should surface {defect['actual_rule']}, got {rule}")
-        pytest.xfail(f"KNOWN_BUNDLE_DEFECT {name}: {defect['why']}")
-
-    assert actual == expected, f"{name}: expected {expected}, got {actual} ({rule})"
+    assert actual == expected, \
+        f"day_{day}: expected {expected}, got {actual} ({rule})"
 
 
 def test_signed_days_produce_a_signature_over_the_recomputed_hash(tmp_path):
@@ -142,6 +137,7 @@ def test_signed_days_produce_a_signature_over_the_recomputed_hash(tmp_path):
 # ── tampered variants ───────────────────────────────────────────────────────
 @pytest.mark.parametrize("name", tampered_names())
 def test_tampered_variant(name, tmp_path):
+    """Every tampered variant is refused for EXACTLY its published rule."""
     expected = load_tampered_verdict(name)
     batch = load_tampered(name)
     day = VARIANT_DAY.get(name, 20000)
@@ -151,18 +147,9 @@ def test_tampered_variant(name, tmp_path):
     assert decision.refused, (
         f"{name} must be REFUSED but the checker was willing to sign it")
     assert not decision.signatures, f"{name} produced a signature"
-
-    actual_rule = decision.primary_rule
-    defect = KNOWN_BUNDLE_DEFECTS.get(name)
-    if defect:
-        assert actual_rule == defect["actual_rule"], (
-            f"{name} is a KNOWN_BUNDLE_DEFECT expected to surface "
-            f"{defect['actual_rule']}, got {actual_rule}")
-        pytest.xfail(f"KNOWN_BUNDLE_DEFECT {name}: {defect['why']}")
-
-    assert actual_rule == expected["rule"], (
-        f"{name}: expected rule {expected['rule']!r}, got {actual_rule!r}\n"
-        + "\n".join(decision.reasons()))
+    assert decision.primary_rule == expected["rule"], (
+        f"{name}: expected rule {expected['rule']!r}, "
+        f"got {decision.primary_rule!r}\n" + "\n".join(decision.reasons()))
 
 
 def test_every_bundle_fixture_is_covered():
@@ -171,9 +158,47 @@ def test_every_bundle_fixture_is_covered():
     assert len(VALID_DAYS) == 3
 
 
-def test_known_defects_are_only_the_two_documented_ones():
-    """Guard the allowance list itself: it must not grow silently."""
-    assert set(KNOWN_BUNDLE_DEFECTS) == {"day_20001", "13_chunk_above_entry_limit"}
+def test_no_defect_allowance_mechanism_remains():
+    """Task 1(e): the defect allowance and its guard test are gone for good.
+
+    Checked against the executable source of both test modules (comments and
+    docstrings stripped, so the prose above may still name the old symbol)
+    and against neither module importing or defining it.
+    """
+    import test_payout_signer
+    assert not hasattr(test_payout_signer, "KNOWN_BUNDLE_DEFECTS")
+
+    banned = ("KNOWN_BUNDLE_DEFECTS", "xfail", "KNOWN_BUNDLE_DEFECT")
+    for mod_path in (Path(__file__), Path(test_payout_signer.__file__)):
+        code = _executable_source(mod_path)
+        for token in banned:
+            assert token not in code, f"{mod_path.name} still references {token}"
+
+
+def _executable_source(path: Path) -> str:
+    """Module source with comments and string literals removed."""
+    import tokenize
+    out: list[str] = []
+    with path.open("rb") as fh:
+        for tok in tokenize.tokenize(fh.readline):
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                continue
+            out.append(tok.string)
+    return " ".join(out)
+
+
+def test_the_checker_clock_is_inside_the_only_feasible_window():
+    """§5.0 puts held (11) before forfeited (12), which pins NOW_MS.
+
+    Fixture 07 can only report `forfeited_wallet_paid` once its wallet has
+    matured out of holdback; fixture 06 can only report `held_wallet_paid`
+    while its wallet is still inside one.  Those two constraints leave a
+    single 3-day window, and the checker's clock must sit in it.
+    """
+    assert HOLDBACK_WINDOW_MIN_MS <= NOW_MS < HOLDBACK_WINDOW_MAX_MS
+    from payout.constants import HOLDBACK_MS
+    assert HOLDBACK_WINDOW_MIN_MS == 1_727_740_800_000 + HOLDBACK_MS
+    assert HOLDBACK_WINDOW_MAX_MS == 1_728_000_000_000 + HOLDBACK_MS
 
 
 # ── the printable table (step 2) ────────────────────────────────────────────
@@ -184,13 +209,10 @@ def build_table(tmp_root: Path) -> tuple[list[tuple], int]:
         name = f"day_{day}"
         exp = load_expected_verdict(day)["verdict"]
         act, rule = _valid_day_outcome(day, tmp_root / name)
-        defect = KNOWN_BUNDLE_DEFECTS.get(name)
-        ok = (act == exp) or (defect and act == defect["actual"]
-                              and rule == defect["actual_rule"])
-        status = "KNOWN_BUNDLE_DEFECT" if (defect and ok) else ("OK" if ok else "DIFFERENCE")
+        ok = act == exp
         if not ok:
             diffs += 1
-        rows.append((name, exp, "—", act, rule or "—", status))
+        rows.append((name, exp, "—", act, rule or "—", "OK" if ok else "DIFFERENCE"))
 
     for name in tampered_names():
         exp = load_tampered_verdict(name)
@@ -200,16 +222,11 @@ def build_table(tmp_root: Path) -> tuple[list[tuple], int]:
                      state_dir=tmp_root / name)
         act = "refuse" if d.refused else "sign"
         rule = d.primary_rule or "—"
-        defect = KNOWN_BUNDLE_DEFECTS.get(name)
-        if defect:
-            ok = d.refused and rule == defect["actual_rule"]
-            status = "KNOWN_BUNDLE_DEFECT" if ok else "DIFFERENCE"
-        else:
-            ok = d.refused and rule == exp["rule"]
-            status = "OK" if ok else "DIFFERENCE"
+        ok = d.refused and rule == exp["rule"]
         if not ok:
             diffs += 1
-        rows.append((name, exp["verdict"], exp["rule"], act, rule, status))
+        rows.append((name, exp["verdict"], exp["rule"], act, rule,
+                     "OK" if ok else "DIFFERENCE"))
     return rows, diffs
 
 
@@ -230,10 +247,9 @@ def _render(rows) -> str:
     out += ["  ".join(r[i].ljust(w[i]) for i in range(len(head))) for r in data[1:]]
     out.append(line)
     ok = sum(1 for r in rows if r[5] == "OK")
-    kd = sum(1 for r in rows if r[5] == "KNOWN_BUNDLE_DEFECT")
     df = sum(1 for r in rows if r[5] == "DIFFERENCE")
-    out.append(f"{len(rows)} fixtures: {ok} OK, {kd} known bundle defect(s), "
-               f"{df} difference(s)")
+    out.append(f"{len(rows)} fixtures: {ok} OK, {df} difference(s), "
+               f"0 expected failure(s)")
     return "\n".join(out)
 
 

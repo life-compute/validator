@@ -69,6 +69,9 @@ LOG_INCONSISTENT = "log_inconsistent"
 MALFORMED_BATCH = "malformed_batch"
 COORDINATOR_UNREACHABLE = "coordinator_unreachable"
 NO_PAYOUT_KEY = "no_payout_key"
+# §6.1 / §10a — the reference reward and the weekly discovery bonus are not
+# payable through payout_batch at all, so a batch carrying either is refused.
+OUT_OF_SCOPE_REWARD_PAID = "out_of_scope_reward_paid"
 
 # ── Warning codes (recorded, never sufficient to sign or to refuse) ─────────
 WARN_FEE_RECIPIENTS_UNVERIFIABLE = "warn_fee_recipients_unverifiable"
