@@ -49,7 +49,8 @@ def summarize_day(
     lines.append(f"Decision:          {'READY TO SIGN' if signable else 'REFUSED — DO NOT SIGN'}")
     lines.append(f"Chunks:            {len(results)} "
                  f"(batch ids {', '.join(str(r.batch_id) for r in results) or 'none'})")
-    lines.append(f"Results paid:      {len(entries)} to {len(by_wallet)} wallet(s)")
+    n_results = sum(len(e.results) for e in entries)
+    lines.append(f"Results paid:      {n_results} to {len(by_wallet)} wallet(s)")
     lines.append(f"Miner total:       {_life(total)}  ({total:,} raw)")
     lines.append(f"Validator fees:    {_life(fees)}  ({fees:,} raw) — paid separately, "
                  f"NOT part of the batch total or its hash")
@@ -64,7 +65,7 @@ def summarize_day(
                  f"per-batch cap ({_pct(worst, C.CAP_PER_BATCH)})")
     lines.append(f"  Entries/chunk:   max {C.MAX_BATCH_ENTRIES}; "
                  f"actual {[len(r.expected_entries) for r in results]}")
-    per_wallet_counts = {w: len(v) for w, v in by_wallet.items()}
+    per_wallet_counts = {w: sum(len(e.results) for e in v) for w, v in by_wallet.items()}
     busiest = max(per_wallet_counts.values(), default=0)
     lines.append(f"  Per-miner/day:   max {C.DAILY_MINER_CAP} results; "
                  f"busiest wallet has {busiest}")
@@ -78,9 +79,10 @@ def summarize_day(
         lines.append("  (nothing payable)")
     for wallet, es in ranked[:top_n]:
         amt = sum(e.amount_raw for e in es)
-        targets = ", ".join(sorted({e.target for e in es}))
+        n_res = sum(len(e.results) for e in es)
+        targets = ", ".join(sorted({r.target for e in es for r in e.results}))
         lines.append(f"  {wallet}")
-        lines.append(f"      {_life(amt)} over {len(es)} result(s) "
+        lines.append(f"      {_life(amt)} over {n_res} result(s) "
                      f"[{_pct(amt, total)} of the day]  targets: {targets}")
     lines.append("")
 
@@ -101,7 +103,7 @@ def summarize_day(
                      f"({sign}{_life(abs(delta))})")
         if p_total:
             lines.append(f"             {sign}{abs(delta) * 100 / p_total:.1f}% versus that day")
-        lines.append(f"  Entries:   {p_entries} -> {len(entries)}")
+        lines.append(f"  Entries:   {p_entries} -> {len(entries)}")  # wallet entries
         if p_wallets:
             lines.append(f"  Wallets:   {p_wallets} -> {len(by_wallet)}")
         prev_w = previous.get("recipients") or []
@@ -141,9 +143,10 @@ def summarize_day(
         lines.append(f"  batchId {r.batch_id} (day {r.day}, chunk {r.seq}) "
                      f"total {_life(r.total_raw)}")
         lines.append(f"      batch hash: {r.batch_hash_recomputed}")
-    lines.append("  The signature covers SHA-256(batchId || day || totalRaw) only —")
-    lines.append("  the recipient list is NOT inside the hash, which is why the")
-    lines.append("  entry-by-entry recomputation above is the real check.")
+    lines.append("  The signature covers the C4c batch hash (§4), which commits to")
+    lines.append("  the domain tag, program id, LIFE mint, batch id, day, entry count")
+    lines.append("  and every (recipient, amount) pair in sorted order — so the")
+    lines.append("  recipient list IS inside what you sign.")
     return "\n".join(lines)
 
 
@@ -155,6 +158,7 @@ def summary_record(day: int, entries: Sequence[ComputedEntry],
         by_wallet[e.recipient] = by_wallet.get(e.recipient, 0) + e.amount_raw
     return {
         "day": day,
+        "resultCount": sum(len(e.results) for e in entries),
         "totalRaw": sum(e.amount_raw for e in entries),
         "validatorFeeRaw": sum(e.validator_fee_raw for e in entries),
         "entryCount": len(entries),

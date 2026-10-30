@@ -4,8 +4,8 @@ Nothing here is copied from the old validator (no tier tables, no commission
 function, no required-validators constant).  Every value below cites the
 section of BATCH_SPEC.md (or its README constant table) that defines it.
 
-Where the spec contradicts itself the stricter reading is used and the
-contradiction is recorded in SPEC_CONFLICTS so the operator can see it.
+C5b2: the spec no longer contradicts itself on MAX_BATCH_ENTRIES or the token
+caps, so there is no SPEC_CONFLICTS list and no WARN_SPEC_CONFLICT warning.
 """
 from __future__ import annotations
 
@@ -16,30 +16,27 @@ RAW_PER_LIFE = 1_000_000          # 1 LIFE = 1e6 raw units, 6 decimals
 CAP_PER_BATCH = 5_000_000_000     # 5,000 LIFE, per single payout_batch call
 CAP_PER_DAY = 5_000_000_000       # 5,000 LIFE, cumulative over ALL chunks/day
 
-# ── Entry limits (§5.4, §5.6, README) ────────────────────────────────────────
-MAX_BATCH_ENTRIES = 5             # per on-chain batch call
+# ── Entry limits (§5.4, §5.6, §14, README) ───────────────────────────────────
+# §14: N=5 serialises to 1,243B > 1,232B MTU; N=4 fits with 62B spare.
+MAX_BATCH_ENTRIES = 4             # distinct WALLET entries per on-chain batch
 DAILY_MINER_CAP = 20              # paid results per miner wallet per day (§5.2)
 
 # ── Holdback (§5.1.3; README) ────────────────────────────────────────────────
 HOLDBACK_MS = 604_800_000         # 7 days
 
-# ── Reward table (§6.1; README) ──────────────────────────────────────────────
-REWARD_HARD = 900_000             # protein
-REWARD_MRNA = 900_000
-REWARD_CRISPR = 252_000
-REWARD_EASY = 300_000             # small_molecule
+# ── Reward tiers (§12 tier -> base reward; mirrors §6.1) ─────────────────────
+REWARD_HARD = 900_000             # tier "hard"   (protein)
+REWARD_MRNA = 900_000             # tier "mrna"
+REWARD_CRISPR = 252_000           # tier "crispr"
+REWARD_EASY = 300_000             # tier "easy"   (small_molecule)
 
-BASE_REWARD_BY_MODALITY = {
-    "protein": REWARD_HARD,
+# §12: "The builder reads the modality and tier only from this table."
+# Tier is the authoritative key; modality is carried for reporting only.
+BASE_REWARD_BY_TIER = {
+    "hard": REWARD_HARD,
     "mrna": REWARD_MRNA,
     "crispr": REWARD_CRISPR,
-    "small_molecule": REWARD_EASY,
-}
-
-# §6.1: "Named targets override modality lookup (currently: CDK4=Hard, MYC=Hard)."
-NAMED_TARGET_BASE_REWARD = {
-    "CDK4": REWARD_HARD,
-    "MYC": REWARD_HARD,
+    "easy": REWARD_EASY,
 }
 
 # ── Hit-count taper (§6.2) ───────────────────────────────────────────────────
@@ -56,33 +53,20 @@ BPS_DENOM = 10_000
 
 # ── Batch id / hash (§3, §4) ─────────────────────────────────────────────────
 BATCH_ID_DAY_MULTIPLIER = 1_000   # batchId = day * 1000 + seq
+DOMAIN_TAG = b"LIFE-PAYOUT-V1"    # §4, 14 bytes UTF-8, no NUL
 
-# ── Spec contradictions the operator must be aware of ────────────────────────
-SPEC_CONFLICTS = (
-    "BATCH_SPEC.md §12 states MAX_BATCH_ENTRIES=20, contradicting §5.4, §5.6 "
-    "and the bundle README (both say 5). The stricter value 5 is enforced.",
-    "BATCH_SPEC.md §12 states 'There is no global 5,000-result per-batch or "
-    "per-day cap', contradicting §5.3 which defines CAP_PER_BATCH and "
-    "CAP_PER_DAY as 5,000 LIFE. The §5.3 caps are enforced.",
+# ── targets_table.json integrity (§12) ───────────────────────────────────────
+TARGETS_TABLE_SHA256 = (
+    "07c97ecd63db314cabd4883371eec89837f678cd3dc91fe7151ebcc19c3e7e8f"
 )
 
 
-def base_reward_for_target(target: str, modality: str | None) -> int:
-    """Resolve the base reward for a target (§6.1).
-
-    Named overrides win.  Otherwise the modality must be supplied by the
-    operator's target->modality map; the public log carries no modality field
-    and BATCH_SPEC.md defines no way to derive one, so an unknown target is a
-    refusal (never a guess).
-    """
-    if target in NAMED_TARGET_BASE_REWARD:
-        return NAMED_TARGET_BASE_REWARD[target]
-    if modality is None:
-        raise KeyError(target)
+def base_reward_for_tier(tier: str) -> int:
+    """§12: tier -> base reward.  An unknown tier is a refusal, never a guess."""
     try:
-        return BASE_REWARD_BY_MODALITY[modality]
+        return BASE_REWARD_BY_TIER[tier]
     except KeyError:
-        raise KeyError(f"{target}:{modality}") from None
+        raise KeyError(f"unknown tier {tier!r}") from None
 
 
 def taper_numerator(hit_count_before: int) -> int:

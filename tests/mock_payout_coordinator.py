@@ -1,18 +1,20 @@
 """Mock payout coordinator — serves the C5b bundle fixtures over HTTP.
 
-Routes (API_CONTRACT.md §2.9, §2.11 plus the canonical-log body route the
-archive serves):
+Routes (API_CONTRACT.md §2.11 and §2.16):
 
     GET /log/{YYYY-MM-DD}             -> log_get_response.json  (hash manifest)
     GET /log/{YYYY-MM-DD}/canonical   -> canonical_log.ndjson   (raw bytes)
-    GET /feed                         -> feed_get_response.json
 
 Fixtures are read from /root/api/c5b-bundle/fixtures.  Nothing is generated:
 the canonical log is served as the exact bytes on disk so its SHA-256 matches
-the anchored hash fixture.
+the published log_hash and the anchored hash fixture.
 
-Fault injection: `offline` makes every route fail (connection refused is
-simulated by a 503), `fail_paths` fails one route only.  No real coordinator,
+GET /feed is gone: wallet age now comes from the canonical log's
+wallet_first_seen events (BATCH_SPEC §13.1), not from a feed timestamp.
+
+Fault injection: `offline` makes every route fail (503), `fail_paths` fails
+one route only, and `override_canonical` serves different bytes for a day so
+the log-hash / anchor-mismatch paths can be exercised.  No real coordinator,
 no chain, no PM2 process is contacted.
 """
 from __future__ import annotations
@@ -24,6 +26,10 @@ from pathlib import Path
 
 BUNDLE = Path("/root/api/c5b-bundle")
 FIXTURES = BUNDLE / "fixtures"
+TAMPERED = FIXTURES / "tampered"
+TARGETS_TABLE = BUNDLE / "targets_table.json"
+
+VALID_DAYS = (20000, 20001, 20002)
 
 
 def day_dir(day: int) -> Path:
@@ -38,16 +44,26 @@ def load_expected_verdict(day: int) -> dict:
     return json.loads((day_dir(day) / "expected_verdict.json").read_text())
 
 
+def tampered_names() -> list[str]:
+    """Every tampered variant in the bundle, in file order."""
+    return sorted(p.name[:-5] for p in TAMPERED.glob("*.json")
+                  if not p.name.endswith(".verdict.json"))
+
+
 def load_tampered(name: str) -> dict:
-    return json.loads((FIXTURES / "tampered" / f"{name}.json").read_text())
+    return json.loads((TAMPERED / f"{name}.json").read_text())
 
 
 def load_tampered_verdict(name: str) -> dict:
-    return json.loads((FIXTURES / "tampered" / f"{name}.verdict.json").read_text())
+    return json.loads((TAMPERED / f"{name}.verdict.json").read_text())
 
 
-def anchored_hashes(days=(20000, 20001, 20002)) -> dict[int, str]:
-    """The mock of the on-chain anchored hashes: day -> logHash."""
+def anchored_hashes(days=VALID_DAYS) -> dict[int, str]:
+    """The MOCK of the on-chain anchored hashes: day -> logHash.
+
+    Read from each day's anchored_log_hash.txt fixture.  This is the only
+    stand-in for `anchor_hash`; no chain is contacted anywhere in the suite.
+    """
     return {d: (day_dir(d) / "anchored_log_hash.txt").read_text().strip()
             for d in days}
 
@@ -63,6 +79,8 @@ class _State:
         self.fail_paths: set[str] = set()
         self.request_log: list[str] = []
         self.iso_to_day = {iso_for_day(d): d for d in self.days}
+        self.override_canonical: dict[int, bytes] = {}
+        self.override_manifest: dict[int, dict] = {}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -88,26 +106,21 @@ class _Handler(BaseHTTPRequestHandler):
         if self.state.offline or path in self.state.fail_paths:
             return self._send_json(503, {"error": "Service Unavailable"})
 
-        if path == "/feed":
-            # Union of every fixture day's feed: the real /feed is a rolling
-            # window across days, not per-day.
-            rows = []
-            for d in self.state.days:
-                obj = json.loads((day_dir(d) / "feed_get_response.json").read_text())
-                rows.extend(obj.get("results", []))
-            return self._send_json(200, {"results": rows})
-
         parts = [p for p in path.split("/") if p]
         if len(parts) >= 2 and parts[0] == "log":
-            iso = parts[1]
-            day = self.state.iso_to_day.get(iso)
+            day = self.state.iso_to_day.get(parts[1])
             if day is None:
                 return self._send_json(404, {"error": "day not archived"})
             if len(parts) == 2:
-                return self._send_json(
-                    200, json.loads((day_dir(day) / "log_get_response.json").read_text()))
+                manifest = self.state.override_manifest.get(day)
+                if manifest is None:
+                    manifest = json.loads(
+                        (day_dir(day) / "log_get_response.json").read_text())
+                return self._send_json(200, manifest)
             if len(parts) == 3 and parts[2] == "canonical":
-                raw = (day_dir(day) / "canonical_log.ndjson").read_bytes()
+                raw = self.state.override_canonical.get(day)
+                if raw is None:
+                    raw = (day_dir(day) / "canonical_log.ndjson").read_bytes()
                 return self._send_bytes(200, raw, "application/x-ndjson")
 
         return self._send_json(404, {"error": "Not found"})
@@ -116,7 +129,7 @@ class _Handler(BaseHTTPRequestHandler):
 class MockPayoutCoordinator:
     """Context-managed fixture server on an ephemeral localhost port."""
 
-    def __init__(self, days=(20000, 20001, 20002)):
+    def __init__(self, days=VALID_DAYS):
         self.state = _State(days)
         handler = type("_Bound", (_Handler,), {"state": self.state})
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -132,6 +145,12 @@ class MockPayoutCoordinator:
 
     def go_online(self) -> None:
         self.state.offline = False
+
+    def set_canonical(self, day: int, raw: bytes) -> None:
+        self.state.override_canonical[int(day)] = raw
+
+    def set_manifest(self, day: int, manifest: dict) -> None:
+        self.state.override_manifest[int(day)] = manifest
 
     def __enter__(self) -> "MockPayoutCoordinator":
         self.thread.start()

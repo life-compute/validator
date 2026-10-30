@@ -2,6 +2,9 @@
 
 Throwaway keys only: generated in memory, written to a pytest tmp_path, never
 to any real wallet location.  No chain, no PM2 process, no live coordinator.
+
+The anchored hashes are a MOCK (mock_payout_coordinator.anchored_hashes), so
+the wrong-anchor and repeated-batch-id variants are testable without a chain.
 """
 from __future__ import annotations
 
@@ -11,26 +14,24 @@ from pathlib import Path
 import pytest
 from solders.keypair import Keypair
 
-from mock_payout_coordinator import MockPayoutCoordinator, anchored_hashes
+from mock_payout_coordinator import (
+    MockPayoutCoordinator,
+    TARGETS_TABLE,
+    VALID_DAYS,
+    anchored_hashes,
+)
 from payout.ledger import DecisionLedger
 from payout.signer_key import PayoutSigner
-from payout.sources import AnchorSource, LogSource, OperatorInputs
+from payout.sources import AnchorSource, LogSource, Settings, TargetsTable
 
-# Day 20000 = 2024-10-04. The fixtures' results were submitted well before
-# that (feed submitted_at 1726790400000 = 2024-09-20), so every wallet is far
-# past the 7-day holdback at this instant.
-NOW_MS = 1_728_172_800_000  # 2024-10-06T00:00:00Z, the fixtures' builtAt
+# The fixtures' builtAt: 2024-10-06T00:00:00Z.  Wallets first seen on
+# 1726790400000 (2024-09-20) are far past the 7-day holdback at this instant;
+# 93qnJXpF… (first seen 1728000000000) is still inside it.
+NOW_MS = 1_728_172_800_000
 
-# Targets appearing in the fixtures. CDK4/MYC are named overrides in §6.1;
-# EGFR and TP53 need an explicit modality — the public log has no modality.
-OPERATOR_TARGET_MODALITY = {
-    "CDK4": "protein",
-    "MYC": "protein",
-    "EGFR": "protein",
-    "TP53": "small_molecule",
-}
-
-FLAGGED_WALLET = "9wLoojm7k8DrPgikDH1mEyis9F3oKcsJiJVqFewJu4b1"
+# BATCH_SPEC §16 / README: the required checker configuration.
+PROGRAM_ID = "BU7WVCvy9CqypB7Hqhw6RJakAeSieVsWNapytQpFgi18"
+LIFE_MINT = "CVDFLCAjXhVWiPXH9nTCTpCgVzmDVoiPzNJYuccr1dqB"
 
 
 def write_throwaway_keypair(path: Path) -> str:
@@ -57,13 +58,14 @@ def anchors() -> AnchorSource:
 
 
 @pytest.fixture
-def operator() -> OperatorInputs:
-    return OperatorInputs(
-        target_modality=dict(OPERATOR_TARGET_MODALITY),
-        flagged_wallets={FLAGGED_WALLET},
-        forfeited_result_ids=set(),
-        source_path="<test fixture>",
-    )
+def settings() -> Settings:
+    return Settings(program_id=PROGRAM_ID, life_mint=LIFE_MINT)
+
+
+@pytest.fixture
+def targets() -> TargetsTable:
+    """The real bundle table, SHA-256-verified against BATCH_SPEC §12."""
+    return TargetsTable.from_file(TARGETS_TABLE)
 
 
 @pytest.fixture
@@ -87,6 +89,13 @@ def signer(payout_key_paths) -> PayoutSigner:
 
 
 @pytest.fixture
-def service(log_source, anchors, operator, ledger, signer):
+def service(log_source, anchors, settings, targets, ledger, signer):
     from payout.service import PayoutSignerService
-    return PayoutSignerService(log_source, anchors, operator, ledger, signer)
+    return PayoutSignerService(log_source, anchors, settings, targets,
+                               ledger, signer)
+
+
+@pytest.fixture
+def history_days() -> tuple[int, ...]:
+    """All valid fixture days: wallet_first_seen is emitted once, on day 0."""
+    return VALID_DAYS
