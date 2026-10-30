@@ -9,17 +9,34 @@ asked us to sign.
 Rule map (BATCH_SPEC.md):
   §5.1  eligibility: a line in the canonical log IS a confirmed verdict (§9);
         wallet not flagged (§13.2/§13.3), results not forfeited (§13.4),
-        wallet-age holdback measured from wallet_first_seen (§13.1).
+        wallet-age holdback measured in DAY numbers from wallet_first_seen
+        (§13.1, §5.1.3) — never from a wall clock.
   §5.2  daily miner cap: 20 paid results per wallet per day.
   §5.3  CAP_PER_BATCH / CAP_PER_DAY, both 5,000 LIFE.
   §5.4  each wallet appears at most ONCE per day; chunks of MAX_BATCH_ENTRIES=4.
   §5.5  wallet entries sorted by recipient pubkey bytes ascending; a wallet's
         results[] sorted by archived_at ascending.
   §6    reward = taper(base(tier from targets_table.json)); fee = 7.5% floored.
+  §6a   the taper baseline is a FULL replay of the canonical logs from
+        GENESIS_DAY (20000) to the day before the batch day, in order.
 
 C5b2: wallet age, flags and forfeits come ONLY from the log's events, and
 modality/tier ONLY from targets_table.json.  There are no operator-supplied
 payout facts.
+
+C5b4 (C5j): two changes with teeth.
+
+  * NO CLOCK.  `now_ms` is gone from every signature in this module.  The
+    holdback decision is `batchDay < firstSeenDay + HOLDBACK_DAYS` (§5.1.3),
+    computed from the injected batch day and the log's own
+    `wallet_first_seen.time_ms`.  §2 forbids `Date.now()` or any equivalent
+    for holdback, forfeit and eligibility logic, so nothing here reads one.
+  * REPLAY, NOT CACHE.  §6a requires the hit count to be derived by replaying
+    every canonical log from GENESIS_DAY through the batch day.  The
+    checker's own recorded per-day counts are a CACHE ONLY: they are compared
+    against the replay and can therefore only ever cause a refusal, never
+    supply a number.  A day missing from the replay range is a refusal too —
+    an unverifiable baseline is never silently assumed to be zero.
 """
 from __future__ import annotations
 
@@ -28,7 +45,7 @@ from typing import Any, Sequence
 
 from . import constants as C
 from .batch_hash import pubkey_bytes
-from .errors import Finding, LOG_INCONSISTENT
+from .errors import Finding, MISSING_ARCHIVE_DAY, TAPER_CACHE_MISMATCH
 from .sources import DayLog, LogRecord, TargetsTable, WalletFacts
 
 
@@ -110,23 +127,21 @@ def hit_counts_before(
     history: Sequence[DayLog],
     *,
     day: int,
-    carry_in: dict[str, int] | None = None,
 ) -> tuple[dict[int, int], dict[str, int]]:
-    """§6.2 hitCountBefore per result_id, from the canonical logs themselves.
+    """§6a/§6.2 hitCountBefore per result_id, by REPLAYING the canonical logs.
 
     The count is built from the canonical logs of all days STRICTLY EARLIER
     than `day`, taken in ascending day order, and then from `day`'s own log in
     confirmation order (archived_at asc, then result_id asc).  Later days are
     ignored: a hit confirmed tomorrow is not an *earlier* hit.
 
-    `carry_in` is the checker's OWN durable record (ledger.target_hits_before)
-    for days it has already signed and whose logs are not in `history`.  The
-    coordinator is never asked for a count; it only ever supplies logs, and
-    this function counts them itself.
+    There is no `carry_in`: §6a makes the replay the ONLY source of the count.
+    The checker's own records are a cache, checked against this replay by
+    `compute_day`, and are never added to it.
 
     Returns (result_id -> hitCountBefore, target -> hits carried into `day`).
     """
-    seen: dict[str, int] = dict(carry_in or {})
+    seen: dict[str, int] = {}
     by_day: dict[int, DayLog] = {}
     for dl in history:
         by_day.setdefault(dl.day, dl)
@@ -146,6 +161,18 @@ def hit_counts_before(
     return out, carried
 
 
+def replay_days_required(day: int, genesis_day: int = C.GENESIS_DAY) -> list[int]:
+    """§6a: every day whose canonical log the replay must read for `day`.
+
+    GENESIS_DAY through the day BEFORE the batch day, in ascending order, plus
+    the batch day itself (whose own log supplies the day's results).  The start
+    is the fixed GENESIS_DAY constant — never a runtime clock or query.
+    """
+    if int(day) < int(genesis_day):
+        return [int(day)]
+    return list(range(int(genesis_day), int(day) + 1))
+
+
 def fold_wallet_facts(history: Sequence[DayLog]) -> dict[str, WalletFacts]:
     """Fold §13 lifecycle events across every day up to the target day.
 
@@ -162,49 +189,59 @@ def compute_day(
     day_log: DayLog,
     *,
     targets: TargetsTable,
-    now_ms: int,
     history: Sequence[DayLog] = (),
     already_paid_result_ids: set[int] | None = None,
     recorded_day_hits: dict[int, dict[str, int]] | None = None,
+    genesis_day: int = C.GENESIS_DAY,
 ) -> DayComputation:
-    """Recompute the payable wallet entries for one calendar day."""
+    """Recompute the payable wallet entries for one calendar day.
+
+    `history` MUST contain the canonical log of every day from `genesis_day`
+    through `day_log.day` (§6a).  A gap is a refusal, not a zero.  No clock
+    parameter exists: the batch day is `day_log.day` and nothing else.
+    """
     already_paid = set(already_paid_result_ids or ())
     hist = list(history) or [day_log]
     facts = fold_wallet_facts(hist)
     findings: list[Finding] = []
     skipped: dict[int, str] = {}
 
-    # §6.2 — the taper count comes from the canonical logs of earlier days,
-    # counted here, never from a coordinator-supplied hit_count.
+    # §6a — the taper count is a FULL replay from GENESIS_DAY.  Any day in
+    # [genesis_day, day] whose log we were not given breaks the replay, and an
+    # unverifiable baseline must never be silently treated as zero.
     recorded = {int(k): dict(v) for k, v in (recorded_day_hits or {}).items()}
     fetched_days = {dl.day for dl in hist}
-    carry_in: dict[str, int] = {}
-    for d, counts in sorted(recorded.items()):
-        if d >= day_log.day or d in fetched_days:
-            continue                       # that day's own log is in `hist`
-        for tgt, n in counts.items():
-            carry_in[tgt] = carry_in.get(tgt, 0) + int(n)
+    required = replay_days_required(day_log.day, genesis_day)
+    missing = [d for d in required if d not in fetched_days]
+    if missing:
+        findings.append(Finding(
+            MISSING_ARCHIVE_DAY,
+            f"the §6a taper replay needs the canonical log of every day from "
+            f"GENESIS_DAY={genesis_day} through {day_log.day}, but "
+            f"{len(missing)} day(s) are missing from the archive: "
+            f"{missing[:10]}{'…' if len(missing) > 10 else ''} — the "
+            f"confirmed-hit baseline cannot be derived, so this batch cannot "
+            f"be signed (§6a replay rule)"))
 
-    hcb_map, carried_in_hits = hit_counts_before(
-        hist, day=day_log.day, carry_in=carry_in)
+    hcb_map, carried_in_hits = hit_counts_before(hist, day=day_log.day)
 
-    # Cross-check the checker's own durable record against the log it was
-    # just served: an earlier day whose log now counts differently means the
-    # archive was rewritten after we signed it.
-    for dl in hist:
-        if dl.day >= day_log.day:
+    # §6a cache rule: anything this checker kept is ONLY a cache and must
+    # equal the replay.  It is never added to the count — it can only refuse.
+    for dl in sorted(hist, key=lambda d: d.day):
+        if dl.day > day_log.day:
             continue
         want = recorded.get(dl.day)
         if want is None:
-            continue
+            continue                       # nothing cached for that day
         got = per_day_target_hits(dl)
         if got != want:
             findings.append(Finding(
-                LOG_INCONSISTENT,
-                f"canonical log for earlier day {dl.day} now yields confirmed-hit "
-                f"counts {sorted(got.items())}, but this checker recorded "
-                f"{sorted(want.items())} when it signed that day — the taper "
-                f"baseline for day {day_log.day} cannot be trusted (§6.2)"))
+                TAPER_CACHE_MISMATCH,
+                f"cached confirmed-hit counts for day {dl.day} are "
+                f"{sorted(want.items())}, but replaying that day's canonical "
+                f"log yields {sorted(got.items())} — saved state is only a "
+                f"cache and must equal the replay, so the taper baseline for "
+                f"day {day_log.day} cannot be trusted (§6a cache rule)"))
 
     records = sorted(day_log.records, key=lambda r: (r.archived_at, r.result_id))
 
@@ -231,11 +268,13 @@ def compute_day(
         if wf.forfeited:
             skipped[rec.result_id] = "forfeited (holdback_forfeit)"
             continue
-        # §5.1.3 — wallet-age holdback, measured from wallet_first_seen.
-        if (now_ms - wf.first_seen_ms) < C.HOLDBACK_MS:
+        # §5.1.3 — wallet-age holdback, in DAY numbers: held on batch day D
+        # when D < firstSeenDay + HOLDBACK_DAYS.  No wall clock takes part.
+        if C.is_held_on_day(wf.first_seen_ms, day_log.day):
             skipped[rec.result_id] = (
-                f"held: wallet age {now_ms - wf.first_seen_ms}ms < "
-                f"HOLDBACK_MS={C.HOLDBACK_MS}ms")
+                f"held: batch day {day_log.day} < firstSeenDay "
+                f"{C.day_of_ms(wf.first_seen_ms)} + "
+                f"HOLDBACK_DAYS={C.HOLDBACK_DAYS}")
             continue
 
         # §12 / §6.1 — tier comes only from targets_table.json.

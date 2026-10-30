@@ -17,21 +17,30 @@ BATCH_SPEC §5.0, verbatim order:
    8 target_not_in_table      a result's target absent from targets_table.json
    9 no_wallet_first_seen     recipient has no wallet_first_seen event
   10 flagged_wallet_paid      wallet_flagged with no later wallet_unflagged
-  11 held_wallet_paid         first_seen within HOLDBACK_MS of nowMs
-  12 forfeited_wallet_paid    holdback_forfeit event present
+  11 forfeited_wallet_paid    holdback_forfeit event present
+  12 held_wallet_paid         batchDay < firstSeenDay + HOLDBACK_DAYS
   13 no_confirmed_result      resultId has no confirmed verdict in the log
   14 repeated_batch_id        batchId already recorded (BatchReplay / ledger)
   15 log_hash_mismatch        batch.logHash != SHA-256(canonical log)
   16 reward_mismatch          per-result amount != calcReward(base, hitsBefore)
   17 total_mismatch           totalRaw != sum of entry amountRaw values
 
-NOTE on 11 before 12 (changed this revision): the previous spec had no stated
-order and this checker ranked forfeiture above holdback, reasoning that
-forfeiture is permanent and therefore stronger.  §5.0 now says otherwise, and
-the spec wins.  The consequence is load-bearing and is NOT cosmetic: a wallet
-that is both held and forfeited now reports `held_wallet_paid`, so fixture 07
-(`forfeited_wallet_paid`) only reaches its published rule when the wallet has
-already matured out of holdback.  See CHECKER_NOW_MS in tests/conftest_payout.py.
+NOTE on 11/12 (changed again this revision — C5b4): §5.0 rule 11 is now
+`forfeited_wallet_paid` and rule 12 is `held_wallet_paid`, with the spec
+stating the reason outright: "A forfeited wallet is also necessarily in its
+first week, but the more specific reason is forfeiture, so this rule fires
+before `held_wallet_paid`."  The previous revision had these the other way
+round and needed a hand-picked checker clock to make fixture 07 reachable at
+all.  With forfeiture first AND the holdback rule expressed in day numbers,
+both fixtures reach their published rule with no clock anywhere: 07's wallet
+(first seen day 20001, forfeited) reports forfeiture on batch day 20001, and
+06's wallet (first seen day 20000) is held on batch day 20002 because
+20002 < 20000 + 7.
+
+NO CLOCK (C5j, §2): `now_ms` is gone from every signature in this module.  The
+holdback decision uses the injected batch day and the log's own
+`wallet_first_seen.time_ms`, so the same fixtures decide identically under any
+system clock.
 
 Codes with no §5.0 number (anchor_hash_mismatch, batch_hash_mismatch, the
 cross-chunk duplicate guards, …) are checks this checker makes beyond the
@@ -72,6 +81,7 @@ from .errors import (
     LOG_HASH_MISMATCH,
     LOG_INCONSISTENT,
     MISSING_PAYABLE_ENTRY,
+    MISSING_ARCHIVE_DAY,
     NO_CONFIRMED_RESULT,
     NO_WALLET_FIRST_SEEN,
     OUT_OF_SCOPE_REWARD_PAID,
@@ -81,6 +91,7 @@ from .errors import (
     REWARD_MISMATCH,
     SORT_CONTRACT_VIOLATED,
     TARGET_NOT_IN_TABLE,
+    TAPER_CACHE_MISMATCH,
     TOTAL_ABOVE_DAY_CAP,
     TOTAL_NOT_SUM_OF_ENTRIES,
     VALIDATOR_FEE_MISMATCH,
@@ -102,8 +113,8 @@ SPEC_RULE_ORDER = (
     TARGET_NOT_IN_TABLE,         # 8
     NO_WALLET_FIRST_SEEN,        # 9
     FLAGGED_WALLET_PAID,         # 10
-    HELD_WALLET_PAID,            # 11  (before 12 — the spec's order, not ours)
-    FORFEITED_WALLET_PAID,       # 12
+    FORFEITED_WALLET_PAID,       # 11  (before 12 — the spec's order, not ours)
+    HELD_WALLET_PAID,            # 12
     NO_CONFIRMED_RESULT,         # 13
     REPEATED_BATCH_ID,           # 14
     LOG_HASH_MISMATCH,           # 15
@@ -114,6 +125,10 @@ SPEC_RULE_ORDER = (
 # Checks this checker makes beyond §5.0's list.  Ranked strictly after every
 # numbered rule so they refuse a batch without ever pre-empting a spec reason.
 EXTRA_RULE_ORDER = (
+    # §6a: without a complete replay from GENESIS_DAY there is no trustworthy
+    # baseline at all, so these come first among the non-numbered checks.
+    MISSING_ARCHIVE_DAY,
+    TAPER_CACHE_MISMATCH,
     OUT_OF_SCOPE_REWARD_PAID,
     VALIDATOR_FEE_MISMATCH,
     ANCHOR_HASH_MISMATCH,
@@ -257,9 +272,12 @@ def verify_batch(
     paid_result_ids: set[int] | None = None,
     day_total_other_chunks: int = 0,
     expected_chunk: Sequence[ComputedEntry] | None = None,
-    now_ms: int | None = None,
 ) -> VerifyResult:
-    """Full per-batch verification.  Returns a VerifyResult; never raises."""
+    """Full per-batch verification.  Returns a VerifyResult; never raises.
+
+    There is no clock parameter: the holdback rule (§5.0 rule 12, §5.1.3) is
+    decided from the batch's own `day` and the log's wallet_first_seen event.
+    """
     findings: list[Finding] = list(computation.findings)
     warnings: list[Finding] = []
     paid_result_ids = set(paid_result_ids or ())
@@ -452,20 +470,25 @@ def verify_batch(
                     f"recipient {recipient[:8]}… has a wallet_flagged event in "
                     f"the canonical log and no subsequent wallet_unflagged — "
                     f"ineligible for payout (§13.2, §5.1.4)", wallet=recipient))
-            if now_ms is not None and (now_ms - wf.first_seen_ms) < C.HOLDBACK_MS:
-                findings.append(Finding(
-                    HELD_WALLET_PAID,
-                    f"recipient {recipient[:8]}… has wallet_first_seen "
-                    f"time_ms={wf.first_seen_ms} in the canonical log — wallet "
-                    f"age {now_ms - wf.first_seen_ms}ms < "
-                    f"HOLDBACK_MS={C.HOLDBACK_MS}ms; first-week result must be "
-                    f"held (§5.1.3)", wallet=recipient))
             if wf.forfeited:
                 findings.append(Finding(
                     FORFEITED_WALLET_PAID,
                     f"recipient {recipient[:8]}… has a holdback_forfeit event "
                     f"in the canonical log — first-week results are permanently "
                     f"forfeited (§13.4, §5.1.5)", wallet=recipient))
+            # §5.0 rule 12 / §5.1.3 — DAY-based holdback, evaluated against the
+            # batch's own day.  No wall-clock value is read anywhere.
+            if C.is_held_on_day(wf.first_seen_ms, batch.day):
+                findings.append(Finding(
+                    HELD_WALLET_PAID,
+                    f"recipient {recipient[:8]}… has wallet_first_seen "
+                    f"time_ms={wf.first_seen_ms} in the canonical log "
+                    f"(firstSeenDay={C.day_of_ms(wf.first_seen_ms)}); batch day "
+                    f"{batch.day} < {C.day_of_ms(wf.first_seen_ms)} + "
+                    f"HOLDBACK_DAYS={C.HOLDBACK_DAYS} = "
+                    f"{C.holdback_release_day(wf.first_seen_ms)}, so this "
+                    f"first-week result must be held (§5.1.3, §5.0 rule 12)",
+                    wallet=recipient))
 
     # ── 5/6. duplicate + sort contract (§4) ─────────────────────────────────
     if len(set(recipients)) != len(recipients):
@@ -616,13 +639,12 @@ def verify_day(
     targets: TargetsTable,
     signed_batch_ids: set[int],
     paid_result_ids: set[int] | None = None,
-    now_ms: int | None = None,
 ) -> list[VerifyResult]:
     """Verify ALL of a day's chunks together (§5.4).
 
     No chunk is signable unless every chunk of the day passes: the chunks
     together must stay inside CAP_PER_DAY and no result may be paid twice
-    across chunks.
+    across chunks.  No clock parameter: see `verify_batch`.
     """
     results: list[VerifyResult] = []
     chunks = computation.chunks()
@@ -646,7 +668,7 @@ def verify_day(
             b, computation, day_log, anchored_log_hash, settings, targets,
             signed_batch_ids, paid_result_ids,
             day_total_other_chunks=day_total - b.total_raw,
-            expected_chunk=expected_chunk, now_ms=now_ms,
+            expected_chunk=expected_chunk,
         )
         if seq >= len(chunks):
             res.findings.append(Finding(

@@ -16,6 +16,9 @@ Fault injection: `offline` makes every route fail (503), `fail_paths` fails
 one route only, and `override_canonical` serves different bytes for a day so
 the log-hash / anchor-mismatch paths can be exercised.  No real coordinator,
 no chain, no PM2 process is contacted.
+
+C5b4: `hide_day(d)` removes a day from the archive entirely (both routes 404),
+which is how the §6a "missing day in the replay range" refusal is tested.
 """
 from __future__ import annotations
 
@@ -81,6 +84,8 @@ class _State:
         self.iso_to_day = {iso_for_day(d): d for d in self.days}
         self.override_canonical: dict[int, bytes] = {}
         self.override_manifest: dict[int, dict] = {}
+        # Days the archive refuses to serve at all (§6a replay gap).
+        self.hidden_days: set[int] = set()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -110,6 +115,8 @@ class _Handler(BaseHTTPRequestHandler):
         if len(parts) >= 2 and parts[0] == "log":
             day = self.state.iso_to_day.get(parts[1])
             if day is None:
+                return self._send_json(404, {"error": "day not archived"})
+            if day in self.state.hidden_days:
                 return self._send_json(404, {"error": "day not archived"})
             if len(parts) == 2:
                 manifest = self.state.override_manifest.get(day)
@@ -151,6 +158,13 @@ class MockPayoutCoordinator:
 
     def set_manifest(self, day: int, manifest: dict) -> None:
         self.state.override_manifest[int(day)] = manifest
+
+    def hide_day(self, day: int) -> None:
+        """Make a day vanish from the archive: both routes return 404."""
+        self.state.hidden_days.add(int(day))
+
+    def unhide_day(self, day: int) -> None:
+        self.state.hidden_days.discard(int(day))
 
     def __enter__(self) -> "MockPayoutCoordinator":
         self.thread.start()

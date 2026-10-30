@@ -1,4 +1,4 @@
-"""Step 2 — run EVERY bundle fixture through the checker and compare.
+"""Step 3 — run EVERY bundle fixture through the checker and compare.
 
 This module is the acceptance gate: the three valid days must be SIGNED and
 every tampered variant must be REFUSED for exactly the rule named in its
@@ -8,6 +8,10 @@ There are no expected failures, no xfails and no defect allowances: with the
 current bundle every one of the 19 fixtures matches its published verdict, so
 nothing needs tolerating.  If a fixture ever stops matching, this run fails —
 which is the point.
+
+C5b4: the checker takes no clock.  `process_day` receives the batch's day
+number and nothing else, and it derives the §6a replay range from
+GENESIS_DAY itself, so neither this module nor any caller can narrow it.
 
 Running this file directly prints the comparison table:
 
@@ -23,13 +27,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from conftest_payout import (  # noqa: E402,F401
-    HOLDBACK_WINDOW_MAX_MS,
-    HOLDBACK_WINDOW_MIN_MS,
+    FAKE_CLOCKS_MS,
     LIFE_MINT,
-    NOW_MS,
     PROGRAM_ID,
     anchors,
     coordinator,
+    fake_clock,
     ledger,
     log_source,
     payout_key_paths,
@@ -50,6 +53,7 @@ from mock_payout_coordinator import (  # noqa: E402
     tampered_names,
 )
 
+from payout.constants import GENESIS_DAY  # noqa: E402
 from payout.ledger import DecisionLedger  # noqa: E402
 from payout.service import PayoutSignerService  # noqa: E402
 from payout.signer_key import PayoutSigner  # noqa: E402
@@ -78,8 +82,7 @@ def _run_one(batch: dict, day: int, *, preseed_signed=(), state_dir: Path):
             ledger,
             signer=None,            # verification only; no key needed to refuse
         )
-        return svc.process_day(day, [batch], now_ms=NOW_MS,
-                               history_days=VALID_DAYS)
+        return svc.process_day(day, [batch])
 
 
 def _valid_day_outcome(day: int, state_dir: Path) -> tuple[str, str | None]:
@@ -99,8 +102,7 @@ def _valid_day_outcome(day: int, state_dir: Path) -> tuple[str, str | None]:
             PayoutSigner.from_env({"PAYOUT_KEYPAIR": str(p),
                                    "VALIDATOR_KEYPAIR": str(v)}),
         )
-        d = svc.process_day(day, [load_batch(day)], now_ms=NOW_MS,
-                            history_days=VALID_DAYS)
+        d = svc.process_day(day, [load_batch(day)])
         return ("sign" if d.signed else "refuse"), d.primary_rule
 
 
@@ -127,8 +129,7 @@ def test_signed_days_produce_a_signature_over_the_recomputed_hash(tmp_path):
             TargetsTable.from_file(TARGETS_TABLE), DecisionLedger(tmp_path / "s"),
             PayoutSigner.from_env({"PAYOUT_KEYPAIR": str(p),
                                    "VALIDATOR_KEYPAIR": str(v)}))
-        d = svc.process_day(20000, [load_batch(20000)], now_ms=NOW_MS,
-                            history_days=VALID_DAYS)
+        d = svc.process_day(20000, [load_batch(20000)])
         assert d.signed, d.reasons()
         assert d.signatures[20000000]
         assert d.results[0].batch_hash_recomputed == load_batch(20000)["batchHash"]
@@ -187,21 +188,48 @@ def _executable_source(path: Path) -> str:
     return " ".join(out)
 
 
-def test_the_checker_clock_is_inside_the_only_feasible_window():
-    """§5.0 puts held (11) before forfeited (12), which pins NOW_MS.
+def test_the_checker_needs_no_feasible_clock_window():
+    """C5b4: no instant has to be chosen for 06 and 07 to reach their rules.
 
-    Fixture 07 can only report `forfeited_wallet_paid` once its wallet has
-    matured out of holdback; fixture 06 can only report `held_wallet_paid`
-    while its wallet is still inside one.  Those two constraints leave a
-    single 3-day window, and the checker's clock must sit in it.
+    The previous revision pinned NOW_MS into a single 3-day window because
+    §5.0 then ranked held (11) above forfeited (12).  §5.0 now ranks
+    forfeited first AND states the holdback rule in day numbers, so both
+    fixtures are decided by the batch day alone:
+
+      07  wallet first seen 1727740800000 -> firstSeenDay 19997, forfeited.
+          Batch day 20001 < 19997+7 = 20004, so it IS also held — but
+          forfeiture is rule 11 and held is rule 12, so the more specific
+          `forfeited_wallet_paid` wins, exactly as §5.0 says it should.
+      06  wallet first seen 1728000000000 -> firstSeenDay 20000, not forfeited.
+          Batch day 20002 < 20000+7 = 20007, so `held_wallet_paid` fires.
+
+    The three valid days are untouched: their wallets are first seen on day
+    19986 and released on 19993, well before batch days 20000..20002.
     """
-    assert HOLDBACK_WINDOW_MIN_MS <= NOW_MS < HOLDBACK_WINDOW_MAX_MS
-    from payout.constants import HOLDBACK_MS
-    assert HOLDBACK_WINDOW_MIN_MS == 1_727_740_800_000 + HOLDBACK_MS
-    assert HOLDBACK_WINDOW_MAX_MS == 1_728_000_000_000 + HOLDBACK_MS
+    from payout.constants import HOLDBACK_DAYS, day_of_ms, is_held_on_day
+    from payout.verifier import SPEC_RULE_ORDER
+
+    assert day_of_ms(1_727_740_800_000) == 19997        # fixture 07's wallet
+    assert is_held_on_day(1_727_740_800_000, 20001)     # held AND forfeited
+    assert SPEC_RULE_ORDER.index("forfeited_wallet_paid") < \
+        SPEC_RULE_ORDER.index("held_wallet_paid")       # forfeiture wins
+
+    assert day_of_ms(1_728_000_000_000) == 20000        # fixture 06's wallet
+    assert is_held_on_day(1_728_000_000_000, 20002)     # 20002 < 20000 + 7
+    assert HOLDBACK_DAYS == 7
+
+    # The valid days' wallets are long released, so nothing is held there.
+    for batch_day in VALID_DAYS:
+        assert not is_held_on_day(1_726_790_400_000, batch_day)
+
+    # And the symbols that encoded the old hand-picked clock are gone.
+    import conftest_payout
+    assert not hasattr(conftest_payout, "NOW_MS")
+    assert not hasattr(conftest_payout, "HOLDBACK_WINDOW_MIN_MS")
+    assert not hasattr(conftest_payout, "HOLDBACK_WINDOW_MAX_MS")
 
 
-# ── the printable table (step 2) ────────────────────────────────────────────
+# ── the printable table (step 3) ────────────────────────────────────────────
 def build_table(tmp_root: Path) -> tuple[list[tuple], int]:
     rows: list[tuple] = []
     diffs = 0
@@ -236,6 +264,38 @@ def test_print_fixture_table(tmp_path, capsys):
         print()
         print(_render(rows))
     assert diffs == 0, f"{diffs} fixture(s) differ from their verdict file"
+
+
+# ── task 2: the same answers under three different system clocks ───────────
+@pytest.mark.parametrize("clock_name", sorted(FAKE_CLOCKS_MS))
+def test_the_whole_fixture_set_is_identical_under_any_system_clock(
+        clock_name, fake_clock, tmp_path):
+    """Task 2: 2024, 2026 and 2030 must all produce the SAME 19 decisions.
+
+    The clock is moved years away from the fixture dates in both directions.
+    Any surviving wall-clock read would change a holdback decision and show
+    up here as a different verdict or a different rule.
+    """
+    fake_clock(FAKE_CLOCKS_MS[clock_name])
+    rows, diffs = build_table(tmp_path)
+    assert diffs == 0, f"clock {clock_name}: {diffs} fixture(s) differ"
+    # The decision tuple, independent of the clock that produced it.
+    got = [(name, actual, actual_rule) for name, _e, _er, actual, actual_rule, _s in rows]
+    assert len(got) == 19
+    _record_clock_outcome(clock_name, got)
+
+
+_CLOCK_OUTCOMES: dict[str, list[tuple]] = {}
+
+
+def _record_clock_outcome(clock_name: str, rows: list[tuple]) -> None:
+    _CLOCK_OUTCOMES[clock_name] = rows
+    if len(_CLOCK_OUTCOMES) > 1:
+        ref_name, ref = next(iter(sorted(_CLOCK_OUTCOMES.items())))
+        for other, rows2 in sorted(_CLOCK_OUTCOMES.items()):
+            assert rows2 == ref, (
+                f"clock {other} disagrees with clock {ref_name}: "
+                f"{[a for a, b in zip(rows2, ref) if a != b][:3]}")
 
 
 def _render(rows) -> str:

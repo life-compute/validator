@@ -6,11 +6,26 @@ section of BATCH_SPEC.md (or its README constant table) that defines it.
 
 C5b2: the spec no longer contradicts itself on MAX_BATCH_ENTRIES or the token
 caps, so there is no SPEC_CONFLICTS list and no WARN_SPEC_CONFLICT warning.
+
+C5b4 (C5j): holdback is DAY-based.  §2 forbids any implementation from calling
+`Date.now()` (or any equivalent wall-clock API) for holdback, forfeit or
+eligibility logic, and §5.1.3 restates the rule purely in day numbers.  This
+module therefore exposes HOLDBACK_DAYS and GENESIS_DAY, and the whole `payout`
+package imports no clock at all.
 """
 from __future__ import annotations
 
 # ── Token units (§5.3) ───────────────────────────────────────────────────────
 RAW_PER_LIFE = 1_000_000          # 1 LIFE = 1e6 raw units, 6 decimals
+
+# ── Calendar (§2) ────────────────────────────────────────────────────────────
+# day = floor(unix_time_ms / 86_400_000).  The batch's day is ALWAYS injected
+# as an explicit parameter; it is never derived from a runtime clock (§2 C5j).
+MS_PER_DAY = 86_400_000
+
+# §6a: the network's first day.  Fixed in the spec and in every fixture
+# generator; an implementation MUST NOT derive it from a clock or a query.
+GENESIS_DAY = 20_000
 
 # ── Caps (§5.3; README constant table) ───────────────────────────────────────
 CAP_PER_BATCH = 5_000_000_000     # 5,000 LIFE, per single payout_batch call
@@ -21,8 +36,16 @@ CAP_PER_DAY = 5_000_000_000       # 5,000 LIFE, cumulative over ALL chunks/day
 MAX_BATCH_ENTRIES = 4             # distinct WALLET entries per on-chain batch
 DAILY_MINER_CAP = 20              # paid results per miner wallet per day (§5.2)
 
-# ── Holdback (§5.1.3; README) ────────────────────────────────────────────────
-HOLDBACK_MS = 604_800_000         # 7 days
+# ── Holdback (§5.1.3, §5.0 rule 12; README) ─────────────────────────────────
+# The README publishes the window as HOLDBACK_MS = 604,800,000 ms ("7 days").
+# §5.1.3 (C5j) expresses the rule itself in DAY numbers only:
+#     held on batch day D  <=>  D < firstSeenDay + HOLDBACK_DAYS
+# so HOLDBACK_DAYS is the decision-bearing constant and HOLDBACK_MS is kept
+# only as the published value it is derived from.
+HOLDBACK_MS = 604_800_000         # 7 days, as published in the README table
+HOLDBACK_DAYS = HOLDBACK_MS // MS_PER_DAY        # == 7
+assert HOLDBACK_DAYS * MS_PER_DAY == HOLDBACK_MS, \
+    "HOLDBACK_MS must be a whole number of days for the day-based rule"
 
 # ── Reward tiers (§12 tier -> base reward; mirrors §6.1) ─────────────────────
 # FIVE valid tiers.  "medium" is new in this spec revision and the table now
@@ -113,3 +136,28 @@ def raw_to_life(raw: int) -> str:
     """Human-readable LIFE amount, exact (no float)."""
     whole, frac = divmod(int(raw), RAW_PER_LIFE)
     return f"{whole:,}.{frac:06d}".rstrip("0").rstrip(".") if frac else f"{whole:,}"
+
+
+# ── Day-based holdback helpers (§2, §5.1.3) ─────────────────────────────────
+def day_of_ms(time_ms: int) -> int:
+    """§2: day = floor(unix_time_ms / 86_400_000).
+
+    Used ONLY to turn a timestamp that the canonical log itself carries
+    (`wallet_first_seen.time_ms`, `submitted_at`) into its UTC day number.
+    It never reads a clock; the value comes from the log.
+    """
+    return int(time_ms) // MS_PER_DAY
+
+
+def holdback_release_day(first_seen_ms: int) -> int:
+    """First batch day on which a wallet's holdback has expired (§5.1.3)."""
+    return day_of_ms(first_seen_ms) + HOLDBACK_DAYS
+
+
+def is_held_on_day(first_seen_ms: int, batch_day: int) -> bool:
+    """§5.0 rule 12 / §5.1.3: held on batch day D when D < firstSeenDay + 7.
+
+    No wall-clock value takes part: `first_seen_ms` is the log's own
+    wallet_first_seen timestamp and `batch_day` is the injected batch day.
+    """
+    return int(batch_day) < holdback_release_day(first_seen_ms)

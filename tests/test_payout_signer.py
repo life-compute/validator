@@ -30,11 +30,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from conftest_payout import (  # noqa: E402,F401
+    FAKE_CLOCKS_MS,
     LIFE_MINT,
-    NOW_MS,
     PROGRAM_ID,
     anchors,
     coordinator,
+    fake_clock,
     history_days,
     ledger,
     log_source,
@@ -46,6 +47,7 @@ from conftest_payout import (  # noqa: E402,F401
     write_throwaway_keypair,
 )
 from mock_payout_coordinator import (  # noqa: E402
+    MockPayoutCoordinator,
     TARGETS_TABLE,
     VALID_DAYS,
     anchored_hashes,
@@ -83,8 +85,9 @@ BUNDLE = Path("/root/api/c5b-bundle")
 # ════════════════════════════════════════════════════════════════════════════
 def test_bundle_tarball_sha256_matches_the_published_value():
     """The whole bundle must be the exact archive we were given."""
-    expected = "1510b839a95739d2c2d3987942a00b2bdc050e772c40c1b177a12fad36f84f95"
+    expected = "cec7dffb21b1a5e3ec40c232b8c882f44f8594a7c8d62cc9c741099ac4fcf838"
     raw = Path("/root/api/c5b-bundle.tar.gz").read_bytes()
+    assert len(raw) == 34_148
     assert hashlib.sha256(raw).hexdigest() == expected
 
 
@@ -322,33 +325,36 @@ def test_no_operator_supplied_payout_inputs_remain():
 # 1d. Wallet facts come only from the canonical log's events (§13)
 # ════════════════════════════════════════════════════════════════════════════
 def test_wallet_facts_are_derived_from_log_events(log_source):
+    """§13: the day_20000 log flags FTGEnxfG… and first-sees four wallets."""
     facts = log_source.day_log(20000).wallet_facts()
-    flagged = "B8ByrxZGu86M5wBeVyQVFf4M9FaDSQxD9fxjPhHQ891B"
+    flagged = "FTGEnxfGkTnr4NmAdg6M9zFBRsKsVdLVuKhES8kPY2QY"
     assert facts[flagged].flagged is True
-    assert facts["EJusumS5jpWXyAZHk3VAe75Veewh82z1gGjZk3hjFN5C"].first_seen_ms \
+    assert facts["3acNWJE2FvPhQu92kTrihzwtCLmoXp92GuXWjUKXVwBb"].first_seen_ms \
         == 1_726_790_400_000
 
 
 def test_unflag_event_clears_an_earlier_flag(log_source):
     from payout.sources import LogEvent
     dl = log_source.day_log(20000)
-    w = "B8ByrxZGu86M5wBeVyQVFf4M9FaDSQxD9fxjPhHQ891B"
+    w = "FTGEnxfGkTnr4NmAdg6M9zFBRsKsVdLVuKhES8kPY2QY"
     dl.events.append(LogEvent(event="wallet_unflagged", wallet=w,
                               time_ms=1_728_000_002_000))
     assert dl.wallet_facts()[w].flagged is False
 
 
 def test_forfeit_event_is_picked_up(log_source):
+    """§13.4: day_20001 forfeits ASRPJVwX…, and forfeiture is permanent."""
     facts = log_source.day_log(20001).wallet_facts()
-    assert facts["BbTNoDCYCQf1FoFj6LXiQEjFJ6YbSUhGrJRweoRYP6kG"].forfeited is True
+    w = facts["ASRPJVwXDmLNcEWuQL7N7BugRUXoKymshy9P3H6MmkwL"]
+    assert w.forfeited is True
+    assert w.forfeit_reason == "reject verdict during holdback window"
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # 1e. The canonical log is proven before it is used
 # ════════════════════════════════════════════════════════════════════════════
 def test_canonical_route_is_fetched_and_hashed(coordinator, service):
-    service.process_day(20000, [load_batch(20000)], now_ms=NOW_MS,
-                        history_days=VALID_DAYS)
+    service.process_day(20000, [load_batch(20000)])
     assert "/log/2024-10-04/canonical" in coordinator.state.request_log
     assert "/log/2024-10-04" in coordinator.state.request_log
 
@@ -361,7 +367,7 @@ def test_a_log_body_that_does_not_match_the_published_hash_is_refused(
     tweaked = good.replace(b'"coord_score":0.91', b'"coord_score":0.92')
     assert tweaked != good
     coordinator.set_canonical(20000, tweaked)
-    d = service.process_day(20000, [load_batch(20000)], now_ms=NOW_MS)
+    d = service.process_day(20000, [load_batch(20000)])
     assert d.refused
     assert any("does not match" in r for r in d.reasons()), d.reasons()
     assert not d.signatures
@@ -372,7 +378,7 @@ def test_a_log_that_does_not_match_the_anchor_is_refused(
     from payout.sources import AnchorSource
     bad = AnchorSource({d: "ab" * 32 for d in VALID_DAYS})
     svc = PayoutSignerService(log_source, bad, settings, targets, ledger, signer)
-    d = svc.process_day(20000, [load_batch(20000)], now_ms=NOW_MS)
+    d = svc.process_day(20000, [load_batch(20000)])
     assert d.refused
     assert any("ANCHORED" in r or ANCHOR_HASH_MISMATCH in r for r in d.reasons())
     assert not d.signatures
@@ -382,19 +388,19 @@ def test_a_missing_anchor_is_fatal(log_source, settings, targets, ledger, signer
     from payout.sources import AnchorSource
     svc = PayoutSignerService(log_source, AnchorSource({}), settings, targets,
                               ledger, signer)
-    d = svc.process_day(20000, [load_batch(20000)], now_ms=NOW_MS)
+    d = svc.process_day(20000, [load_batch(20000)])
     assert d.refused and not d.signatures
 
 
-def _verify_one(log_source, settings, targets, day, anchored, now_ms=NOW_MS):
+def _verify_one(log_source, settings, targets, day, anchored):
     """Call the verifier layer DIRECTLY, bypassing the service's hash gate."""
     from payout.recompute import compute_day
     from payout.verifier import Batch, verify_batch
     dl = log_source.day_log(day)
     hist = [log_source.day_log(d) for d in VALID_DAYS]
-    comp = compute_day(dl, targets=targets, now_ms=now_ms, history=hist)
+    comp = compute_day(dl, targets=targets, history=hist)
     return verify_batch(Batch.from_json(load_batch(day)), comp, dl, anchored,
-                        settings, targets, set(), now_ms=now_ms)
+                        settings, targets, set())
 
 
 def test_verifier_layer_independently_rejects_a_wrong_anchor(
@@ -422,7 +428,7 @@ def test_verifier_layer_independently_rejects_a_wrong_published_log_hash(
 
 def test_a_coordinator_outage_produces_no_signature(coordinator, service):
     coordinator.go_offline()
-    d = service.process_day(20000, [load_batch(20000)], now_ms=NOW_MS)
+    d = service.process_day(20000, [load_batch(20000)])
     assert d.refused and not d.signatures
 
 
@@ -450,8 +456,7 @@ def test_spec_conflicts_list_is_gone():
 
 def test_the_other_warning_is_kept(service):
     """Fee RECIPIENTS are still unverifiable, and that caveat must survive."""
-    d = service.process_day(20000, [load_batch(20000)], now_ms=NOW_MS,
-                            history_days=VALID_DAYS)
+    d = service.process_day(20000, [load_batch(20000)])
     codes = {w.code for r in d.results for w in r.warnings}
     assert "warn_fee_recipients_unverifiable" in codes
 
@@ -528,8 +533,7 @@ def test_the_checker_keeps_its_own_hit_counts_with_the_signed_batches(
     state = tmp_path / "state"
     svc = PayoutSignerService(log_source, anchors, settings, targets,
                               DecisionLedger(state), signer)
-    assert svc.process_day(20000, [load_batch(20000)], now_ms=NOW_MS,
-                           history_days=VALID_DAYS).signed
+    assert svc.process_day(20000, [load_batch(20000)]).signed
     # A fresh ledger over the same directory still knows day 20000's counts.
     reread = DecisionLedger(state)
     assert reread.day_target_hits[20000] == {"CDK4": 3, "MYC": 1, "EGFR": 1}
@@ -537,30 +541,54 @@ def test_the_checker_keeps_its_own_hit_counts_with_the_signed_batches(
     assert reread.target_hits_before(20000) == {}
 
 
-def test_the_recorded_count_carries_the_taper_without_refetching_the_log(
+def test_a_saved_count_is_never_a_substitute_for_the_replay(
         tmp_path, log_source, targets):
-    """The baseline can come from our own record alone — no coordinator count."""
+    """§6a: saved state is a CACHE ONLY — it can never supply a count.
+
+    The previous revision let a recorded per-day count stand in for a day
+    whose log was not fetched (`carry_in`).  §6a forbids that: the count must
+    come from replaying GENESIS_DAY..D, and a day missing from the replay is
+    a refusal.  Feeding the record without the log must therefore NOT quietly
+    produce a taper baseline — it must report the missing day.
+    """
+    from payout.errors import MISSING_ARCHIVE_DAY
     from payout.recompute import compute_day
     dl = log_source.day_log(20001)
-    # No history at all, but our own record of day 20000 is supplied.
-    comp = compute_day(dl, targets=targets, now_ms=NOW_MS, history=[dl],
+    # Day 20000's log is deliberately absent; only our own record is offered.
+    comp = compute_day(dl, targets=targets, history=[dl],
                        recorded_day_hits={20000: {"CDK4": 3, "MYC": 1, "EGFR": 1}})
+    assert MISSING_ARCHIVE_DAY in {f.code for f in comp.findings}, \
+        [f.code for f in comp.findings]
+    # And the record contributed nothing to the count.
+    assert comp.carried_in_hits == {}
+
+
+def test_the_replay_supplies_the_whole_baseline(log_source, targets):
+    """§6a: with the full replay present, the baseline comes from the logs."""
+    from payout.recompute import compute_day
+    hist = [log_source.day_log(d) for d in VALID_DAYS]
+    comp = compute_day(hist[1], targets=targets, history=hist)
+    assert not comp.findings, [f.code for f in comp.findings]
     assert comp.carried_in_hits == {"CDK4": 3, "MYC": 1, "EGFR": 1}
     assert comp.hit_counts_before[6] == 1        # MYC already hit once
     assert comp.hit_counts_before[8] == 3        # CDK4 already hit three times
     assert comp.hit_counts_before[7] == 0        # TP53 is brand new
 
 
-def test_a_rewritten_earlier_log_invalidates_the_taper_baseline(
+def test_a_cached_count_that_differs_from_the_replay_refuses(
         log_source, targets):
-    """Our record and the served log must agree about an earlier day."""
+    """§6a cache rule: cache != replay is a refusal, in either direction."""
     from payout.recompute import compute_day
-    from payout.errors import LOG_INCONSISTENT
+    from payout.errors import TAPER_CACHE_MISMATCH
     hist = [log_source.day_log(d) for d in (20000, 20001)]
-    comp = compute_day(hist[1], targets=targets, now_ms=NOW_MS, history=hist,
+    comp = compute_day(hist[1], targets=targets, history=hist,
                        recorded_day_hits={20000: {"CDK4": 99, "MYC": 1, "EGFR": 1}})
-    assert any(f.code == LOG_INCONSISTENT for f in comp.findings), \
+    assert any(f.code == TAPER_CACHE_MISMATCH for f in comp.findings), \
         [f.code for f in comp.findings]
+    # The honest cache for that day passes.
+    ok = compute_day(hist[1], targets=targets, history=hist,
+                     recorded_day_hits={20000: {"CDK4": 3, "MYC": 1, "EGFR": 1}})
+    assert not ok.findings, [f.code for f in ok.findings]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -580,8 +608,8 @@ def test_rule_order_is_the_spec_numbered_list_verbatim():
         "target_not_in_table",        # 8
         "no_wallet_first_seen",       # 9
         "flagged_wallet_paid",        # 10
-        "held_wallet_paid",           # 11
-        "forfeited_wallet_paid",      # 12
+        "forfeited_wallet_paid",      # 11
+        "held_wallet_paid",           # 12
         "no_confirmed_result",        # 13
         "repeated_batch_id",          # 14
         "log_hash_mismatch",          # 15
@@ -593,11 +621,15 @@ def test_rule_order_is_the_spec_numbered_list_verbatim():
     assert not set(SPEC_RULE_ORDER) & set(EXTRA_RULE_ORDER)
 
 
-def test_held_outranks_forfeited_because_the_spec_says_so():
-    """§5.0 puts held (11) before forfeited (12) — the reverse of C5b2."""
+def test_forfeited_outranks_held_because_the_spec_says_so():
+    """§5.0 now puts forfeited (11) before held (12) — the reverse of C5b3.
+
+    The spec gives the reason in the rule text itself: a forfeited wallet is
+    necessarily also in its first week, so the more SPECIFIC reason must win.
+    """
     from payout.verifier import SPEC_RULE_ORDER
-    assert SPEC_RULE_ORDER.index("held_wallet_paid") < \
-        SPEC_RULE_ORDER.index("forfeited_wallet_paid")
+    assert SPEC_RULE_ORDER.index("forfeited_wallet_paid") < \
+        SPEC_RULE_ORDER.index("held_wallet_paid")
 
 
 def test_a_batch_breaking_several_rules_is_refused_for_the_first_one(
@@ -607,14 +639,14 @@ def test_a_batch_breaking_several_rules_is_refused_for_the_first_one(
     from payout.verifier import Batch, verify_batch
     dl = log_source.day_log(20000)
     hist = [log_source.day_log(d) for d in VALID_DAYS]
-    comp = compute_day(dl, targets=targets, now_ms=NOW_MS, history=hist)
+    comp = compute_day(dl, targets=targets, history=hist)
 
     raw = load_batch(20000)
     raw["entries"] = list(reversed(raw["entries"]))        # rule 6: unsorted
     raw["entries"][0]["results"][0]["amountRaw"] = "999999"  # rule 16: reward
     raw["entries"][0]["amountRaw"] = "999999"
     res = verify_batch(Batch.from_json(raw), comp, dl, anchored_hashes()[20000],
-                       settings, targets, set(), now_ms=NOW_MS)
+                       settings, targets, set())
     assert not res.signable
     fired = {f.code for f in res.findings}
     assert "sort_contract_violated" in fired and "reward_mismatch" in fired
@@ -644,14 +676,14 @@ def test_a_batch_paying_an_out_of_scope_reward_is_refused(
     from payout.verifier import Batch, verify_batch
     dl = log_source.day_log(20000)
     hist = [log_source.day_log(d) for d in VALID_DAYS]
-    comp = compute_day(dl, targets=targets, now_ms=NOW_MS, history=hist)
+    comp = compute_day(dl, targets=targets, history=hist)
 
     raw = load_batch(20000)
     ent = raw["entries"][0]                      # 4pmn7PJu… / result 3 / CDK4
     ent["results"][0]["amountRaw"] = str(amount)
     ent["amountRaw"] = str(amount)
     res = verify_batch(Batch.from_json(raw), comp, dl, anchored_hashes()[20000],
-                       settings, targets, set(), now_ms=NOW_MS)
+                       settings, targets, set())
     assert not res.signable
     assert OUT_OF_SCOPE_REWARD_PAID in {f.code for f in res.findings}, \
         res.reasons()
@@ -671,11 +703,9 @@ def test_entry_total_must_equal_the_sum_of_its_breakdown():
 # 1h. Replay: the checker keeps its own record of signed batch ids
 # ════════════════════════════════════════════════════════════════════════════
 def test_a_batch_id_is_never_signed_twice(service):
-    first = service.process_day(20000, [load_batch(20000)], now_ms=NOW_MS,
-                                history_days=VALID_DAYS)
+    first = service.process_day(20000, [load_batch(20000)])
     assert first.signed, first.reasons()
-    second = service.process_day(20000, [load_batch(20000)], now_ms=NOW_MS,
-                                 history_days=VALID_DAYS)
+    second = service.process_day(20000, [load_batch(20000)])
     assert second.refused
     assert second.primary_rule == REPEATED_BATCH_ID
     assert not second.signatures
@@ -686,13 +716,11 @@ def test_the_signed_record_survives_a_restart(tmp_path, log_source, anchors,
     state = tmp_path / "state"
     svc1 = PayoutSignerService(log_source, anchors, settings, targets,
                                DecisionLedger(state), signer)
-    assert svc1.process_day(20000, [load_batch(20000)], now_ms=NOW_MS,
-                            history_days=VALID_DAYS).signed
+    assert svc1.process_day(20000, [load_batch(20000)]).signed
     # A brand-new service over the same state directory.
     svc2 = PayoutSignerService(log_source, anchors, settings, targets,
                                DecisionLedger(state), signer)
-    again = svc2.process_day(20000, [load_batch(20000)], now_ms=NOW_MS,
-                             history_days=VALID_DAYS)
+    again = svc2.process_day(20000, [load_batch(20000)])
     assert again.refused and again.primary_rule == REPEATED_BATCH_ID
 
 
@@ -728,3 +756,162 @@ def test_signer_signs_the_32_raw_bytes_only(signer):
 
 def test_signer_repr_never_leaks_secret_material(signer):
     assert "secret withheld" in repr(signer)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2. Task 2 — the checker's saved state is only a cache, and no clock is read
+# ════════════════════════════════════════════════════════════════════════════
+def _fresh_service(tmp_path, mock, state_dir, signed=False):
+    """A service over `state_dir`, with or without a signing key."""
+    from conftest_payout import write_throwaway_keypair
+    from payout.sources import AnchorSource
+    key = None
+    if signed:
+        p_, v_ = tmp_path / "pk.json", tmp_path / "vk.json"
+        if not p_.exists():
+            write_throwaway_keypair(p_)
+            write_throwaway_keypair(v_)
+        key = PayoutSigner.from_env({"PAYOUT_KEYPAIR": str(p_),
+                                     "VALIDATOR_KEYPAIR": str(v_)})
+    from payout.sources import LogSource as _LS
+    return PayoutSignerService(
+        _LS(mock.url, timeout=5.0), AnchorSource(anchored_hashes()),
+        Settings(program_id=PROGRAM_ID, life_mint=LIFE_MINT),
+        TargetsTable.from_file(TARGETS_TABLE), DecisionLedger(state_dir), key)
+
+
+def _decide(tmp_path, mock, state_dir, day):
+    d = _fresh_service(tmp_path, mock, state_dir).process_day(
+        day, [load_batch(day)])
+    return ("sign" if d.signed else "refuse"), d.primary_rule
+
+
+def test_deleting_the_saved_state_gives_identical_decisions(tmp_path):
+    """Task 2: the saved state is a cache, so losing it changes nothing.
+
+    Each valid day is decided once with a warm state directory (populated by
+    a prior run of the SAME day on a sibling ledger) and once with the state
+    directory deleted outright.  §6a says the count comes from the replay, so
+    both runs must agree exactly.
+    """
+    import shutil
+    with MockPayoutCoordinator() as mock:
+        for day in VALID_DAYS:
+            warm = tmp_path / f"warm_{day}"
+            # Populate the cache by signing the earlier days first.
+            svc = _fresh_service(tmp_path, mock, warm, signed=True)
+            for earlier in [d for d in VALID_DAYS if d < day]:
+                svc.process_day(earlier, [load_batch(earlier)])
+            with_state = _decide(tmp_path, mock, warm, day)
+            assert (warm / "payout_index.json").is_file()
+
+            shutil.rmtree(warm)
+            assert not warm.exists()
+            without_state = _decide(tmp_path, mock, warm, day)
+
+            assert with_state == without_state, (
+                f"day {day}: with saved state {with_state}, "
+                f"without it {without_state}")
+
+
+def test_changing_one_saved_count_makes_the_checker_refuse(tmp_path):
+    """Task 2: a single tampered cached count must refuse, not re-price.
+
+    Day 20000's own log gives CDK4 three confirmed hits.  Writing 4 into the
+    checker's saved state contradicts the replay by exactly one, and §6a's
+    cache rule makes that a refusal.
+    """
+    import json as _json
+    from payout.errors import TAPER_CACHE_MISMATCH
+    with MockPayoutCoordinator() as mock:
+        state = tmp_path / "state"
+        svc = _fresh_service(tmp_path, mock, state, signed=True)
+        first = svc.process_day(20000, [load_batch(20000)])
+        assert first.signed, first.reasons()
+
+        index_path = state / "payout_index.json"
+        index = _json.loads(index_path.read_text())
+        assert index["day_target_hits"]["20000"]["CDK4"] == 3
+        index["day_target_hits"]["20000"]["CDK4"] = 4        # one count, +1
+        # Let the same day be re-checked: clear only the replay guard.
+        index["signed_batch_ids"] = []
+        index["paid_result_ids"] = []
+        index_path.write_text(_json.dumps(index))
+
+        again = _fresh_service(tmp_path, mock, state).process_day(
+            20000, [load_batch(20000)])
+        assert again.refused, "a tampered cached count must refuse"
+        assert not again.signatures
+        assert again.primary_rule == TAPER_CACHE_MISMATCH, again.reasons()
+
+
+def test_a_missing_day_in_the_archive_makes_the_checker_refuse(tmp_path):
+    """Task 2 / §6a: a gap anywhere in GENESIS_DAY..D refuses to sign.
+
+    Day 20002's replay range is 20000, 20001, 20002.  Hiding day 20001 leaves
+    the batch day itself perfectly servable, so only the replay rule can catch
+    it — and an absent day must never be treated as "zero hits".
+    """
+    from payout.constants import GENESIS_DAY
+    from payout.errors import MISSING_ARCHIVE_DAY
+    assert GENESIS_DAY == 20000
+    with MockPayoutCoordinator() as mock:
+        mock.hide_day(20001)
+        d = _fresh_service(tmp_path, mock, tmp_path / "s", signed=True).process_day(
+            20002, [load_batch(20002)])
+        assert d.refused, "a missing archive day must refuse"
+        assert not d.signatures
+        assert d.primary_rule == MISSING_ARCHIVE_DAY, d.reasons()
+        assert "20001" in " ".join(d.reasons())
+
+
+def test_the_replay_really_reads_every_day_from_genesis(tmp_path):
+    """§6a: GET /log/{day}/canonical is called for 20000..D, in order."""
+    from payout.batch_hash import day_to_iso
+    with MockPayoutCoordinator() as mock:
+        _fresh_service(tmp_path, mock, tmp_path / "s", signed=True).process_day(
+            20002, [load_batch(20002)])
+        canon = [p for p in mock.state.request_log if p.endswith("/canonical")]
+        for day in (20000, 20001, 20002):
+            assert f"/log/{day_to_iso(day)}/canonical" in canon, day
+        # Ascending day order, genesis first.
+        order = [p for p in canon if p.endswith("/canonical")]
+        assert order.index(f"/log/{day_to_iso(20000)}/canonical") < \
+            order.index(f"/log/{day_to_iso(20002)}/canonical")
+
+
+def test_the_payout_package_contains_no_wall_clock_call():
+    """Task 1(a): no NOW_MS and no current-time read anywhere in `payout`.
+
+    Checked against executable source (comments and docstrings stripped), so
+    the prose explaining the removal cannot satisfy the test by itself.
+    """
+    import tokenize
+    import payout
+    banned = ("NOW_MS", "now_ms", "time.time", "time_ns", "datetime.now",
+              "utcnow", "date.today", "monotonic", "perf_counter")
+    pkg_dir = Path(payout.__file__).parent
+    offenders = {}
+    for src in sorted(pkg_dir.glob("*.py")):
+        toks = []
+        with src.open("rb") as fh:
+            for tok in tokenize.tokenize(fh.readline):
+                if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                    continue
+                toks.append(tok.string)
+        code = "".join(toks)
+        hits = [b for b in banned if b.replace(".", "") in code.replace(".", "")]
+        if hits:
+            offenders[src.name] = hits
+    assert not offenders, f"wall-clock references remain: {offenders}"
+
+
+@pytest.mark.parametrize("clock_name", sorted(FAKE_CLOCKS_MS))
+def test_a_signed_day_is_signed_under_any_clock(clock_name, fake_clock, tmp_path):
+    """Task 2: the signature itself is clock-independent, byte for byte."""
+    fake_clock(FAKE_CLOCKS_MS[clock_name])
+    with MockPayoutCoordinator() as mock:
+        d = _fresh_service(tmp_path, mock, tmp_path / "s", signed=True).process_day(
+            20000, [load_batch(20000)])
+        assert d.signed, d.reasons()
+        assert d.results[0].batch_hash_recomputed == load_batch(20000)["batchHash"]

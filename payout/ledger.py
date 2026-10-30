@@ -14,13 +14,19 @@ logs, so the hit count never comes from the coordinator.
 Storage is a JSONL file plus a small JSON index, both under the service's
 state directory.  No secret material is ever written: signatures are public,
 keys are not stored.
+
+C5b4 (C5j, §2): no clock.  Decision records used to carry a `ts` taken from
+`time.time()`; the spec forbids any wall-clock call in this path, so records
+are ordered by a durable per-ledger sequence number (`seq`) instead.  The
+recorded per-day hit counts are, per §6a, only a CACHE: `recompute.compute_day`
+compares them against a full replay from GENESIS_DAY and refuses on a
+mismatch, so nothing here is ever trusted as a substitute for the replay.
 """
 from __future__ import annotations
 
 import json
 import os
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -42,11 +48,12 @@ class DecisionLedger:
                     obj.setdefault("signed_batch_ids", [])
                     obj.setdefault("paid_result_ids", [])
                     obj.setdefault("day_target_hits", {})
+                    obj.setdefault("decision_seq", 0)
                     return obj
             except json.JSONDecodeError:
                 pass
         return {"signed_batch_ids": [], "paid_result_ids": [],
-                "day_target_hits": {}}
+                "day_target_hits": {}, "decision_seq": 0}
 
     def _save_index(self) -> None:
         tmp = tempfile.NamedTemporaryFile(
@@ -93,7 +100,11 @@ class DecisionLedger:
     # ── writes ──────────────────────────────────────────────────────────────
     def record_decision(self, record: dict[str, Any]) -> dict[str, Any]:
         entry = dict(record)
-        entry.setdefault("ts", int(time.time() * 1000))
+        # §2 forbids a wall-clock call anywhere in the checker, so decisions
+        # are ordered by a durable counter rather than a timestamp.
+        self._index["decision_seq"] = int(self._index.get("decision_seq", 0)) + 1
+        entry.setdefault("seq", self._index["decision_seq"])
+        self._save_index()
         with self.log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, sort_keys=True) + "\n")
             fh.flush()

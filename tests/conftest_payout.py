@@ -5,6 +5,13 @@ to any real wallet location.  No chain, no PM2 process, no live coordinator.
 
 The anchored hashes are a MOCK (mock_payout_coordinator.anchored_hashes), so
 the wrong-anchor and repeated-batch-id variants are testable without a chain.
+
+C5b4: there is no checker clock.  NOW_MS and the hand-picked "feasible
+holdback window" are gone: BATCH_SPEC §2/§5.1.3 make holdback a function of
+the batch's day number and the log's own wallet_first_seen event, and §5.0
+now fires `forfeited_wallet_paid` (11) before `held_wallet_paid` (12), so no
+fixture needs a particular instant to reach its published rule.  Tests that
+care prove this by running the whole set under three different fake clocks.
 """
 from __future__ import annotations
 
@@ -24,34 +31,15 @@ from payout.ledger import DecisionLedger
 from payout.signer_key import PayoutSigner
 from payout.sources import AnchorSource, LogSource, Settings, TargetsTable
 
-# ── the checker's clock (§5.1.3 holdback is measured against it) ────────────
-#
-# NOW_MS is NOT free to choose: BATCH_SPEC §5.0 orders held_wallet_paid (11)
-# BEFORE forfeited_wallet_paid (12), so a wallet that is both held and
-# forfeited reports *held*.  Two fixtures pull in opposite directions:
-#
-#   07_forfeited_wallet_paid  BbTNoDCY… first_seen 1727740800000, forfeited.
-#       To surface `forfeited_wallet_paid` it must NOT also be held:
-#           nowMs ≥ 1727740800000 + 604800000 = 1728345600000
-#   06_held_wallet_paid       ATQisH1y… first_seen 1728000000000, not forfeited.
-#       To surface `held_wallet_paid` it must still be inside the window:
-#           nowMs <  1728000000000 + 604800000 = 1728604800000
-#
-# Feasible window: [1728345600000, 1728604800000)
-#                  = 2024-10-08T00:00Z .. 2024-10-11T00:00Z (exclusive).
-# The batches' own builtAt (1728172800000, 2024-10-06) is OUTSIDE it — at that
-# instant BbTNoDCY is still inside its first week and correctly reports
-# `held_wallet_paid`, not the rule its verdict file names.  We therefore run
-# the checker at 2024-10-09T00:00Z, the midpoint of the feasible window.
-#
-# Wallets first seen 1726790400000 (2024-09-20) are far past the holdback at
-# this instant, so the three valid days are unaffected.
-NOW_MS = 1_728_432_000_000          # 2024-10-09T00:00:00Z
-
-# The window above, asserted in tests so a future clock change cannot silently
-# flip 06 and 07 to the wrong rule.
-HOLDBACK_WINDOW_MIN_MS = 1_728_345_600_000
-HOLDBACK_WINDOW_MAX_MS = 1_728_604_800_000
+# ── system clocks the whole fixture set must decide identically under ───────
+# Task 2: the checker reads no clock, so these are only ever installed to
+# PROVE that.  They straddle the fixture dates on both sides (2024 is around
+# them, 2026 and 2030 are years later).
+FAKE_CLOCKS_MS = {
+    "2024": 1_704_067_200_000,      # 2024-01-01T00:00:00Z
+    "2026": 1_767_225_600_000,      # 2026-01-01T00:00:00Z
+    "2030": 1_893_456_000_000,      # 2030-01-01T00:00:00Z
+}
 
 # BATCH_SPEC §16 / README: the required checker configuration.
 PROGRAM_ID = "BU7WVCvy9CqypB7Hqhw6RJakAeSieVsWNapytQpFgi18"
@@ -123,3 +111,40 @@ def service(log_source, anchors, settings, targets, ledger, signer):
 def history_days() -> tuple[int, ...]:
     """All valid fixture days: wallet_first_seen is emitted once, on day 0."""
     return VALID_DAYS
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Install a fixed system clock; the checker must not notice.
+
+    Patches `time.time`, `time.time_ns` and `datetime.datetime.now/utcnow` so
+    that ANY wall-clock call made anywhere under test returns the chosen
+    instant.  The checker is supposed to make none.
+    """
+    import datetime as _dt
+    import time as _time
+
+    def _install(ms: int):
+        secs = ms / 1000.0
+        monkeypatch.setattr(_time, "time", lambda: secs)
+        monkeypatch.setattr(_time, "time_ns", lambda: int(ms) * 1_000_000)
+
+        fixed = _dt.datetime.fromtimestamp(secs, _dt.timezone.utc)
+
+        class _FrozenDateTime(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+            @classmethod
+            def utcnow(cls):
+                return fixed.replace(tzinfo=None)
+
+            @classmethod
+            def today(cls):
+                return fixed.replace(tzinfo=None)
+
+        monkeypatch.setattr(_dt, "datetime", _FrozenDateTime)
+        return ms
+
+    return _install

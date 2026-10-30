@@ -69,6 +69,11 @@ LOG_INCONSISTENT = "log_inconsistent"
 MALFORMED_BATCH = "malformed_batch"
 COORDINATOR_UNREACHABLE = "coordinator_unreachable"
 NO_PAYOUT_KEY = "no_payout_key"
+# §6a — the taper baseline must be a full replay from GENESIS_DAY.  A day that
+# the archive cannot serve breaks the replay, and any state the checker kept is
+# only a cache that must equal the replay.  Both are refusals.
+MISSING_ARCHIVE_DAY = "missing_archive_day"
+TAPER_CACHE_MISMATCH = "taper_cache_mismatch"
 # §6.1 / §10a — the reference reward and the weekly discovery bonus are not
 # payable through payout_batch at all, so a batch carrying either is refused.
 OUT_OF_SCOPE_REWARD_PAID = "out_of_scope_reward_paid"

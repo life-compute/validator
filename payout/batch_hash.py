@@ -149,13 +149,19 @@ def log_hash_hex(canonical_ndjson: bytes) -> str:
 
 
 def day_to_iso(day: int) -> str:
-    """§2: day = floor(unix_ms / 86_400_000) -> the YYYY-MM-DD GET /log key."""
+    """§2: day = floor(unix_ms / 86_400_000) -> the YYYY-MM-DD GET /log key.
+
+    A pure calendar conversion of a day NUMBER that is already in hand.  It
+    reads no clock (no `now()`, no `today()`), so it is not a wall-clock call
+    of the kind §2 forbids for holdback/forfeit/eligibility logic.
+    """
     import datetime as _dt
     return (_dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
             + _dt.timedelta(days=int(day))).strftime("%Y-%m-%d")
 
 
 def iso_to_day(iso: str) -> int:
+    """Inverse of `day_to_iso`; likewise a pure conversion, never a clock."""
     import datetime as _dt
     d = _dt.datetime.strptime(iso, "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc)
     return int(d.timestamp() * 1000) // 86_400_000
