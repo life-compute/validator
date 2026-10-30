@@ -28,6 +28,19 @@ class CoordinatorUnreachable(PayoutError):
     """
 
 
+class DayNotClosed(CoordinatorUnreachable):
+    """The day is still OPEN, so its log is not final and must not be used.
+
+    BATCH_SPEC §13.6 / API_CONTRACT §2.16: an open day answers
+    `GET /log/{day}/canonical` with `409 Conflict` and `GET /log/{day}` with
+    `closed: false`.  An open day's lines can still change, so no payout may
+    ever be derived from one.  This is a subclass of CoordinatorUnreachable
+    so that every existing fail-closed path still catches it, but it carries
+    its own refusal code so the reason is explicit rather than a bare
+    "HTTP 409".
+    """
+
+
 class PayoutKeyError(PayoutError):
     """Refuse-to-start condition for the payout signing key."""
 
@@ -74,6 +87,10 @@ NO_PAYOUT_KEY = "no_payout_key"
 # only a cache that must equal the replay.  Both are refusals.
 MISSING_ARCHIVE_DAY = "missing_archive_day"
 TAPER_CACHE_MISMATCH = "taper_cache_mismatch"
+# §13.6 — an OPEN day is not final: GET /log/{day}/canonical answers 409 and
+# GET /log/{day} reports closed:false.  Its log may still change, so it is
+# never read, never cached and never signed against.
+DAY_NOT_CLOSED = "day_not_closed"
 # §6.1 / §10a — the reference reward and the weekly discovery bonus are not
 # payable through payout_batch at all, so a batch carrying either is refused.
 OUT_OF_SCOPE_REWARD_PAID = "out_of_scope_reward_paid"

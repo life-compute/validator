@@ -86,6 +86,9 @@ class _State:
         self.override_manifest: dict[int, dict] = {}
         # Days the archive refuses to serve at all (§6a replay gap).
         self.hidden_days: set[int] = set()
+        # Days that are still OPEN (§13.6): /canonical -> 409, manifest ->
+        # closed:false.  A closed day is served normally.
+        self.open_days: set[int] = set()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -123,8 +126,32 @@ class _Handler(BaseHTTPRequestHandler):
                 if manifest is None:
                     manifest = json.loads(
                         (day_dir(day) / "log_get_response.json").read_text())
+                if day in self.state.open_days:
+                    # §13.6: an open day reports closed:false, no-store, and
+                    # publishes no final hash.
+                    manifest = {k: v for k, v in manifest.items()
+                                if k not in ("log_hash", "results", "verdicts")}
+                    manifest["closed"] = False
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    body = json.dumps(manifest).encode()
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    return self.wfile.write(body)
                 return self._send_json(200, manifest)
             if len(parts) == 3 and parts[2] == "canonical":
+                if day in self.state.open_days:
+                    # §2.16: 409 Conflict + Cache-Control: no-store.
+                    body = json.dumps({"error": "Day is not yet closed",
+                                       "day": parts[1],
+                                       "closed": False}).encode()
+                    self.send_response(409)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    return self.wfile.write(body)
                 raw = self.state.override_canonical.get(day)
                 if raw is None:
                     raw = (day_dir(day) / "canonical_log.ndjson").read_bytes()
@@ -165,6 +192,13 @@ class MockPayoutCoordinator:
 
     def unhide_day(self, day: int) -> None:
         self.state.hidden_days.discard(int(day))
+
+    def open_day(self, day: int) -> None:
+        """Make a day OPEN (§13.6): /canonical -> 409, manifest closed:false."""
+        self.state.open_days.add(int(day))
+
+    def close_day(self, day: int) -> None:
+        self.state.open_days.discard(int(day))
 
     def __enter__(self) -> "MockPayoutCoordinator":
         self.thread.start()

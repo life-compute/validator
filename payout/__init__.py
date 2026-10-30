@@ -17,6 +17,7 @@ from .batch_hash import (
 )
 from .errors import (
     CoordinatorUnreachable,
+    DayNotClosed,
     Finding,
     PayoutConfigError,
     PayoutError,
@@ -39,7 +40,8 @@ from .verifier import Batch, RULE_PRECEDENCE, verify_batch, verify_day, VerifyRe
 
 __all__ = [
     "AnchorSource", "Batch", "ComputedEntry", "CoordinatorUnreachable",
-    "DayComputation", "DayDecision", "DayLog", "DecisionLedger", "Finding",
+    "DayComputation", "DayDecision", "DayLog", "DayNotClosed",
+    "DecisionLedger", "Finding",
     "LogSource", "PayoutConfigError", "PayoutError", "PayoutKeyError",
     "PayoutSigner", "PayoutSignerService", "RULE_PRECEDENCE", "Settings",
     "TargetsTable", "VerifyResult", "WalletFacts", "batch_hash_bytes",

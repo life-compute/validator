@@ -29,6 +29,8 @@ from . import constants as C
 from .errors import (
     COORDINATOR_UNREACHABLE,
     CoordinatorUnreachable,
+    DAY_NOT_CLOSED,
+    DayNotClosed,
     Finding,
     LOG_INCONSISTENT,
     MALFORMED_BATCH,
@@ -140,6 +142,18 @@ class PayoutSignerService:
         for d in replay_days_required(day, genesis_day):
             try:
                 d_log, d_anchor = self._load_verified_day_log(d)
+            except DayNotClosed as exc:
+                # §13.6: an OPEN day is never usable — not as the batch day
+                # and not as a replay day.  Refuse with the explicit reason
+                # instead of letting it look like an unreachable archive.
+                which = ("the batch day itself" if d == day
+                         else f"replay day {d} (GENESIS_DAY={genesis_day}..{day})")
+                return self._refuse_hard(
+                    day, DAY_NOT_CLOSED,
+                    f"day {d} is NOT CLOSED — {which} is still open "
+                    f"({exc}); an open day's canonical log is not final and "
+                    f"must never be used for a payout, so no signature is "
+                    f"produced")
             except CoordinatorUnreachable as exc:
                 if d == day:
                     # The batch's own day: report the source/integrity failure.

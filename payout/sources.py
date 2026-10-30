@@ -32,7 +32,7 @@ from typing import Any
 
 from .batch_hash import day_to_iso, log_hash_hex, pubkey_bytes
 from .constants import TARGETS_TABLE_SHA256
-from .errors import CoordinatorUnreachable, PayoutConfigError
+from .errors import CoordinatorUnreachable, DayNotClosed, PayoutConfigError
 
 # Lifecycle event names defined by BATCH_SPEC §13.
 EV_FIRST_SEEN = "wallet_first_seen"
@@ -241,6 +241,17 @@ class DayLog:
         r = self.manifest.get("results")
         return str(r.get("sha256")).lower() if isinstance(r, dict) and r.get("sha256") else None
 
+    @property
+    def manifest_closed(self) -> bool | None:
+        """§13.6 `closed` flag of GET /log/{day}, or None when not published.
+
+        A closed day reports `closed: true`; an open day reports
+        `closed: false`.  The flag is optional in this bundle's manifests, so
+        None means "not stated" and only an explicit False is an open day.
+        """
+        v = self.manifest.get("closed")
+        return bool(v) if isinstance(v, bool) else None
+
     def wallet_facts(self, carry_in: dict[str, WalletFacts] | None = None
                      ) -> dict[str, WalletFacts]:
         """Fold the day's lifecycle events into per-wallet facts (§13).
@@ -292,6 +303,12 @@ class LogSource:
                         f"GET {path} returned HTTP {resp.status}")
                 return resp.read()
         except urllib.error.HTTPError as exc:
+            # §13.6 / §2.16: 409 means the day is still OPEN, not that the
+            # archive is broken.  Distinguish it so the refusal says why.
+            if exc.code == 409:
+                raise DayNotClosed(
+                    f"GET {path} returned HTTP 409: the day is still open "
+                    f"(not yet closed)") from None
             raise CoordinatorUnreachable(f"GET {path} returned HTTP {exc.code}") from None
         except (urllib.error.URLError, OSError) as exc:
             # Never include the full URL: it can carry credentials.
@@ -318,8 +335,19 @@ class LogSource:
         return self._get(f"/log/{day_to_iso(day)}/canonical")
 
     def day_log(self, day: int) -> DayLog:
-        """Fetch manifest + canonical body and parse both line classes (§13)."""
+        """Fetch manifest + canonical body and parse both line classes (§13).
+
+        §13.6: the manifest is read FIRST and an explicitly open day
+        (`closed: false`) stops here — the canonical body is never fetched,
+        so an open day's lines cannot reach any payout computation.  An open
+        day also answers the canonical route with 409, which `_get` turns
+        into the same DayNotClosed refusal.
+        """
         manifest = self.log_manifest(day)
+        if manifest.get("closed") is False:
+            raise DayNotClosed(
+                f"GET /log/{day_to_iso(day)} reports closed=false: day {day} "
+                f"is still open, so its canonical log is not final (§13.6)")
         raw = self.canonical_log_bytes(day)
         records: list[LogRecord] = []
         events: list[LogEvent] = []

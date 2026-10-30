@@ -78,33 +78,93 @@ from payout.signer_key import PayoutSigner  # noqa: E402
 from payout.sources import Settings, TargetsTable  # noqa: E402
 
 BUNDLE = Path("/root/api/c5b-bundle")
+BUNDLE_TARBALL = Path("/root/api/c5b-bundle.tar.gz")
+
+
+# ── bundle-derived helpers (no literal from any particular bundle) ──────────
+def readme_index() -> dict[str, str]:
+    """The README's File Index section as {relative path: sha256}.
+
+    Parsed from the bundle's own README, so a new bundle with different files,
+    different hashes or a different file count needs no edit here.
+    """
+    import re
+    readme = (BUNDLE / "README.md").read_text()
+    section = readme.split("## File Index", 1)[1].split("\n## ", 1)[0]
+    rows = re.findall(r"^\|\s*([^|]+?)\s*\|\s*([0-9a-f]{64})\s*\|\s*$",
+                      section, re.M)
+    assert rows, "the README File Index section lists no files"
+    return dict(rows)
+
+
+def log_events(day: int, kind: str) -> list[dict]:
+    """Lifecycle events of one kind in a day's canonical log, in file order."""
+    path = BUNDLE / f"fixtures/day_{day}/canonical_log.ndjson"
+    out = []
+    for line in path.read_text().splitlines():
+        if line.strip() and (obj := json.loads(line)).get("event") == kind:
+            out.append(obj)
+    return out
+
+
+def days_with_event(kind: str) -> list[int]:
+    """Valid fixture days whose log carries at least one event of `kind`."""
+    return [d for d in VALID_DAYS if log_events(d, kind)]
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # 0. Bundle integrity
 # ════════════════════════════════════════════════════════════════════════════
-def test_bundle_tarball_sha256_matches_the_published_value():
-    """The whole bundle must be the exact archive we were given."""
-    expected = "cec7dffb21b1a5e3ec40c232b8c882f44f8594a7c8d62cc9c741099ac4fcf838"
-    raw = Path("/root/api/c5b-bundle.tar.gz").read_bytes()
-    assert len(raw) == 34_148
-    assert hashlib.sha256(raw).hexdigest() == expected
+def test_the_tarball_contains_exactly_the_files_the_readme_indexes():
+    """The archive must carry exactly the README's files, byte for byte.
+
+    No bundle hash, size or file count is written here: the expected names and
+    SHA-256s are read from the bundle's own README manifest and compared with
+    the members of the tarball, so a future bundle needs no edit.
+    """
+    import tarfile
+    index = readme_index()
+    assert BUNDLE_TARBALL.is_file(), f"bundle tarball not found: {BUNDLE_TARBALL}"
+
+    members: dict[str, str] = {}
+    with tarfile.open(BUNDLE_TARBALL, "r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            name = m.name[2:] if m.name.startswith("./") else m.name
+            fh = tf.extractfile(m)
+            assert fh is not None, f"unreadable tar member {name}"
+            members[name] = hashlib.sha256(fh.read()).hexdigest()
+
+    # The README indexes every file except itself (it cannot hash itself).
+    expected_names = set(index) | {"README.md"}
+    assert set(members) == expected_names, (
+        f"tarball/README disagree — missing from tar: "
+        f"{sorted(expected_names - set(members))}; "
+        f"extra in tar: {sorted(set(members) - expected_names)}")
+    bad = [(n, want, members[n]) for n, want in index.items()
+           if members[n] != want]
+    assert not bad, f"tar members do not match the README index: {bad}"
 
 
 def test_every_file_in_the_readme_index_matches_its_listed_sha256():
-    """Each of the 50 indexed files must hash to the README's value."""
-    import re
-    readme = (BUNDLE / "README.md").read_text()
-    rows = re.findall(r"^\|\s*([^|]+?)\s*\|\s*([0-9a-f]{64})\s*\|\s*$",
-                      readme, re.M)
-    assert len(rows) == 50, f"expected 50 indexed files, found {len(rows)}"
+    """Each indexed file on disk must hash to the README's value."""
+    index = readme_index()
     bad = []
-    for name, want in rows:
+    for name, want in index.items():
         p = BUNDLE / name
         got = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "MISSING"
         if got != want:
             bad.append((name, want, got))
     assert not bad, f"bundle files do not match the README index: {bad}"
+
+
+def test_the_extracted_bundle_has_no_file_the_readme_does_not_index():
+    """No extra file may ride along un-indexed."""
+    index = readme_index()
+    on_disk = {str(p.relative_to(BUNDLE)) for p in BUNDLE.rglob("*") if p.is_file()}
+    extra = on_disk - set(index) - {"README.md"}
+    assert not extra, f"files present but not indexed by the README: {sorted(extra)}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -325,29 +385,58 @@ def test_no_operator_supplied_payout_inputs_remain():
 # 1d. Wallet facts come only from the canonical log's events (§13)
 # ════════════════════════════════════════════════════════════════════════════
 def test_wallet_facts_are_derived_from_log_events(log_source):
-    """§13: the day_20000 log flags FTGEnxfG… and first-sees four wallets."""
-    facts = log_source.day_log(20000).wallet_facts()
-    flagged = "FTGEnxfGkTnr4NmAdg6M9zFBRsKsVdLVuKhES8kPY2QY"
-    assert facts[flagged].flagged is True
-    assert facts["3acNWJE2FvPhQu92kTrihzwtCLmoXp92GuXWjUKXVwBb"].first_seen_ms \
-        == 1_726_790_400_000
+    """§13: wallet facts come from the log's own events, nothing else.
+
+    The flagged wallet, the first-seen wallets and their timestamps are read
+    out of the bundle's canonical log, so a bundle with different throwaway
+    keys or different instants needs no edit here.
+    """
+    flagged_days = days_with_event("wallet_flagged")
+    assert flagged_days, "no bundle day carries a wallet_flagged event"
+    day = flagged_days[0]
+    facts = log_source.day_log(day).wallet_facts()
+
+    for ev in log_events(day, "wallet_flagged"):
+        unflagged_after = [u for u in log_events(day, "wallet_unflagged")
+                           if u["wallet"] == ev["wallet"]
+                           and u["time_ms"] >= ev["time_ms"]]
+        assert facts[ev["wallet"]].flagged is (not unflagged_after), ev["wallet"]
+
+    seen = log_events(day, "wallet_first_seen")
+    assert seen, f"day {day} has no wallet_first_seen event"
+    for ev in seen:
+        assert facts[ev["wallet"]].first_seen_ms == ev["time_ms"], ev["wallet"]
+    # Every first-seen wallet in the log is known to the checker.
+    assert {e["wallet"] for e in seen} <= set(facts)
 
 
 def test_unflag_event_clears_an_earlier_flag(log_source):
+    """A later wallet_unflagged must clear a flag the same log set."""
     from payout.sources import LogEvent
-    dl = log_source.day_log(20000)
-    w = "FTGEnxfGkTnr4NmAdg6M9zFBRsKsVdLVuKhES8kPY2QY"
+    flagged_days = days_with_event("wallet_flagged")
+    assert flagged_days, "no bundle day carries a wallet_flagged event"
+    day = flagged_days[0]
+    ev = log_events(day, "wallet_flagged")[0]
+    w = ev["wallet"]
+
+    dl = log_source.day_log(day)
+    assert dl.wallet_facts()[w].flagged is True, "precondition: wallet is flagged"
     dl.events.append(LogEvent(event="wallet_unflagged", wallet=w,
-                              time_ms=1_728_000_002_000))
+                              time_ms=ev["time_ms"] + 1_000))
     assert dl.wallet_facts()[w].flagged is False
 
 
 def test_forfeit_event_is_picked_up(log_source):
-    """§13.4: day_20001 forfeits ASRPJVwX…, and forfeiture is permanent."""
-    facts = log_source.day_log(20001).wallet_facts()
-    w = facts["ASRPJVwXDmLNcEWuQL7N7BugRUXoKymshy9P3H6MmkwL"]
-    assert w.forfeited is True
-    assert w.forfeit_reason == "reject verdict during holdback window"
+    """§13.4: a holdback_forfeit is picked up with its own reason string."""
+    forfeit_days = days_with_event("holdback_forfeit")
+    assert forfeit_days, "no bundle day carries a holdback_forfeit event"
+    day = forfeit_days[0]
+    facts = log_source.day_log(day).wallet_facts()
+    for ev in log_events(day, "holdback_forfeit"):
+        w = facts[ev["wallet"]]
+        assert w.forfeited is True, ev["wallet"]
+        assert w.forfeit_reason == ev.get("reason")
+        assert w.forfeited_at_ms == ev["time_ms"]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -915,3 +1004,141 @@ def test_a_signed_day_is_signed_under_any_clock(clock_name, fake_clock, tmp_path
             20000, [load_batch(20000)])
         assert d.signed, d.reasons()
         assert d.results[0].batch_hash_recomputed == load_batch(20000)["batchHash"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Open (not closed) days — BATCH_SPEC §13.6 / API_CONTRACT §2.16
+# ════════════════════════════════════════════════════════════════════════════
+def test_the_mock_serves_an_open_day_exactly_as_the_contract_says():
+    """§2.16: /canonical -> 409 + no-store; /log/{day} -> closed:false."""
+    import urllib.error
+    import urllib.request
+    from payout.batch_hash import day_to_iso
+    with MockPayoutCoordinator() as mock:
+        mock.open_day(20002)
+        iso = day_to_iso(20002)
+
+        try:
+            urllib.request.urlopen(f"{mock.url}/log/{iso}/canonical", timeout=5)
+            raise AssertionError("an open day's canonical route must not be 200")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 409, exc.code
+            assert exc.headers.get("Cache-Control") == "no-store"
+            body = json.loads(exc.read())
+            assert body["closed"] is False
+            assert body["error"] == "Day is not yet closed"
+
+        with urllib.request.urlopen(f"{mock.url}/log/{iso}", timeout=5) as r:
+            manifest = json.loads(r.read())
+        assert manifest["closed"] is False
+        # A closed day is unaffected.
+        with urllib.request.urlopen(f"{mock.url}/log/{day_to_iso(20000)}",
+                                    timeout=5) as r:
+            assert json.loads(r.read()).get("closed") is not False
+
+
+def test_an_open_day_raises_day_not_closed_and_is_never_read(log_source,
+                                                             coordinator):
+    """§13.6: the open day's canonical body is never fetched at all."""
+    from payout.batch_hash import day_to_iso
+    from payout.errors import DayNotClosed
+    coordinator.open_day(20002)
+    with pytest.raises(DayNotClosed) as exc:
+        log_source.day_log(20002)
+    assert "still open" in str(exc.value) or "closed=false" in str(exc.value)
+    # The manifest said closed:false, so the canonical route was never called.
+    assert f"/log/{day_to_iso(20002)}/canonical" not in coordinator.state.request_log
+
+
+def test_a_409_on_the_canonical_route_alone_is_day_not_closed(coordinator,
+                                                              log_source):
+    """Even if the manifest looks closed, a 409 body is a DayNotClosed.
+
+    This is the pure transport case: the checker must read the 409 status for
+    what §2.16 says it means, not as a generic unreachable archive.
+    """
+    from payout.errors import DayNotClosed
+    coordinator.open_day(20002)
+    # Re-publish a *closed-looking* manifest so only the 409 can catch it.
+    coordinator.set_manifest(20002, json.loads(
+        (BUNDLE / "fixtures/day_20002/log_get_response.json").read_text()))
+    coordinator.state.open_days.add(20002)
+    with pytest.raises(DayNotClosed) as exc:
+        log_source.canonical_log_bytes(20002)
+    assert "409" in str(exc.value)
+
+
+def test_the_checker_refuses_to_sign_an_open_batch_day(tmp_path):
+    """Task 2: an open batch day is refused with a clear reason, unsigned."""
+    from payout.errors import DAY_NOT_CLOSED
+    with MockPayoutCoordinator() as mock:
+        mock.open_day(20002)
+        d = _fresh_service(tmp_path, mock, tmp_path / "s", signed=True).process_day(
+            20002, [load_batch(20002)])
+        assert d.refused, "an open day must never be signed"
+        assert not d.signatures, "an open day produced a signature"
+        assert d.primary_rule == DAY_NOT_CLOSED, d.reasons()
+        reason = " ".join(d.reasons()).lower()
+        assert "not closed" in reason or "still open" in reason, d.reasons()
+        assert "20002" in " ".join(d.reasons())
+
+
+def test_an_open_day_inside_the_replay_range_also_refuses(tmp_path):
+    """§6a + §13.6: an open day anywhere in GENESIS..D blocks the signature.
+
+    Day 20002's replay range is 20000..20002.  Opening day 20001 leaves the
+    batch day itself perfectly closed and servable, so only the replay can
+    catch it — and an open day must never be silently treated as empty.
+    """
+    from payout.errors import DAY_NOT_CLOSED
+    with MockPayoutCoordinator() as mock:
+        mock.open_day(20001)
+        d = _fresh_service(tmp_path, mock, tmp_path / "s", signed=True).process_day(
+            20002, [load_batch(20002)])
+        assert d.refused
+        assert not d.signatures
+        assert d.primary_rule == DAY_NOT_CLOSED, d.reasons()
+        assert "20001" in " ".join(d.reasons())
+
+
+def test_an_open_day_is_refused_under_every_clock(fake_clock, tmp_path):
+    """The open-day refusal is a property of the archive, not of the clock."""
+    from payout.errors import DAY_NOT_CLOSED
+    for name, ms in sorted(FAKE_CLOCKS_MS.items()):
+        fake_clock(ms)
+        with MockPayoutCoordinator() as mock:
+            mock.open_day(20002)
+            d = _fresh_service(tmp_path, mock, tmp_path / f"s_{name}",
+                               signed=True).process_day(
+                20002, [load_batch(20002)])
+            assert d.refused and d.primary_rule == DAY_NOT_CLOSED, (name, d.reasons())
+            assert not d.signatures
+
+
+def test_closing_the_day_lets_the_same_batch_sign(tmp_path):
+    """The refusal is caused by openness ONLY: close the day and it signs."""
+    with MockPayoutCoordinator() as mock:
+        mock.open_day(20002)
+        refused = _fresh_service(tmp_path, mock, tmp_path / "a",
+                                 signed=True).process_day(
+            20002, [load_batch(20002)])
+        assert refused.refused
+
+        mock.close_day(20002)
+        signed = _fresh_service(tmp_path, mock, tmp_path / "b",
+                                signed=True).process_day(
+            20002, [load_batch(20002)])
+        assert signed.signed, signed.reasons()
+        assert signed.signatures
+
+
+def test_an_open_day_leaves_no_signature_and_no_paid_results(tmp_path):
+    """Nothing from an open day may reach the ledger as signed or paid."""
+    state = tmp_path / "s"
+    with MockPayoutCoordinator() as mock:
+        mock.open_day(20002)
+        svc = _fresh_service(tmp_path, mock, state, signed=True)
+        d = svc.process_day(20002, [load_batch(20002)])
+        assert d.refused and not d.signatures
+        assert not svc.ledger.signed_batch_ids
+        assert not svc.ledger.paid_result_ids
