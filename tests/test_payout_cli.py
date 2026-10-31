@@ -6,37 +6,28 @@ the anchored hashes.  No chain, no PM2 process, no real key: every keypair
 here is generated in memory into a pytest tmp_path.
 
 ════════════════════════════════════════════════════════════════════════════
-BUNDLE DEFECT — why one check is a STRICT xfail
+BYTE-IDENTITY — now a plain, unconditional assertion
 ════════════════════════════════════════════════════════════════════════════
-Task 2 asks for the written file to be byte-identical to the bundle's sample
-`payout/online_signature.json`, on the stated grounds that Ed25519 signatures
-are deterministic.  They are — and that is exactly what the samples violate.
+An earlier revision of this bundle shipped sample online signature files that
+all carried the SAME R (nonce point) over three DIFFERENT batch hashes.  A
+reused Ed25519 nonce discloses the private key, so those samples were not
+reproducible by any conforming RFC 8032 signer and the byte-identity check
+was carried as a `xfail(strict=True)`.
 
-The three sample files carry the SAME R (nonce point) over three DIFFERENT
-batch hashes:
+That defect is FIXED in the current bundle.  The three samples now carry
+three distinct R values, and signing each day's `batchHash` with the
+documented fixture key (`SHA-256("c5b-actor:" + "onlineKp")`) reproduces each
+sample file byte for byte, envelope included.
 
-    day 20000  R = 7d6b06df…b738   batchHash dc6ea8c4…d99e
-    day 20001  R = 7d6b06df…b738   batchHash ddd9070e…a902
-    day 20002  R = 7d6b06df…b738   batchHash 90975349…c866
-
-A reused Ed25519 nonce discloses the private key: from any two of those
-signatures the secret scalar falls out algebraically, and
-`test_bundle_samples_leak_their_signing_key` below proves it by predicting
-day 20002's S from days 20000+20001 alone, without ever touching the key.
-
-Correct RFC 8032 signing of those same hashes with the same fixture key
-produces completely different (and all-distinct) signatures.  So the samples
-are NOT reproducible by any conforming signer; matching them byte-for-byte
-would require deliberately re-using a nonce, i.e. shipping a signer that
-leaks its own key.  We do not.
-
-Therefore:
-  * `test_signature_verifies_under_the_fixture_online_key` is the REAL
-    acceptance check — our signature must verify under the bundle's online
-    key over the raw 32-byte batch hash, for all three valid days.
-  * `test_bundle_sample_is_byte_identical` is `xfail(strict=True)`: it fails
-    loudly on the day the bundle is regenerated with proper nonces, which is
-    the signal to delete the xfail and make it a plain assertion.
+Therefore the markers are gone and both properties are asserted outright:
+  * `test_bundle_sample_is_byte_identical` — our written file equals the
+    bundle's sample, byte for byte, for all three valid days.
+  * `test_bundle_samples_do_not_share_an_r_value` — the guard that keeps the
+    old defect from silently coming back: the samples' R values must be
+    pairwise distinct.  If a future bundle regresses to a reused nonce this
+    fires immediately instead of being absorbed by an xfail.
+  * `test_signature_verifies_under_the_fixture_online_key` remains the
+    semantic acceptance check (verifies over the raw 32-byte hash).
 """
 from __future__ import annotations
 
@@ -133,52 +124,52 @@ def run_sign(mock, day, out, env, *, post=False, extra=()):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# The bundle defect, pinned
+# Nonce-reuse guard — keeps the old bundle defect from coming back
 # ════════════════════════════════════════════════════════════════════════════
-def test_bundle_samples_reuse_one_nonce_across_three_days():
-    """All three sample online signatures share one R over distinct hashes."""
-    rs, hashes = set(), set()
+def test_bundle_samples_do_not_share_an_r_value():
+    """The three sample online signatures must have pairwise-distinct R.
+
+    An earlier bundle revision reused ONE R across all three days over three
+    different batch hashes.  That discloses the signing key: with R1 == R2 the
+    secret scalar is ((s1 - s2) * inv(h1 - h2)) mod L.  This guard fails the
+    moment a sample bundle regresses to a reused nonce, instead of that being
+    absorbed by an xfail marker as it was before.
+    """
+    r_by_day, hashes = {}, {}
     for day in VALID_DAYS:
         sig = json.loads(load_online_signature_bytes(day))["chunks"][0]["signatureHex"]
         batch = json.loads((BUNDLE / f"fixtures/day_{day}/batch.json").read_text())
-        rs.add(sig[:64])
-        hashes.add(batch["batchHash"])
-    assert len(hashes) == 3, "the three days must have three different hashes"
-    assert len(rs) == 1, (
-        "expected the known bundle defect: one reused R across all three days")
+        r_by_day[day] = sig[:64]          # R = first 32 bytes of the signature
+        hashes[day] = batch["batchHash"]
+
+    assert len(set(hashes.values())) == len(VALID_DAYS), (
+        f"the valid days must have distinct batch hashes, got {hashes}")
+
+    # Pairwise, so the failure message names the exact colliding pair.
+    days = sorted(r_by_day)
+    for i, a in enumerate(days):
+        for b in days[i + 1:]:
+            assert r_by_day[a] != r_by_day[b], (
+                f"NONCE REUSE: days {a} and {b} share R={r_by_day[a]} over "
+                f"different batch hashes ({hashes[a]} vs {hashes[b]}) — this "
+                f"discloses the online signing key")
+
+    assert len(set(r_by_day.values())) == len(VALID_DAYS)
 
 
-def test_bundle_samples_leak_their_signing_key():
-    """Two samples are enough to recover the scalar and forge the third.
+def test_bundle_samples_are_reproducible_rfc8032_signatures():
+    """Each sample is exactly what deterministic Ed25519 produces, and verifies.
 
-    Proves the defect is fatal, not cosmetic.  Nothing secret is printed: the
-    recovered scalar is only used to re-derive day 20002's S and compare.
+    The counterpart to the R guard: distinct nonces alone are not enough, the
+    samples must be the signatures a conforming signer actually emits.
     """
-    L = 2**252 + 27742317777372353535851937790883648493
-    A = bytes(online_keypair().pubkey())
-
-    def load(day):
-        sig = bytes.fromhex(
-            json.loads(load_online_signature_bytes(day))["chunks"][0]["signatureHex"])
+    kp = online_keypair()
+    for day in VALID_DAYS:
+        sample = json.loads(load_online_signature_bytes(day))["chunks"][0]["signatureHex"]
         bh = bytes.fromhex(
             json.loads((BUNDLE / f"fixtures/day_{day}/batch.json").read_text())["batchHash"])
-        return sig[:32], int.from_bytes(sig[32:], "little"), bh
-
-    R1, s1, m1 = load(20000)
-    R2, s2, m2 = load(20001)
-    R3, s3, m3 = load(20002)
-    assert R1 == R2 == R3
-
-    def h(R, m):
-        return int.from_bytes(hashlib.sha512(R + A + m).digest(), "little") % L
-
-    h1, h2, h3 = h(R1, m1), h(R2, m2), h(R3, m3)
-    scalar = ((s1 - s2) * pow(h1 - h2, -1, L)) % L   # recovered from 2 samples
-    nonce = (s1 - h1 * scalar) % L
-    assert (nonce + h3 * scalar) % L == s3, (
-        "day 20002's S must be predictable from days 20000+20001 — if this "
-        "stops holding the bundle was regenerated and the xfail below should "
-        "already have fired")
+        assert bytes(kp.sign_message(bh)).hex() == sample, f"day {day}"
+        assert Signature(bytes.fromhex(sample)).verify(kp.pubkey(), bh), f"day {day}"
 
 
 def test_our_signer_never_reuses_a_nonce(tmp_path):
@@ -291,11 +282,12 @@ def test_signature_verifies_under_the_fixture_online_key(tmp_path, day):
 
 @pytest.mark.parametrize("day", VALID_DAYS)
 def test_written_file_matches_the_bundle_sample_except_for_the_signature(tmp_path, day):
-    """Everything but the defective signature bytes is byte-for-byte right.
+    """Everything but the signature bytes is byte-for-byte right.
 
-    Pins the envelope: schema, key order, indent=2, no trailing newline,
-    signerPubkeyHex, batchId.  Only `signatureHex` differs, and only because
-    of the reused-nonce defect.
+    Pins the envelope independently of the signature: schema, key order,
+    indent=2, no trailing newline, signerPubkeyHex, batchId.  Kept alongside
+    the full byte-identity check because it localises any future failure to
+    the envelope rather than the signature.
     """
     out = tmp_path / f"sig_{day}.json"
     with MockPayoutCoordinator() as mock:
@@ -317,14 +309,14 @@ def test_written_file_matches_the_bundle_sample_except_for_the_signature(tmp_pat
     assert serialize_signature_file(rebuilt) == theirs_raw
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUNDLE DEFECT: the sample online signature files were generated with a "
-    "REUSED Ed25519 nonce (identical R across days 20000/20001/20002 over "
-    "three different batch hashes), which leaks the signing key. A conforming "
-    "RFC 8032 signer cannot reproduce them. When the bundle is regenerated "
-    "with proper nonces this xfail fires — delete it and keep the assertion."))
 @pytest.mark.parametrize("day", VALID_DAYS)
 def test_bundle_sample_is_byte_identical(tmp_path, day):
+    """Our written file IS the bundle's sample, byte for byte.
+
+    Ed25519 is deterministic (RFC 8032), the bundle documents the online key's
+    seed, and `serialize_signature_file` pins the envelope encoding — so the
+    whole file reproduces, not just the signature.
+    """
     out = tmp_path / f"sig_{day}.json"
     with MockPayoutCoordinator() as mock:
         assert run_sign(mock, day, out, base_env(tmp_path)) == payout_cli.EXIT_OK

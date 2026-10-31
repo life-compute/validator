@@ -16,15 +16,16 @@ route accepts.
 The signature is over `hex_decode(batchHash)` — the RAW 32 bytes of the
 SHA-256 batch hash, never the 64-char hex string (§C5r.1, §8).
 
-BUNDLE DEFECT (do not "fix" by matching it): the bundle's sample online
-signature files were produced with a REUSED Ed25519 nonce — all three days
-carry the identical R value over three different batch hashes, which leaks the
-signing key (the scalar is recoverable from any two of them, and day 20002's S
-is exactly predictable from days 20000+20001).  This module signs with
-standard RFC 8032 deterministic Ed25519, so its output verifies under the same
-key but is NOT byte-identical to those samples.  Reproducing them would mean
-shipping a signer that discloses its own private key.  See
-tests/test_payout_cli.py::test_bundle_sample_is_byte_identical (strict xfail).
+Signing is standard RFC 8032 deterministic Ed25519, so for a given key and
+batch hash the output is reproducible.  The bundle's sample online signature
+files reproduce byte for byte under the documented fixture key; see
+tests/test_payout_cli.py::test_bundle_sample_is_byte_identical.
+
+HISTORICAL NOTE: an earlier revision of the bundle shipped samples generated
+with a REUSED Ed25519 nonce (one R across all three days over three different
+batch hashes), which discloses the signing key.  That is fixed upstream; the
+regression guard is
+tests/test_payout_cli.py::test_bundle_samples_do_not_share_an_r_value.
 """
 from __future__ import annotations
 
