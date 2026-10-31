@@ -47,9 +47,14 @@ LIFE_MINT = "CVDFLCAjXhVWiPXH9nTCTpCgVzmDVoiPzNJYuccr1dqB"
 
 
 def write_throwaway_keypair(path: Path) -> str:
-    """Write a throwaway 64-byte Solana keypair file; return its base58 pubkey."""
+    """Write a throwaway 64-byte Solana keypair file; return its base58 pubkey.
+
+    Mode 0600: the start-up guard refuses any payout key that is readable by
+    someone other than its owner, so the fixtures must honour it too.
+    """
     kp = Keypair()
     path.write_text(json.dumps(list(bytes(kp))))
+    path.chmod(0o600)
     return str(kp.pubkey())
 
 

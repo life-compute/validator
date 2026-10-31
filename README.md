@@ -198,6 +198,49 @@ All settings have sensible defaults. See `.env.example` for the full list.
 
 ---
 
+## Payout signing key — create it once
+
+The payout key is a **separate** key from the validator's verdict-signing key:
+one compromised key must never be able to both issue verdicts and authorise
+payouts. Create it once, on the rig, with the checker's own `keygen` command.
+
+```bash
+# 1. Owner-only directory for the key (do this first — keygen will not
+#    create the directory for you).
+mkdir -p -m 700 /root/keys
+
+# 2. Create the payout key.  Prints ONLY the base58 public key and the path.
+python -m payout.cli keygen --out /root/keys/payout-online.json
+
+# 3. Read the public key back at any time (prints the public key, nothing else).
+python -m payout.cli pubkey --key /root/keys/payout-online.json
+```
+
+`keygen` takes its seed from `os.urandom(32)`, writes the Solana keypair
+format (a JSON array of 64 numbers: the 32-byte seed followed by the 32-byte
+public key), creates the file with `O_EXCL` at mode `0600`, and self-checks
+the result — it signs and verifies a test message and reads the file back off
+disk — before reporting success. It **refuses to overwrite an existing file**:
+there is no `--force`. To rotate, move the old file aside deliberately first.
+
+> **Only the public key ever leaves the rig.** The base58 string printed by
+> `keygen`/`pubkey` is the only thing you register, paste into an issue, send
+> to the coordinator, or put in a backup note. The key file itself — and the
+> seed inside it — never leaves `/root/keys`: do not copy it to another
+> machine, do not commit it, do not paste its contents anywhere, and do not
+> include it in logs or support bundles. Anyone holding that file can
+> authorise payouts as you.
+
+The checker also **refuses to start** if `PAYOUT_KEYPAIR` points at a file
+that is readable or writable by anyone other than its owner. If you ever see
+that refusal, fix the permissions rather than relaxing the check:
+
+```bash
+chmod 600 /root/keys/payout-online.json
+```
+
+---
+
 ## Payout batch checker — daily run
 
 The payout checker verifies a day's payout batch independently and signs it
@@ -206,9 +249,10 @@ touches no verdict path.
 
 ```bash
 # Required: the payout key is SEPARATE from the validator's verdict key.
-# The command refuses to start if PAYOUT_KEYPAIR is unset, or if its public
-# key equals VALIDATOR_KEYPAIR's.  It never creates or rotates a key.
-export PAYOUT_KEYPAIR=/secure/payout_key.json
+# The command refuses to start if PAYOUT_KEYPAIR is unset, if its file is
+# readable by anyone but its owner, or if its public key equals
+# VALIDATOR_KEYPAIR's.  `sign` never creates or rotates a key — use `keygen`.
+export PAYOUT_KEYPAIR=/root/keys/payout-online.json
 export VALIDATOR_KEYPAIR=/secure/validator_key.json
 export PROGRAM_ID=BU7WVCvy9CqypB7Hqhw6RJakAeSieVsWNapytQpFgi18
 export LIFE_MINT=CVDFLCAjXhVWiPXH9nTCTpCgVzmDVoiPzNJYuccr1dqB

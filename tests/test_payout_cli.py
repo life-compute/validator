@@ -81,6 +81,7 @@ def write_fixture_online_key(path: Path) -> Keypair:
     """Materialise the bundle's online key as a 64-byte keypair file."""
     kp = online_keypair()
     path.write_text(json.dumps(list(bytes(kp))))
+    path.chmod(0o600)  # the start-up guard refuses group/world-readable keys
     return kp
 
 

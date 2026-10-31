@@ -24,6 +24,7 @@ from pathlib import Path
 from solders.keypair import Keypair
 
 from .errors import PayoutKeyError
+from .keygen import require_owner_only
 
 PAYOUT_KEYPAIR_ENV = "PAYOUT_KEYPAIR"
 VALIDATOR_KEYPAIR_ENV = "VALIDATOR_KEYPAIR"
@@ -72,6 +73,10 @@ class PayoutSigner:
             raise PayoutKeyError(
                 f"{PAYOUT_KEYPAIR_ENV} is required and has no default; "
                 f"the payout signer refuses to start without it")
+
+        # Permissions BEFORE contents: a payout key that group or other can
+        # read is treated as already disclosed, so refuse to start on it.
+        require_owner_only(payout_path, PAYOUT_KEYPAIR_ENV)
 
         payout_kp = _load_keypair(payout_path, PAYOUT_KEYPAIR_ENV)
         payout_pub = str(payout_kp.pubkey())

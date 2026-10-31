@@ -1,6 +1,8 @@
 """`python -m payout.cli` — the payout checker's command line.
 
     python -m payout.cli sign --coordinator URL --day N --out FILE [--post]
+    python -m payout.cli keygen --out PATH
+    python -m payout.cli pubkey --key PATH
 
 What `sign` does, in order, all fail-closed (§C5r.3):
 
@@ -30,6 +32,15 @@ Configuration:
 `--post` additionally submits the file's EXACT bytes to
 `POST /payout/{day}/signature`.  Without it the command only writes the file.
 
+`keygen` creates a NEW payout key (os.urandom(32) seed, Ed25519 public key
+derived with the same solders library the signer signs with) in the Solana
+keypair format: a JSON array of 64 numbers, the 32-byte seed followed by the
+32-byte public key.  It refuses to overwrite an existing path (O_EXCL), makes
+the file mode 0600, self-checks the key by signing+verifying a test message
+and by reading the file back, and prints ONLY the base58 public key and the
+path.  `pubkey` prints the base58 public key of an existing file, nothing
+else.  Neither command ever prints, logs or returns the seed.
+
 No key material is ever printed: only public keys, hashes and signatures.
 """
 from __future__ import annotations
@@ -49,6 +60,7 @@ from .errors import (
     PayoutError,
     REPEATED_BATCH_ID,
 )
+from .keygen import generate_keypair_file, read_pubkey
 from .ledger import DecisionLedger
 from .recompute import replay_days_required
 from .routes import PayoutRoutes
@@ -211,6 +223,34 @@ def cmd_sign(args, env: dict[str, str] | None = None) -> int:
     return EXIT_OK
 
 
+def cmd_keygen(args, env: dict[str, str] | None = None) -> int:
+    """Create a brand-new payout key.  Prints the PUBLIC key and the path only.
+
+    Refuses to overwrite; file is created O_EXCL at mode 0600; the key is
+    self-checked (sign+verify, and read back off disk) before success is
+    reported.  The seed is never printed, logged or returned.
+    """
+    try:
+        pubkey = generate_keypair_file(args.out)
+    except PayoutError as exc:
+        _eprint(f"REFUSING TO CREATE KEY: {exc}")
+        return EXIT_CONFIG
+
+    print(f"pubkey: {pubkey}")
+    print(f"path: {Path(args.out)}")
+    return EXIT_OK
+
+
+def cmd_pubkey(args, env: dict[str, str] | None = None) -> int:
+    """Print the public key of an existing key file.  Nothing else."""
+    try:
+        print(read_pubkey(args.key))
+    except PayoutError as exc:
+        _eprint(f"cannot read public key: {exc}")
+        return EXIT_CONFIG
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m payout.cli",
@@ -234,6 +274,22 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="genesis_day",
                    help=f"§6a replay start (default {C.GENESIS_DAY})")
     s.set_defaults(func=cmd_sign)
+
+    k = sub.add_parser(
+        "keygen",
+        help="create a NEW payout key file (never overwrites; prints only the "
+             "public key)")
+    k.add_argument("--out", required=True,
+                   help="path to create, e.g. /root/keys/payout-online.json; "
+                        "must not already exist")
+    k.set_defaults(func=cmd_keygen)
+
+    g = sub.add_parser(
+        "pubkey",
+        help="print the base58 public key of an existing key file")
+    g.add_argument("--key", required=True, help="path to a Solana keypair file")
+    g.set_defaults(func=cmd_pubkey)
+
     return p
 
 
