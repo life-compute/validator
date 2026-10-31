@@ -39,6 +39,15 @@ from .progress import ProgressStore
 from .rescore import RescoreFailed, Rescorer, RescoreTimeout
 from .signing import Signer
 
+import sys as _sys
+from pathlib import Path as _Path
+
+# Repo-root module: the single source of truth for the outbound User-Agent.
+_repo_root = str(_Path(__file__).resolve().parent.parent)
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+from http_ua import ua_headers  # noqa: E402
+
 log = logging.getLogger("life-validator.client")
 
 
@@ -78,7 +87,10 @@ class CoordinatorClient:
         from .signing import canonical_body
 
         body_bytes = canonical_body(body_obj)
-        headers = {"Content-Type": "application/json"}
+        # User-Agent is mandatory on every outbound request: the coordinator's
+        # Cloudflare edge rejects the default Python-urllib token with
+        # 403 "error code: 1010" before X-Auth is evaluated.
+        headers = ua_headers({"Content-Type": "application/json"})
         if signed:
             # X-Auth is built fresh per attempt by the caller's retry loop so
             # each retry gets a new nonce and timestamp (the coordinator

@@ -27,6 +27,14 @@ from typing import Any
 from .batch_hash import day_to_iso
 from .errors import CoordinatorUnreachable
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_repo_root = str(_Path(__file__).resolve().parent.parent)
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+from http_ua import ua_headers  # noqa: E402
+
 
 class PayoutRoutes:
     """Reader/writer for the payout routes.  No auth: both are public."""
@@ -40,7 +48,8 @@ class PayoutRoutes:
         path = f"/payout/{day_to_iso(day)}"
         url = f"{self.base_url}{path}"
         try:
-            with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+            req = urllib.request.Request(url, headers=ua_headers(), method="GET")
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 if resp.status != 200:
                     raise CoordinatorUnreachable(
                         f"GET {path} returned HTTP {resp.status}")
@@ -81,7 +90,7 @@ class PayoutRoutes:
         url = f"{self.base_url}{path}"
         req = urllib.request.Request(
             url, data=bytes(body), method="POST",
-            headers={"Content-Type": "application/json"})
+            headers=ua_headers({"Content-Type": "application/json"}))
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read()

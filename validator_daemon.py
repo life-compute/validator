@@ -40,6 +40,13 @@ from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
 
+# Single source of truth for the outbound User-Agent (repo root).
+import sys as _sys
+_repo_root = str(Path(__file__).resolve().parent)
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+from http_ua import ua_headers  # noqa: E402
+
 # ── Already-processed submission tracking ──────────────────────────────────────
 # Keyed by submission pubkey → number of validate_on_chain attempts.
 # Once a tx lands successfully, the on-chain status flips to Validating (1) and
@@ -2213,7 +2220,7 @@ def _rpc(method: str, params: list, max_retries: int = 3) -> dict:
             req = urllib.request.Request(
                 SOLANA_RPC,
                 data=payload.encode(),
-                headers={"Content-Type": "application/json"},
+                headers=ua_headers({"Content-Type": "application/json"}),
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -2357,7 +2364,8 @@ def _parse_result_submission(pubkey: str, data: bytes) -> dict | None:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def fetch_targets() -> list:
     try:
-        with urllib.request.urlopen(TARGETS_URL, timeout=15) as r:
+        _req = urllib.request.Request(TARGETS_URL, headers=ua_headers(), method="GET")
+        with urllib.request.urlopen(_req, timeout=15) as r:
             return json.loads(r.read())
     except Exception as e:
         log.warning(f"fetch_targets: {e}")

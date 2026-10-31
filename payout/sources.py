@@ -34,6 +34,14 @@ from .batch_hash import day_to_iso, log_hash_hex, pubkey_bytes
 from .constants import TARGETS_TABLE_SHA256
 from .errors import CoordinatorUnreachable, DayNotClosed, PayoutConfigError
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_repo_root = str(_Path(__file__).resolve().parent.parent)
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+from http_ua import ua_headers  # noqa: E402
+
 # Lifecycle event names defined by BATCH_SPEC §13.
 EV_FIRST_SEEN = "wallet_first_seen"
 EV_FLAGGED = "wallet_flagged"
@@ -307,7 +315,8 @@ class LogSource:
     def _get(self, path: str) -> bytes:
         url = f"{self.base_url}{path}"
         try:
-            with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+            req = urllib.request.Request(url, headers=ua_headers(), method="GET")
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 if resp.status != 200:
                     raise CoordinatorUnreachable(
                         f"GET {path} returned HTTP {resp.status}")
