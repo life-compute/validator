@@ -73,6 +73,9 @@ class MockState:
         self.validators: set[str] = validators if validators is not None else set()
         self.unscorable: set[int] = set()
         self.request_log: list[tuple[str, str]] = []
+        # Results the Worker already holds a verdict for: POST /verdicts
+        # answers 409 Conflict for these (§2.5 "a verdict already exists").
+        self.verdict_exists: set[int] = set()
         # Fault injection
         self.fail_next_pending: int = 0      # N consecutive 503s on GET /pending
         self.fail_next_verdict: int = 0
@@ -232,6 +235,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._err(404, "Result not found")
         if rid in self.state.unscorable:
             return self._err(410, "Result is unscorable: max attempts reached")
+        if rid in self.state.verdict_exists:
+            return self._err(409, "Conflict: a verdict already exists for this result")
 
         # ── error path (§2.5 B) ────────────────────────────────────────────
         if payload.get("status") == "validator_error":

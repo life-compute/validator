@@ -334,7 +334,13 @@ def test_outage_longer_than_cap_does_not_hang_or_crash(coord, tmp_path,
 
 
 def test_never_loops_forever_on_one_item(coord, tmp_path, msa_dir, protein_pins):
-    """Repeated local failures hit the attempt cap and the item is abandoned."""
+    """Repeated local failures are bounded — now by the Worker, not by us.
+
+    Since the done-rule fix a soft error no longer retires the result
+    locally, so the brake is the Worker's own attempt counter: it marks the
+    result unscorable at max_attempts and stops offering it.  What must hold
+    is that the scorer is not invoked forever.
+    """
     runner = FakeRunner(raises=RuntimeError("boom"))
     store = ProgressStore(tmp_path / "p.sqlite3")
     svc, _, _ = make_service(coord, tmp_path, runner, msa_dir,
@@ -344,8 +350,13 @@ def test_never_loops_forever_on_one_item(coord, tmp_path, msa_dir, protein_pins)
     for _ in range(6):
         svc.process_batch()
 
-    assert store.state_of(72) in ("submitted", "failed")
-    assert len(runner.calls) <= 2, "scorer re-invoked past the attempt cap"
+    # The Worker retired it (§2.5: max_attempts -> unscorable, dropped from
+    # /pending), and we never marked it done ourselves.
+    assert 72 in coord.state.unscorable
+    assert store.state_of(72) == "claimed"
+    assert len(runner.calls) == 3, \
+        f"scorer must stop once the Worker stops offering, got {len(runner.calls)}"
+    assert svc.process_batch()["seen"] == 0, "row is no longer offered"
 
 
 # ── NEGATIVE CONTROL 4: restart does not repeat work ────────────────────────
@@ -445,6 +456,214 @@ def test_keypair_path_is_configured_not_embedded():
             / "coordinator_client" / "config.py").read_text()
     assert "[" not in text.split("VALIDATOR_KEYPAIR")[1][:200] or True
     assert "wallet.json" in cfg.VALIDATOR_KEYPAIR
+
+
+# ── who decides "done": only an accepted verdict or a 409 ───────────────────
+
+def test_validator_error_is_reprocessed_when_the_worker_offers_it_again(
+        coord, tmp_path, msa_dir, protein_pins):
+    """The C28 bug: a soft error must NOT retire the result locally.
+
+    Offer 1 raises inside the scorer -> validator_error.  The Worker keeps
+    the row pending (its cooldown/review window) and offers it again.  The
+    validator must re-score it, not answer skipped_done.
+    """
+    db = tmp_path / "softerr.sqlite3"
+    store = ProgressStore(db)
+    runner = FakeRunner(raises=RuntimeError("transient CUDA hiccup"))
+    svc, signer, _ = make_service(coord, tmp_path, runner, msa_dir, store=store)
+    coord.state.add_pending(pending_row(1, score=-8.85, **protein_pins))
+
+    first = svc.process_batch()
+    assert first["errors"] == 1, first
+    assert len(coord.state.errors) == 1
+    assert store.state_of(1) == "claimed", \
+        "a validator_error must not be terminal — the Worker owns the retry"
+    assert not store.is_done(1)
+
+    # The Worker offers it again (its own attempt counter advanced), and the
+    # scorer is healthy this time.
+    coord.state.pending[1]["scoring_attempts"] = 1
+    good = FakeRunner({"affinity_pred_value": -0.4870})
+    svc2, _, store2 = make_service(coord, tmp_path, good, msa_dir,
+                                   signer=signer, store=ProgressStore(db))
+    second = svc2.process_batch()
+
+    assert second["skipped_done"] == 0, "re-offer was wrongly skipped as done"
+    assert second["verdicts"] == 1, second
+    assert len(good.calls) == 1, "the re-offered result was never re-scored"
+    assert len(coord.state.verdicts) == 1
+    assert store2.is_done(1), "an accepted verdict IS terminal"
+
+
+def test_accepted_verdict_is_skipped_on_the_next_offer(
+        coord, tmp_path, msa_dir, protein_pins):
+    """The other half of the rule: a real verdict retires the result."""
+    db = tmp_path / "accepted.sqlite3"
+    runner = FakeRunner({"affinity_pred_value": -0.4870})
+    svc, signer, store = make_service(coord, tmp_path, runner, msa_dir,
+                                      store=ProgressStore(db))
+    coord.state.add_pending(pending_row(2, score=-8.85, **protein_pins))
+
+    assert svc.process_batch()["verdicts"] == 1
+    assert store.state_of(2) == "submitted"
+
+    # Worker offers the same row again (e.g. a stale /pending page).
+    runner2 = FakeRunner({"affinity_pred_value": -0.4870})
+    svc2, _, _ = make_service(coord, tmp_path, runner2, msa_dir,
+                              signer=signer, store=ProgressStore(db))
+    stats = svc2.process_batch()
+
+    assert stats["skipped_done"] == 1, stats
+    assert runner2.calls == [], "a result with an accepted verdict was re-scored"
+    assert len(coord.state.verdicts) == 1, "duplicate verdict posted"
+
+
+def test_malformed_row_is_not_marked_done_and_is_retried_when_fixed(
+        coord, tmp_path, msa_dir, protein_pins):
+    """A malformed row is the Worker's to correct; we must see the fix."""
+    db = tmp_path / "malformed.sqlite3"
+    runner = FakeRunner({"affinity_pred_value": -0.4870})
+    svc, signer, store = make_service(coord, tmp_path, runner, msa_dir,
+                                      store=ProgressStore(db))
+    bad = pending_row(3, score=-8.85, **protein_pins)
+    bad["scorer_profile"] = {"boltz_version": "2.2.1", "flags": []}  # no sampling
+    coord.state.add_pending(bad)
+
+    first = svc.process_batch()
+    assert first["malformed"] == 1, first
+    assert not store.is_done(3), "a malformed row must stay retryable"
+    assert runner.calls == []
+
+    # The Worker republishes the row, now contract-complete.
+    coord.state.add_pending(pending_row(3, score=-8.85, **protein_pins))
+    svc2, _, store2 = make_service(coord, tmp_path, runner, msa_dir,
+                                   signer=signer, store=ProgressStore(db))
+    second = svc2.process_batch()
+
+    assert second["skipped_done"] == 0
+    assert second["verdicts"] == 1, second
+    assert store2.is_done(3)
+
+
+def test_409_on_a_verdict_means_already_recorded_and_is_terminal(
+        coord, tmp_path, msa_dir, protein_pins):
+    """409 = the verdict exists. Terminal, and never re-scored afterwards."""
+    db = tmp_path / "conflict.sqlite3"
+    runner = FakeRunner({"affinity_pred_value": -0.4870})
+    svc, signer, store = make_service(coord, tmp_path, runner, msa_dir,
+                                      store=ProgressStore(db))
+    coord.state.add_pending(pending_row(4, score=-8.85, **protein_pins))
+    coord.state.verdict_exists.add(4)
+
+    stats = svc.process_batch()
+    assert stats.get("already_recorded") == 1, stats
+    assert store.state_of(4) == "submitted"
+    assert store.is_done(4)
+    assert not coord.state.verdicts, "the mock recorded no new verdict on 409"
+
+    runner2 = FakeRunner({"affinity_pred_value": -0.4870})
+    svc2, _, _ = make_service(coord, tmp_path, runner2, msa_dir,
+                              signer=signer, store=ProgressStore(db))
+    assert svc2.process_batch()["skipped_done"] == 1
+    assert runner2.calls == []
+
+
+def test_409_on_a_validator_error_is_also_terminal(
+        coord, tmp_path, msa_dir, protein_pins):
+    """Same rule on the error path: 409 proves a verdict already exists."""
+    db = tmp_path / "conflict_err.sqlite3"
+    runner = FakeRunner(raises=RuntimeError("boom"))
+    svc, _, store = make_service(coord, tmp_path, runner, msa_dir,
+                                 store=ProgressStore(db))
+    coord.state.add_pending(pending_row(5, score=-8.85, **protein_pins))
+    coord.state.verdict_exists.add(5)
+
+    svc.process_batch()
+    assert store.is_done(5), "409 on the error path must retire the result"
+    assert store.state_of(5) == "submitted"
+
+
+def test_attempt_cap_resets_on_a_new_worker_offer(
+        coord, tmp_path, msa_dir, protein_pins):
+    """The cap guards ONE offer; it must not retire a result forever.
+
+    To stay inside a single offer the error POSTs are made to fail, so the
+    Worker's own attempt counter never advances and the offer tag is stable.
+    Without the per-offer reset the local cap would re-create the C28 bug a
+    few polls later: `failed` is terminal, so the re-offer is skipped_done.
+    """
+    db = tmp_path / "cap.sqlite3"
+    runner = FakeRunner(raises=RuntimeError("boom"))
+    svc, signer, store = make_service(coord, tmp_path, runner, msa_dir,
+                                      max_item_attempts=2,
+                                      store=ProgressStore(db))
+    coord.state.add_pending(pending_row(6, score=-8.85, **protein_pins))
+    coord.state.fail_next_verdict = 100   # same offer for the whole burst
+
+    for _ in range(4):           # burn through this offer's budget
+        svc.process_batch()
+    assert coord.state.pending[6]["scoring_attempts"] == 0, "offer must be stable"
+    assert store.state_of(6) == "failed"
+    assert store.is_done(6, "0"), "cap is terminal WITHIN the offer"
+    assert not store.is_done(6, "2"), "a NEW offer must not be skipped"
+    burned = len(runner.calls)
+    assert burned == 2, f"scorer re-invoked past the cap: {burned}"
+
+    # A NEW offer from the Worker: fresh budget, result is scored again.
+    coord.state.fail_next_verdict = 0
+    coord.state.pending[6]["scoring_attempts"] = 2
+    good = FakeRunner({"affinity_pred_value": -0.4870})
+    svc2, _, store2 = make_service(coord, tmp_path, good, msa_dir,
+                                   max_item_attempts=2, signer=signer,
+                                   store=ProgressStore(db))
+    stats = svc2.process_batch()
+
+    assert stats["skipped_done"] == 0, "new offer was skipped as done"
+    assert stats["verdicts"] == 1, stats
+    assert len(good.calls) == 1
+    assert store2.state_of(6) == "submitted"
+
+
+def test_log_only_stays_terminal(coord, tmp_path, msa_dir, crispr_pins):
+    """pegRNA posts no verdict, so it is retired by local decision."""
+    db = tmp_path / "logonly.sqlite3"
+    runner = FakeRunner({"iptm": 0.85})
+    svc, signer, store = make_service(coord, tmp_path, runner, msa_dir,
+                                      store=ProgressStore(db))
+    coord.state.add_pending(pending_row(
+        7, modality="pegrna", smiles="ACGTACGTACGTACGTACGT",
+        score=-8.5, **crispr_pins))
+
+    assert svc.process_batch()["log_only"] == 1
+    assert store.is_done(7)
+
+    runner2 = FakeRunner({"iptm": 0.85})
+    svc2, _, _ = make_service(coord, tmp_path, runner2, msa_dir,
+                              signer=signer, store=ProgressStore(db))
+    assert svc2.process_batch()["skipped_done"] == 1
+    assert runner2.calls == [], "a log-only item must not be re-scored"
+
+
+def test_progress_store_migrates_a_pre_fix_database(tmp_path):
+    """An existing store written without offer_tag opens and works."""
+    import sqlite3
+
+    db = tmp_path / "old.sqlite3"
+    old = sqlite3.connect(str(db), isolation_level=None)
+    old.execute("""CREATE TABLE progress (
+        result_id INTEGER PRIMARY KEY, state TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        molecule_hash TEXT NOT NULL DEFAULT '',
+        outcome TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL)""")
+    old.execute("INSERT INTO progress VALUES(11,'submitted',1,'','confirm',0.0)")
+    old.close()
+
+    store = ProgressStore(db)
+    assert store.is_done(11)
+    assert store.claim(12, "mol", offer_tag="0") == 1
+    assert store.claim(12, "mol", offer_tag="0") == 2, "same offer accumulates"
+    assert store.claim(12, "mol", offer_tag="1") == 1, "new offer resets"
 
 
 # ── pegRNA stays log-only ───────────────────────────────────────────────────

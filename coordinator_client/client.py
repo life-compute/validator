@@ -8,7 +8,16 @@ Flow
          re-score with the lease's scorer profile, fail closed on inputs
          POST /verdicts (signed) with score + error + input-hash record
          or POST a validator_error with a contract reason code
-       mark terminal (committed)
+       mark terminal (committed) ONLY for an accepted verdict or a 409
+
+Who decides "done"
+------------------
+Only two outcomes retire a result locally: a verdict the Worker ACCEPTED
+(2xx), and a 409 answer meaning a verdict already exists.  A validator_error
+and a malformed row are NOT terminal — the Worker owns the retry decision
+(soft-error cooldown + review window) and re-offers the result itself.
+A log-only (pegRNA) item is terminal: it is a final local disposition that
+posts no verdict, so nothing else would ever stop it being re-scored.
 
 Guarantees
 ----------
@@ -49,6 +58,20 @@ if _repo_root not in _sys.path:
 from http_ua import ua_headers  # noqa: E402
 
 log = logging.getLogger("life-validator.client")
+
+
+def _as_int(val: Any) -> int:
+    """Coerce a Worker-supplied attempt counter to an int, defaulting to 0.
+
+    Used only to build the offer tag, never to score: a junk value simply
+    means "offer 0", which is the conservative choice (same budget).
+    """
+    if isinstance(val, bool) or not isinstance(val, (int, float, str)):
+        return 0
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
 
 
 class HttpError(Exception):
@@ -191,8 +214,11 @@ class ValidatorService:
         for raw in self.client.get_pending():
             stats["seen"] += 1
             rid = raw.get("id")
+            # The Worker's own attempt counter identifies the offer.  Read it
+            # from the raw row: the skip decision happens before parsing.
+            offer_tag = str(_as_int(raw.get("scoring_attempts")))
 
-            if isinstance(rid, int) and self.store.is_done(rid):
+            if isinstance(rid, int) and self.store.is_done(rid, offer_tag):
                 stats["skipped_done"] += 1
                 continue
 
@@ -200,17 +226,23 @@ class ValidatorService:
                 item = PendingResult.from_dict(raw)
             except ContractError as e:
                 # The row does not satisfy the contract we built to.  Do not
-                # guess any input — report and move on.
+                # guess any input — report and move on.  NOT marked done: a
+                # malformed row is the Worker's to fix and re-offer; if we
+                # retired it locally we would never see the corrected row.
                 stats["malformed"] += 1
                 log.error("result %s: %s", rid, e)
                 if isinstance(rid, int):
                     self._post_error(rid, contract.REASON_MISSING_CONTRACT_FIELD, str(e))
                 continue
 
-            attempts = self.store.claim(item.id, item.molecule_hash)
+            # Same offer tag as the skip check above, so a `failed` row and a
+            # fresh claim can never disagree about which offer this is.
+            attempts = self.store.claim(item.id, item.molecule_hash,
+                                        offer_tag=offer_tag)
             if attempts > self.max_item_attempts:
-                log.error("result %d: local attempt cap (%d) reached — giving up",
-                          item.id, self.max_item_attempts)
+                log.error("result %d: local attempt cap (%d) reached for this "
+                          "offer (worker attempt %d) — giving up on this offer",
+                          item.id, self.max_item_attempts, item.scoring_attempts)
                 self.store.mark_failed(item.id, "attempt_cap")
                 self._post_error(item.id, contract.REASON_INTERNAL_ERROR,
                                  "local attempt cap reached")
@@ -242,7 +274,9 @@ class ValidatorService:
             return "errors"
 
         if result.log_only:
-            # pegRNA: recorded, never submitted as a verdict.
+            # pegRNA: recorded, never submitted as a verdict.  Terminal by
+            # local decision — no verdict is ever posted for it, so the
+            # accepted-verdict rule cannot apply (see module docstring).
             self._write_log({"result_id": item.id, "modality": item.modality,
                              "mode": "LOG_ONLY", "validator_score": result.score,
                              "claimed": item.score,
@@ -270,10 +304,22 @@ class ValidatorService:
             input_hashes=result.input_hashes.as_dict())
         try:
             resp = self.client.post_verdict(body)
+        except HttpError as e:
+            if e.status == 409:
+                # 409 Conflict = the Worker already holds a verdict for this
+                # result.  The verdict EXISTS, so this is terminal success:
+                # mark done and never spend GPU time on it again.
+                log.info("result %d: coordinator answered 409 — a verdict "
+                         "already exists, marking done", item.id)
+                self.store.mark_submitted(item.id, "already_recorded:409")
+                return "already_recorded"
+            log.error("result %d: POST /verdicts failed: %s", item.id, e)
+            return "errors"
         except Exception as e:
             log.error("result %d: POST /verdicts failed: %s", item.id, e)
             return "errors"
 
+        # Only a verdict the Worker accepted (2xx) is terminal.
         self.store.mark_submitted(item.id, decision)
         self._write_log({"result_id": item.id, "modality": item.modality,
                          "target": item.target, "claimed": item.score,
@@ -291,14 +337,31 @@ class ValidatorService:
         return "verdicts"
 
     # ── helpers ─────────────────────────────────────────────────────────────
-    def _post_error(self, result_id: int, reason_code: str, detail: str) -> None:
+    def _post_error(self, result_id: int, reason_code: str, detail: str) -> bool:
+        """POST a validator_error.  Returns True iff a 409 proved a verdict exists.
+
+        A validator_error is NOT terminal and must NOT be marked done: the
+        Worker owns the retry decision (soft-error cooldown + review window).
+        Marking it done here is what made every re-offer come back as
+        `skipped_done`, so the result was never re-scored.  The only terminal
+        answer on this path is a 409 ("a verdict already exists").
+        """
+        already = False
         try:
             self.client.post_verdict(contract.error_body(result_id, reason_code))
-            self.store.mark_submitted(result_id, f"validator_error:{reason_code}")
+        except HttpError as e:
+            if e.status == 409:
+                log.info("result %d: 409 on validator_error — a verdict "
+                         "already exists, marking done", result_id)
+                self.store.mark_submitted(result_id, "already_recorded:409")
+                already = True
+            else:
+                log.error("result %d: POST validator_error failed: %s", result_id, e)
         except Exception as e:
             log.error("result %d: POST validator_error failed: %s", result_id, e)
         self._write_log({"result_id": result_id, "status": "validator_error",
                          "reason_code": reason_code, "detail": detail})
+        return already
 
     def _write_log(self, row: dict[str, Any]) -> None:
         if not self.verdict_log:
