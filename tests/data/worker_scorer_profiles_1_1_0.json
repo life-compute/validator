@@ -1,0 +1,91 @@
+{
+  "profile_version": "1.1.0",
+  "_source": "GET /config of the live devnet coordinator, 2026-11-01, scorer_profiles",
+  "scorer_profiles": {
+    "protein": {
+      "alignment_sampling": "uniform",
+      "boltz_version": "2.2.1",
+      "flags": {
+        "recycling_steps": 1,
+        "sampling_steps": 25,
+        "diffusion_samples": 1,
+        "sampling_steps_affinity": 25,
+        "diffusion_samples_affinity": 1,
+        "affinity_mw_correction": true,
+        "no_kernels": true,
+        "output_format": "mmcif",
+        "override": true,
+        "num_workers": 0,
+        "accelerator": "gpu",
+        "devices": 1,
+        "model": "boltz2",
+        "use_potentials": false,
+        "max_parallel_samples": 5,
+        "msa_pairing_strategy": "greedy",
+        "use_msa_server": false
+      },
+      "msa_sampling": {
+        "subsample_msa": true,
+        "num_subsampled_msa": 1024,
+        "max_msa_seqs": 1024
+      },
+      "seed": 68
+    },
+    "mrna": {
+      "alignment_sampling": "uniform",
+      "boltz_version": "2.2.1",
+      "flags": {
+        "recycling_steps": 1,
+        "sampling_steps": 25,
+        "diffusion_samples": 1,
+        "sampling_steps_affinity": 25,
+        "diffusion_samples_affinity": 1,
+        "affinity_mw_correction": true,
+        "no_kernels": true,
+        "output_format": "mmcif",
+        "override": true,
+        "num_workers": 0,
+        "accelerator": "gpu",
+        "devices": 1,
+        "model": "boltz2",
+        "use_potentials": false,
+        "max_parallel_samples": 5,
+        "msa_pairing_strategy": "greedy",
+        "use_msa_server": false
+      },
+      "msa_sampling": {
+        "subsample_msa": false,
+        "num_subsampled_msa": 1024,
+        "max_msa_seqs": 8192
+      },
+      "seed": 68
+    },
+    "crispr": {
+      "alignment_sampling": "uniform",
+      "boltz_version": "2.2.1",
+      "flags": {
+        "recycling_steps": 1,
+        "sampling_steps": 25,
+        "diffusion_samples": 1,
+        "affinity_mw_correction": false,
+        "no_kernels": true,
+        "output_format": "mmcif",
+        "override": true,
+        "num_workers": 0,
+        "accelerator": "gpu",
+        "devices": 1,
+        "model": "boltz2",
+        "use_potentials": false,
+        "max_parallel_samples": 5,
+        "msa_pairing_strategy": "greedy",
+        "use_msa_server": false
+      },
+      "msa_sampling": {
+        "subsample_msa": false,
+        "num_subsampled_msa": 1024,
+        "max_msa_seqs": 8192
+      },
+      "seed": 68
+    }
+  }
+}

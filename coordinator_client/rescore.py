@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import hashpin
+from . import boltzspec, hashpin
 from .contract import PendingResult
 
 log = logging.getLogger("life-validator.rescore")
@@ -122,22 +122,51 @@ def crispr_yaml(grna_seq: str) -> dict[str, Any]:
 
 def boltz_flags_for(profile, modality: str, has_msa: bool,
                     num_subsampled_msa: int) -> list[str]:
-    """Flags for one re-score.
+    """Flags for one re-score, validated against Boltz 2.2.1.
 
     The lease's scorer_profile flags are used EXACTLY as given — that is the
-    contract's guarantee that miner and validator ran the same scorer.  The
-    MSA depth cap is appended only when a real alignment is attached and the
-    profile has not already specified its own subsampling.
+    contract's guarantee that miner and validator ran the same scorer.
+
+    profile_version 1.1.0 publishes `flags` as an OBJECT plus its own
+    `msa_sampling` object; `ScorerProfile.from_dict` has already turned both
+    into argv tokens, and the profile's MSA block is then authoritative: it
+    states per modality whether to subsample and how deep.
+
+    Only a legacy list-shaped profile (no msa_sampling) gets the local depth
+    cap appended, and then only for a protein with a real alignment — an
+    8 GB card OOMs on a deep a3m.
+
+    Every token is checked against boltzspec.OPTION_SPEC before it can reach
+    the GPU, so a misspelled or mis-formed option fails here in milliseconds
+    instead of as an INTERNAL_ERROR after a model load.
     """
     flags = list(profile.flags)
-    if modality == "protein" and has_msa:
+
+    msa_tokens = list(getattr(profile, "msa_sampling", ()) or ())
+    if msa_tokens:
+        flags += msa_tokens
+    elif modality == "protein" and has_msa:
         already = any(f.startswith(("--subsample_msa", "--num_subsampled_msa",
                                     "--max_msa_seqs")) for f in flags)
         if not already:
             flags += ["--subsample_msa",
                       f"--num_subsampled_msa={num_subsampled_msa}",
                       f"--max_msa_seqs={num_subsampled_msa}"]
+
+    try:
+        boltzspec.validate_tokens(flags)
+    except boltzspec.BoltzArgError as e:
+        # Fail closed and name the offending option: a profile we cannot run
+        # verbatim must never be silently "fixed" into a different scorer.
+        raise RescoreFailed("INTERNAL_ERROR",
+                            f"scorer profile is not valid for Boltz 2.2.1: {e}") from e
     return flags
+
+
+def seed_for(profile, default_seed: int) -> int:
+    """The profile's seed when it publishes one, else the configured default."""
+    seed = getattr(profile, "seed", None)
+    return int(seed) if seed is not None else int(default_seed)
 
 
 # ── the scored outcome ───────────────────────────────────────────────────────
@@ -217,7 +246,8 @@ class Rescorer:
 
         flags = boltz_flags_for(item.scorer_profile, "protein", True,
                                 self.num_subsampled_msa)
-        metrics = self._run(protein_yaml(sequence, item.smiles, str(msa_path)), flags)
+        metrics = self._run(protein_yaml(sequence, item.smiles, str(msa_path)), flags,
+                            seed_for(item.scorer_profile, self.seed))
 
         pred = metrics.get("affinity_pred_value")
         if pred is None:
@@ -244,7 +274,8 @@ class Rescorer:
 
         flags = boltz_flags_for(item.scorer_profile, item.modality, False,
                                 self.num_subsampled_msa)
-        metrics = self._run(mrna_yaml(sequence, item.smiles), flags)
+        metrics = self._run(mrna_yaml(sequence, item.smiles), flags,
+                            seed_for(item.scorer_profile, self.seed))
 
         prob = metrics.get("affinity_probability_binary")
         pred = metrics.get("affinity_pred_value")
@@ -279,7 +310,8 @@ class Rescorer:
 
         flags = boltz_flags_for(item.scorer_profile, "crispr", False,
                                 self.num_subsampled_msa)
-        metrics = self._run(crispr_yaml(grna), flags)
+        metrics = self._run(crispr_yaml(grna), flags,
+                            seed_for(item.scorer_profile, self.seed))
 
         iptm = metrics.get("iptm")
         if iptm is None:
@@ -293,10 +325,12 @@ class Rescorer:
                               0.0)
 
     # ── runner plumbing ─────────────────────────────────────────────────────
-    def _run(self, yaml_inputs: dict[str, Any], flags: list[str]) -> dict[str, Any]:
+    def _run(self, yaml_inputs: dict[str, Any], flags: list[str],
+             seed: int | None = None) -> dict[str, Any]:
         try:
             metrics = self.runner.run(yaml_inputs=yaml_inputs, flags=flags,
-                                      seed=self.seed, timeout_s=self.timeout_s)
+                                      seed=self.seed if seed is None else seed,
+                                      timeout_s=self.timeout_s)
         except RescoreTimeout:
             raise
         except MemoryError as e:

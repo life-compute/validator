@@ -67,13 +67,25 @@ def crispr_pins() -> dict[str, str]:
             "pinned_msa_sha256": hashpin.SHA256_EMPTY}
 
 
-SCORER_PROFILE = {"boltz_version": "1.0.1",
-                  "flags": ["--use-msa-server", "--recycling-steps=3"],
-                  "alignment_sampling": "uniform"}
+# The scorer profiles the LIVE Worker publishes (profile_version 1.1.0),
+# frozen verbatim from GET /config.  The old literal here was the Boltz-1.0.1
+# shape (`flags` a list, `--use-msa-server` hyphenated) which Boltz 2.2.1
+# rejects outright — tests built on it could never have caught the argv bug.
+WORKER_PROFILES = json.loads(
+    (DATA / "worker_scorer_profiles_1_1_0.json").read_text())["scorer_profiles"]
+
+SCORER_PROFILE = WORKER_PROFILES["protein"]
+
+
+def profile_for(modality: str) -> dict[str, Any]:
+    """The published profile for *modality* (pegRNA scores on the CRISPR path)."""
+    key = "crispr" if modality == "pegrna" else modality
+    return json.loads(json.dumps(WORKER_PROFILES.get(key, SCORER_PROFILE)))
 
 
 def pending_row(result_id: int, **over: Any) -> dict[str, Any]:
     """A contract-shaped (extended) pending row."""
+    modality = str(over.get("modality", "protein"))
     row: dict[str, Any] = {
         "id": result_id,
         "lease_id": "a3f2e8b1c9d04e5f",
@@ -86,7 +98,7 @@ def pending_row(result_id: int, **over: Any) -> dict[str, Any]:
         "scoring_attempts": 0,
         "modality": "protein",
         "smiles": "CC(=O)Oc1ccccc1C(=O)O",
-        "scorer_profile": dict(SCORER_PROFILE),
+        "scorer_profile": profile_for(modality),
         "uniprot_id": "P11802",
         "pinned_receptor_sha256": "0" * 64,
         "pinned_msa_sha256": "0" * 64,

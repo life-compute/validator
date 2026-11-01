@@ -151,7 +151,11 @@ def test_verdict_carries_input_hash_record(coord, tmp_path, msa_dir, protein_pin
     assert hashes["receptor_sha256"] == protein_pins["pinned_receptor_sha256"]
     assert hashes["msa_sha256"] == protein_pins["pinned_msa_sha256"]
     assert len(hashes["ligand_smiles_sha256"]) == 64
-    assert "--use-msa-server" in hashes["boltz_flags"], "lease profile flags must be used"
+    # The lease profile's own tokens are what gets hashed.  Checked against
+    # the published 1.1.0 protein profile, not a hand-written literal.
+    flags = list(hashes["boltz_flags"])
+    assert flags[:2] == ["--recycling_steps", "1"], "lease profile flags must be used"
+    assert "--use_msa_server" not in flags, "the locked profile uses no MSA server"
 
 
 def test_lease_scorer_profile_flags_are_used_exactly(coord, tmp_path, msa_dir, protein_pins):

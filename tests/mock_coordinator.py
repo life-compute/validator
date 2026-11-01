@@ -23,6 +23,7 @@ import hashlib
 import json
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -55,9 +56,14 @@ CONFIG: dict[str, Any] = {
     "reject_rate": {"window": 50, "threshold": 0.10},
     "scoring": {"rescore_timeout_ms": 1_200_000, "reclaim_timeout_ms": 1_500_000,
                 "max_attempts": 3},
-    "scorer_profile": {"boltz_version": "1.0.1",
-                       "flags": ["--use-msa-server", "--recycling-steps=3"],
-                       "alignment_sampling": "uniform"},
+    # profile_version 1.1.0: `flags` is an OBJECT of bare option names, and
+    # each modality carries its own msa_sampling block and seed.  Frozen from
+    # the live Worker's GET /config so the mock cannot drift into a shape the
+    # real coordinator never publishes.
+    "profile_version": "1.1.0",
+    "scorer_profiles": json.loads(
+        (Path(__file__).parent / "data" /
+         "worker_scorer_profiles_1_1_0.json").read_text())["scorer_profiles"],
 }
 
 

@@ -82,12 +82,58 @@ class ContractError(ValueError):
     """A pending row does not satisfy the contract the client was built to."""
 
 
+def flags_mapping_to_cli(flags: dict[str, Any]) -> tuple[str, ...]:
+    """Turn a profile_version>=1.1.0 flags OBJECT into Boltz CLI tokens.
+
+    `{"recycling_steps": 1}`      -> ("--recycling_steps", "1")
+    `{"no_kernels": true}`        -> ("--no_kernels",)        boolean switch
+    `{"use_msa_server": false}`   -> ()                        switch left off
+
+    A boolean is a click switch: it is either present or absent and NEVER
+    takes a value.  Everything else is `--name value` as two argv tokens.
+    Emitting `name` without the `--` (which is what iterating the object as
+    if it were a list produced) makes click read it as a positional DATA
+    argument — that is the 'Got unexpected extra arguments' failure.
+    """
+    out: list[str] = []
+    for key, value in flags.items():
+        name = str(key)
+        if not name:
+            raise ContractError("scorer_profile flag with empty name")
+        if name.startswith("-"):
+            raise ContractError(
+                f"scorer_profile flag key {name!r} must be a bare option name, "
+                f"not an argv token")
+        opt = "--" + name
+        if isinstance(value, bool):
+            if value:
+                out.append(opt)
+        elif value is None:
+            continue
+        else:
+            out += [opt, str(value)]
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class ScorerProfile:
-    """The lease's scorer profile — the validator uses EXACTLY this."""
+    """The lease's scorer profile — the validator uses EXACTLY this.
+
+    Two wire shapes are accepted:
+
+    * profile_version <= 1.0.x — `flags` is a LIST of ready argv tokens.
+    * profile_version  1.1.0   — `flags` is an OBJECT of option -> value,
+      plus an `msa_sampling` object and a `seed`.  This is what the live
+      Worker publishes.
+
+    `flags` on the dataclass is always the normalised argv token tuple.
+    """
     boltz_version: str
     flags: tuple[str, ...]
     alignment_sampling: str
+    msa_sampling: tuple[str, ...] = ()
+    seed: int | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ScorerProfile":
@@ -96,13 +142,41 @@ class ScorerProfile:
         missing = [k for k in ("boltz_version", "flags", "alignment_sampling") if k not in d]
         if missing:
             raise ContractError(f"scorer_profile missing {missing}")
-        return cls(str(d["boltz_version"]), tuple(str(f) for f in d["flags"]),
-                   str(d["alignment_sampling"]))
+
+        raw_flags = d["flags"]
+        if isinstance(raw_flags, dict):
+            flags = flags_mapping_to_cli(raw_flags)
+        elif isinstance(raw_flags, (list, tuple)):
+            flags = tuple(str(f) for f in raw_flags)
+        else:
+            raise ContractError(
+                f"scorer_profile.flags must be an object or a list, got "
+                f"{type(raw_flags).__name__}")
+
+        raw_msa = d.get("msa_sampling")
+        if raw_msa is None:
+            msa: tuple[str, ...] = ()
+        elif isinstance(raw_msa, dict):
+            msa = flags_mapping_to_cli(raw_msa)
+        else:
+            raise ContractError("scorer_profile.msa_sampling must be an object")
+
+        raw_seed = d.get("seed")
+        if raw_seed is None:
+            seed = None
+        elif isinstance(raw_seed, bool) or not isinstance(raw_seed, int):
+            raise ContractError(f"scorer_profile.seed must be an integer, got {raw_seed!r}")
+        else:
+            seed = int(raw_seed)
+
+        return cls(str(d["boltz_version"]), flags, str(d["alignment_sampling"]),
+                   msa_sampling=msa, seed=seed, raw=dict(d))
 
     def as_dict(self) -> dict[str, Any]:
-        return {"boltz_version": self.boltz_version,
-                "flags": list(self.flags),
-                "alignment_sampling": self.alignment_sampling}
+        return dict(self.raw) if self.raw else {
+            "boltz_version": self.boltz_version,
+            "flags": list(self.flags),
+            "alignment_sampling": self.alignment_sampling}
 
 
 @dataclass(frozen=True)
