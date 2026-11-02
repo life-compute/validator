@@ -193,13 +193,20 @@ def compute_day(
     already_paid_result_ids: set[int] | None = None,
     recorded_day_hits: dict[int, dict[str, int]] | None = None,
     genesis_day: int = C.GENESIS_DAY,
+    holdback_days: int | None = None,
 ) -> DayComputation:
     """Recompute the payable wallet entries for one calendar day.
 
     `history` MUST contain the canonical log of every day from `genesis_day`
     through `day_log.day` (§6a).  A gap is a refusal, not a zero.  No clock
     parameter exists: the batch day is `day_log.day` and nothing else.
+
+    `holdback_days` is the EFFECTIVE holdback resolved by `Settings`: the
+    protocol constant 7 unless a hard-coded devnet program id activated
+    HOLDBACK_DAYS_OVERRIDE.  None means the constant.
     """
+    hb = C.HOLDBACK_DAYS if holdback_days is None else int(holdback_days)
+    forfeiture_on = C.forfeiture_applies(hb)
     already_paid = set(already_paid_result_ids or ())
     hist = list(history) or [day_log]
     facts = fold_wallet_facts(hist)
@@ -264,17 +271,19 @@ def compute_day(
         if wf.flagged:
             skipped[rec.result_id] = "wallet flagged (wallet_flagged, no wallet_unflagged)"
             continue
-        # §5.1.5 / §13.4 — forfeiture is permanent.
-        if wf.forfeited:
+        # §5.1.5 / §13.4 — forfeiture is permanent.  It forfeits FIRST-WEEK
+        # results, so with an effective holdback of 0 there is no first week
+        # and nothing to forfeit (devnet override only).
+        if wf.forfeited and forfeiture_on:
             skipped[rec.result_id] = "forfeited (holdback_forfeit)"
             continue
         # §5.1.3 — wallet-age holdback, in DAY numbers: held on batch day D
         # when D < firstSeenDay + HOLDBACK_DAYS.  No wall clock takes part.
-        if C.is_held_on_day(wf.first_seen_ms, day_log.day):
+        if C.is_held_on_day(wf.first_seen_ms, day_log.day, hb):
             skipped[rec.result_id] = (
                 f"held: batch day {day_log.day} < firstSeenDay "
                 f"{C.day_of_ms(wf.first_seen_ms)} + "
-                f"HOLDBACK_DAYS={C.HOLDBACK_DAYS}")
+                f"HOLDBACK_DAYS={hb}")
             continue
 
         # §12 / §6.1 — tier comes only from targets_table.json.

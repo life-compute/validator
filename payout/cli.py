@@ -26,6 +26,12 @@ Configuration:
                    refuses when its public key equals the validator's
                    verdict-signing key (VALIDATOR_KEYPAIR).
   PROGRAM_ID / LIFE_MINT   required (§16), no defaults.
+  HOLDBACK_DAYS_OVERRIDE   DEVNET ONLY.  Honoured only when PROGRAM_ID is one
+                   of the program ids hard-coded in constants.DEVNET_PROGRAM_IDS;
+                   for any other id it is IGNORED with a loud message and the
+                   protocol constant HOLDBACK_DAYS=7 is enforced.  A value that
+                   is negative or not an integer refuses start-up on EVERY
+                   network.  Unset => 7.  (HOLDBACK_DAYS itself stays ignored.)
   PAYOUT_STATE_DIR   ledger location (default ./payout_state).
   PAYOUT_ANCHORS     JSON file of day -> anchored logHash (§9).
 
@@ -78,12 +84,26 @@ def _eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _loud(msg: str) -> None:
+    """Print to BOTH streams: a safety message must not be lost to a pipe."""
+    print(msg)
+    print(msg, file=sys.stderr)
+
+
 def _build_service(args, env: dict[str, str]) -> tuple[PayoutSignerService,
                                                        PayoutRoutes,
                                                        PayoutSigner,
                                                        LogSource]:
     """Wire the checker up.  Any missing required setting raises."""
-    settings = Settings.from_env(env)
+    settings = Settings.from_env(env, warn=_loud)
+
+    # §devnet-only: one loud, unmissable start-up line when the hard-coded
+    # devnet allow-list has let HOLDBACK_DAYS_OVERRIDE take effect.
+    if settings.holdback_override_active:
+        _loud(f"*** DEVNET HOLDBACK OVERRIDE ACTIVE: "
+              f"HOLDBACK_DAYS={settings.holdback_days} "
+              f"(protocol constant is {C.HOLDBACK_DAYS}) "
+              f"for PROGRAM_ID={settings.program_id} ***")
 
     table_path = (env.get("TARGETS_TABLE") or "").strip()
     if not table_path:

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from .batch_hash import day_to_iso, log_hash_hex, pubkey_bytes
+from . import constants as C
 from .constants import TARGETS_TABLE_SHA256
 from .errors import CoordinatorUnreachable, DayNotClosed, PayoutConfigError
 
@@ -58,9 +59,17 @@ class Settings:
     A checker configured with different values cannot verify any fixture
     batch, which is the point: the chain constants are committed to by every
     batch hash (§4), so getting them wrong must fail loudly, not silently.
+
+    `holdback_days` is the EFFECTIVE holdback for this configuration.  It is
+    the protocol constant C.HOLDBACK_DAYS (7) unless HOLDBACK_DAYS_OVERRIDE
+    is set AND `program_id` is one of the hard-coded devnet program ids in
+    C.DEVNET_PROGRAM_IDS.  It is resolved once, here, at start-up — no rule
+    reads the environment itself, so there is exactly one place where a
+    non-7 holdback can come into existence.
     """
     program_id: str
     life_mint: str
+    holdback_days: int = C.HOLDBACK_DAYS
 
     def __post_init__(self) -> None:
         for name, val in (("PROGRAM_ID", self.program_id),
@@ -74,9 +83,33 @@ class Settings:
                 raise PayoutConfigError(
                     f"{name} is not a valid base58 32-byte public key: {exc}"
                 ) from None
+        try:
+            hb = C.parse_holdback_override(self.holdback_days)
+        except ValueError as exc:
+            raise PayoutConfigError(
+                f"holdback_days is invalid: {exc}") from None
+        if hb != C.HOLDBACK_DAYS and not C.is_devnet_program_id(self.program_id):
+            raise PayoutConfigError(
+                f"holdback_days={hb} is only allowed for a devnet program id; "
+                f"PROGRAM_ID={self.program_id} is not in the hard-coded "
+                f"devnet allow-list, so the protocol constant "
+                f"{C.HOLDBACK_DAYS} applies")
+
+    @property
+    def holdback_override_active(self) -> bool:
+        """True when this configuration runs on a non-protocol holdback."""
+        return int(self.holdback_days) != C.HOLDBACK_DAYS
 
     @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
+    def from_env(cls, env: dict[str, str] | None = None,
+                 warn=None) -> "Settings":
+        """Build Settings from the environment, resolving the devnet override.
+
+        `warn` is called with one line of text when HOLDBACK_DAYS_OVERRIDE is
+        present but IGNORED (non-devnet program id).  An override value that
+        is negative or not an integer raises PayoutConfigError at start-up,
+        on every network, before the program id is even consulted.
+        """
         import os
         env = dict(os.environ if env is None else env)
         missing = [k for k in ("PROGRAM_ID", "LIFE_MINT")
@@ -85,8 +118,31 @@ class Settings:
             raise PayoutConfigError(
                 f"{' and '.join(missing)} must be set; BATCH_SPEC §16 makes "
                 f"them required checker configuration with no default")
-        return cls(program_id=env["PROGRAM_ID"].strip(),
-                   life_mint=env["LIFE_MINT"].strip())
+        program_id = env["PROGRAM_ID"].strip()
+
+        holdback_days = C.HOLDBACK_DAYS
+        raw = env.get(C.HOLDBACK_OVERRIDE_ENV)
+        if raw is not None and str(raw).strip() != "":
+            try:
+                value = C.parse_holdback_override(raw)
+            except ValueError as exc:
+                raise PayoutConfigError(
+                    f"{C.HOLDBACK_OVERRIDE_ENV}={str(raw)!r} is invalid: "
+                    f"{exc}; it must be a non-negative integer. Refusing to "
+                    f"start.") from None
+            if C.is_devnet_program_id(program_id):
+                holdback_days = value
+            elif warn is not None:
+                warn(
+                    f"!!! {C.HOLDBACK_OVERRIDE_ENV}={value} IGNORED: "
+                    f"PROGRAM_ID={program_id} is not a hard-coded devnet "
+                    f"program id. The protocol holdback of "
+                    f"{C.HOLDBACK_DAYS} days is ENFORCED. !!!")
+
+        return cls(program_id=program_id,
+                   life_mint=env["LIFE_MINT"].strip(),
+                   holdback_days=holdback_days)
+
 
 
 # ── targets table (§12) ──────────────────────────────────────────────────────

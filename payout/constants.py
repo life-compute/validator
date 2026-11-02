@@ -15,6 +15,8 @@ package imports no clock at all.
 """
 from __future__ import annotations
 
+import re
+
 # ── Token units (§5.3) ───────────────────────────────────────────────────────
 RAW_PER_LIFE = 1_000_000          # 1 LIFE = 1e6 raw units, 6 decimals
 
@@ -46,6 +48,56 @@ HOLDBACK_MS = 604_800_000         # 7 days, as published in the README table
 HOLDBACK_DAYS = HOLDBACK_MS // MS_PER_DAY        # == 7
 assert HOLDBACK_DAYS * MS_PER_DAY == HOLDBACK_MS, \
     "HOLDBACK_MS must be a whole number of days for the day-based rule"
+
+# ── Devnet-only holdback override (NOT part of BATCH_SPEC) ──────────────────
+# The devnet coordinator is deployed with a holdback of 0 so a test day can be
+# paid the moment it closes.  HOLDBACK_DAYS_OVERRIDE lets the checker follow
+# that deployment, but ONLY for a program id that is hard-coded here: the
+# tuple below is the complete allow-list and is deliberately NOT configurable,
+# so no environment variable, file or flag can make a real cluster accept a
+# holdback other than the protocol constant 7.
+#
+# HOLDBACK_DAYS_OVERRIDE is read instead of HOLDBACK_DAYS: the plain
+# HOLDBACK_DAYS environment variable stays ignored on every network.
+DEVNET_PROGRAM_IDS = (
+    "HhS2coMkjRc5SSPsJn4mTXcFYwWL9hz6cfAzoWKymadv",
+    "74RHjg1zYgN9zuVykde4SK2ERiRgNkouATW9MmQDLRWf",
+)
+
+HOLDBACK_OVERRIDE_ENV = "HOLDBACK_DAYS_OVERRIDE"
+
+_INT_RE = re.compile(r"^[+-]?[0-9]+$")
+
+
+def is_devnet_program_id(program_id: str) -> bool:
+    """True only for an EXACT match against the hard-coded devnet allow-list.
+
+    Exact string equality: a program id that differs by a single character is
+    a different program and gets the protocol constant, not the override.
+    """
+    return isinstance(program_id, str) and program_id in DEVNET_PROGRAM_IDS
+
+
+def parse_holdback_override(raw: object) -> int:
+    """Parse HOLDBACK_DAYS_OVERRIDE.  Raises ValueError on anything invalid.
+
+    Accepts a non-negative decimal integer only — no floats ("0.0"), no
+    whitespace-only, no "true", no negative value.  Validation happens at
+    start-up and BEFORE the program id is consulted, so a malformed setting is
+    refused on devnet and on a real cluster alike.
+    """
+    if isinstance(raw, bool):
+        raise ValueError(f"{raw!r} is not an integer")
+    if isinstance(raw, int):
+        value = int(raw)
+    else:
+        text = str(raw).strip()
+        if not text or not _INT_RE.match(text):
+            raise ValueError(f"{str(raw)!r} is not an integer")
+        value = int(text)
+    if value < 0:
+        raise ValueError(f"{value} is below 0")
+    return value
 
 # ── Reward tiers (§12 tier -> base reward; mirrors §6.1) ─────────────────────
 # FIVE valid tiers.  "medium" is new in this spec revision and the table now
@@ -149,15 +201,38 @@ def day_of_ms(time_ms: int) -> int:
     return int(time_ms) // MS_PER_DAY
 
 
-def holdback_release_day(first_seen_ms: int) -> int:
-    """First batch day on which a wallet's holdback has expired (§5.1.3)."""
-    return day_of_ms(first_seen_ms) + HOLDBACK_DAYS
+def holdback_release_day(first_seen_ms: int,
+                         holdback_days: int | None = None) -> int:
+    """First batch day on which a wallet's holdback has expired (§5.1.3).
+
+    `holdback_days` defaults to the protocol constant 7.  It is only ever
+    something else when `Settings` resolved a devnet override (see
+    DEVNET_PROGRAM_IDS); callers on a real cluster always get 7.
+    """
+    hb = HOLDBACK_DAYS if holdback_days is None else int(holdback_days)
+    return day_of_ms(first_seen_ms) + hb
 
 
-def is_held_on_day(first_seen_ms: int, batch_day: int) -> bool:
+def is_held_on_day(first_seen_ms: int, batch_day: int,
+                   holdback_days: int | None = None) -> bool:
     """§5.0 rule 12 / §5.1.3: held on batch day D when D < firstSeenDay + 7.
 
     No wall-clock value takes part: `first_seen_ms` is the log's own
     wallet_first_seen timestamp and `batch_day` is the injected batch day.
+    With an effective holdback of 0 the condition D < firstSeenDay + 0 is
+    false for every wallet, i.e. there is no first week at all.
     """
-    return int(batch_day) < holdback_release_day(first_seen_ms)
+    return int(batch_day) < holdback_release_day(first_seen_ms, holdback_days)
+
+
+def forfeiture_applies(holdback_days: int | None = None) -> bool:
+    """§5.1.5 / §13.4: is there a first week whose results can be forfeited?
+
+    `holdback_forfeit` forfeits a wallet's FIRST-WEEK results.  When the
+    effective holdback is 0 there is no first week, so nothing can be
+    forfeited and the rule is consistently inert — otherwise a devnet batch
+    could be refused for forfeiting a window the same config says is empty.
+    """
+    hb = HOLDBACK_DAYS if holdback_days is None else int(holdback_days)
+    return hb > 0
+

@@ -182,6 +182,9 @@ class PayoutSignerService:
             already_paid_result_ids=self.ledger.paid_result_ids,
             recorded_day_hits=self.ledger.day_target_hits,
             genesis_day=genesis_day,
+            # The EFFECTIVE holdback, resolved once by Settings at start-up.
+            holdback_days=getattr(self.settings, "holdback_days",
+                                  C.HOLDBACK_DAYS),
         )
 
         results = verify_day(

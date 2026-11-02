@@ -470,23 +470,26 @@ def verify_batch(
                     f"recipient {recipient[:8]}… has a wallet_flagged event in "
                     f"the canonical log and no subsequent wallet_unflagged — "
                     f"ineligible for payout (§13.2, §5.1.4)", wallet=recipient))
-            if wf.forfeited:
+            if wf.forfeited and C.forfeiture_applies(settings.holdback_days):
                 findings.append(Finding(
                     FORFEITED_WALLET_PAID,
                     f"recipient {recipient[:8]}… has a holdback_forfeit event "
                     f"in the canonical log — first-week results are permanently "
                     f"forfeited (§13.4, §5.1.5)", wallet=recipient))
             # §5.0 rule 12 / §5.1.3 — DAY-based holdback, evaluated against the
-            # batch's own day.  No wall-clock value is read anywhere.
-            if C.is_held_on_day(wf.first_seen_ms, batch.day):
+            # batch's own day.  No wall-clock value is read anywhere.  The
+            # effective holdback comes from `settings` (7 unless a hard-coded
+            # devnet program id activated HOLDBACK_DAYS_OVERRIDE).
+            if C.is_held_on_day(wf.first_seen_ms, batch.day,
+                                settings.holdback_days):
                 findings.append(Finding(
                     HELD_WALLET_PAID,
                     f"recipient {recipient[:8]}… has wallet_first_seen "
                     f"time_ms={wf.first_seen_ms} in the canonical log "
                     f"(firstSeenDay={C.day_of_ms(wf.first_seen_ms)}); batch day "
                     f"{batch.day} < {C.day_of_ms(wf.first_seen_ms)} + "
-                    f"HOLDBACK_DAYS={C.HOLDBACK_DAYS} = "
-                    f"{C.holdback_release_day(wf.first_seen_ms)}, so this "
+                    f"HOLDBACK_DAYS={settings.holdback_days} = "
+                    f"{C.holdback_release_day(wf.first_seen_ms, settings.holdback_days)}, so this "
                     f"first-week result must be held (§5.1.3, §5.0 rule 12)",
                     wallet=recipient))
 
