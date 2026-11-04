@@ -41,12 +41,23 @@ the checker, which loads them itself; `_SECRET_ENV_KEYS` are redacted to the
 path only in every status record and log line.
 
 ANCHORS (§9).  The checker requires PAYOUT_ANCHORS: day -> anchored logHash.
-With ANCHOR_SOURCE=worker this file is built from the Worker's OWN closed-day
-manifests, which is NOT an independent anchor — the same party that proposes
-the batch supplies the hash it is checked against.  It is therefore allowed
-ONLY for a program id in the hard-coded devnet allow-list
-(payout.constants.DEVNET_PROGRAM_IDS) and prints a loud warning every run.
-`ChainAnchorBuilder` below is the place where on-chain anchors go later.
+BY DEFAULT that map is now read from the CHAIN
+(payout.chain_anchors.ChainAnchorBuilder): for each day the operator's SPL
+Memo anchor transaction is located, validated and its log hash taken.  The
+checker still computes the log hash itself from the canonical log it
+downloaded and compares the two — the Worker's published value is never the
+authority.
+
+The old Worker-sourced map survives ONLY behind the explicit opt-in
+ANCHORS_FROM_WORKER=1 (equivalently ANCHOR_SOURCE=worker), which is honoured
+only for a program id in the hard-coded devnet allow-list
+(payout.constants.DEVNET_PROGRAM_IDS), prints a loud warning every run and is
+OFF by default.  ANCHOR_SOURCE=file keeps a pre-built file working for tests.
+
+Chain outcomes:  a day with no anchor yet is TRANSIENT (`anchor_pending`) —
+retried next run, never a refusal, never blocking another day.  A hash that
+disagrees with the computed log hash is the refusal `anchor_mismatch`; two
+valid anchors that disagree are the refusal `anchor_conflict`.
 """
 from __future__ import annotations
 
@@ -68,7 +79,17 @@ from typing import Any, Iterable
 from . import cli as payout_cli
 from . import constants as C
 from .batch_hash import day_to_iso
-from .errors import PayoutError
+from .chain_anchors import (
+    ANCHOR_CONFLICT,
+    ANCHOR_MISMATCH,
+    ANCHOR_MISSING,
+    AnchorConflict,
+    AnchorRpcUnavailable,
+    ChainAnchorBuilder,
+    DEFAULT_ANCHOR_RPC_URL,
+    DEFAULT_MEMO_PROGRAM,
+)
+from .errors import ANCHOR_HASH_MISMATCH, PayoutError
 from .ledger import DecisionLedger
 from .routes import PayoutRoutes
 
@@ -91,6 +112,9 @@ ANCHOR_WARNING = (
     "that proposes the batch also supplies the log hash it is checked "
     "against. This is accepted ONLY for a hard-coded devnet program id and "
     "MUST be replaced by on-chain anchors before any real cluster. ***")
+
+# Set by the operator to go BACK to the old, non-independent behaviour.
+WORKER_ANCHORS_ENV = "ANCHORS_FROM_WORKER"
 
 _REFUSED_RE = re.compile(r"^REFUSED day (\d+): (\S+)", re.M)
 
@@ -182,13 +206,21 @@ class ServiceConfig:
     genesis_day: int
     first_day: int
     last_day: int | None = None
-    anchor_source: str = "worker"
+    anchor_source: str = "chain"
+    anchor_rpc_url: str = DEFAULT_ANCHOR_RPC_URL
+    anchor_operator_pubkey: str = ""
+    anchor_memo_program: str = DEFAULT_MEMO_PROGRAM
     holdback_override: str | None = None
     timeout: float = 20.0
 
     @property
     def signatures_dir(self) -> Path:
         return Path(self.work_dir) / "signatures"
+
+    @property
+    def anchor_cache_path(self) -> Path:
+        """Incremental signature cache: lives beside the checker's ledger."""
+        return Path(self.state_dir) / "anchor_signature_cache.json"
 
     @property
     def status_path(self) -> Path:
@@ -217,11 +249,30 @@ class ServiceConfig:
         genesis_day = int(genesis_raw) if genesis_raw else C.GENESIS_DAY
         first_raw = (env.get("PAYOUT_FIRST_DAY") or "").strip()
         last_raw = (env.get("PAYOUT_LAST_DAY") or "").strip()
-        anchor_source = (env.get("ANCHOR_SOURCE") or "worker").strip().lower()
+        # Chain anchors are the DEFAULT.  ANCHORS_FROM_WORKER=1 is the only
+        # supported way back to the Worker-sourced map, and ANCHOR_SOURCE is
+        # still honoured so an existing file-based test setup keeps working.
+        anchor_source = (env.get("ANCHOR_SOURCE") or "").strip().lower()
+        from_worker = (env.get(WORKER_ANCHORS_ENV) or "").strip().lower()
+        if from_worker in ("1", "true", "yes", "on"):
+            anchor_source = anchor_source or "worker"
+        elif from_worker not in ("", "0", "false", "no", "off"):
+            raise ServiceConfigError(
+                f"{WORKER_ANCHORS_ENV}={from_worker!r} is not a boolean "
+                f"(use 1 or leave it unset)")
+        anchor_source = anchor_source or "chain"
         if anchor_source not in ("worker", "file", "chain"):
             raise ServiceConfigError(
                 f"ANCHOR_SOURCE={anchor_source!r} is not one of "
                 f"worker|file|chain")
+        operator = (env.get("ANCHOR_OPERATOR_PUBKEY") or "").strip()
+        if anchor_source == "chain" and not operator:
+            raise ServiceConfigError(
+                "ANCHOR_OPERATOR_PUBKEY is required: anchors are read from "
+                "the chain by default, and without the operator's public key "
+                "the checker cannot tell whose memo counts as an anchor "
+                f"(set it, or opt back in to the devnet-only Worker anchors "
+                f"with {WORKER_ANCHORS_ENV}=1)")
         for key in ("PAYOUT_KEYPAIR", "VALIDATOR_KEYPAIR", "TARGETS_TABLE"):
             path = (env.get(key) or "").strip()
             if path and not Path(path).is_file():
@@ -242,6 +293,11 @@ class ServiceConfig:
             first_day=int(first_raw) if first_raw else genesis_day,
             last_day=int(last_raw) if last_raw else None,
             anchor_source=anchor_source,
+            anchor_rpc_url=((env.get("ANCHOR_RPC_URL") or "").strip()
+                            or DEFAULT_ANCHOR_RPC_URL),
+            anchor_operator_pubkey=operator,
+            anchor_memo_program=((env.get("ANCHOR_MEMO_PROGRAM") or "").strip()
+                                 or DEFAULT_MEMO_PROGRAM),
             holdback_override=(env.get("HOLDBACK_DAYS_OVERRIDE") or None),
             timeout=float((env.get("HTTP_TIMEOUT") or "20").strip()),
         )
@@ -272,6 +328,12 @@ class ServiceConfig:
             "validatorKeypairPath": self.validator_keypair,
             "anchorsPath": self.anchors_path,
             "anchorSource": self.anchor_source,
+            "anchorRpcUrl": (self.anchor_rpc_url
+                             if self.anchor_source == "chain" else None),
+            "anchorOperatorPubkey": (self.anchor_operator_pubkey
+                                     if self.anchor_source == "chain" else None),
+            "anchorMemoProgram": (self.anchor_memo_program
+                                  if self.anchor_source == "chain" else None),
             "stateDir": self.state_dir,
             "genesisDay": self.genesis_day,
             "holdbackDaysOverride": self.holdback_override,
@@ -396,32 +458,30 @@ class FileAnchorBuilder(AnchorBuilder):
         return {int(k): str(v).strip().lower() for k, v in obj.items()}
 
 
-class ChainAnchorBuilder(AnchorBuilder):
-    """PLACEHOLDER for the real thing: anchors read from the chain.
+def _chain_builder(cfg: ServiceConfig, warn=print) -> ChainAnchorBuilder:
+    """The real on-chain builder (payout.chain_anchors), configured.
 
-    Implement here: read the program's `anchor_hash` account for each day
-    (BATCH_SPEC §9) through an RPC endpoint, and return day -> hash.  Nothing
-    else in this module changes — `_anchor_builder` just hands back this class
-    for ANCHOR_SOURCE=chain, and no program-id gate is needed because an
-    on-chain anchor IS independent of the coordinator.
+    No program-id gate is needed here: an on-chain anchor published by the
+    operator IS independent of the coordinator, so it is valid on any cluster.
     """
-
-    name = "chain"
-
-    def build(self, days: Iterable[int]) -> dict[int, str]:
-        raise AnchorSourceRefused(
-            "ANCHOR_SOURCE=chain is not implemented yet: on-chain anchor_hash "
-            "reads (BATCH_SPEC §9) still have to be wired up in "
-            "payout.autorun.ChainAnchorBuilder.build")
+    return ChainAnchorBuilder(
+        program_id=cfg.program_id,
+        operator_pubkey=cfg.anchor_operator_pubkey,
+        rpc_url=cfg.anchor_rpc_url,
+        memo_program=cfg.anchor_memo_program,
+        cache_path=cfg.anchor_cache_path,
+        timeout=cfg.timeout,
+        headers=ua_headers(),
+        warn=warn)
 
 
 def _anchor_builder(cfg: ServiceConfig, client: WorkerClient,
-                    warn=print) -> AnchorBuilder:
+                    warn=print) -> AnchorBuilder | ChainAnchorBuilder:
     if cfg.anchor_source == "worker":
         return WorkerAnchorBuilder(client, cfg.program_id, warn=warn)
     if cfg.anchor_source == "file":
         return FileAnchorBuilder(cfg.anchors_path)
-    return ChainAnchorBuilder()
+    return _chain_builder(cfg, warn=warn)
 
 
 # ── per-day outcome ─────────────────────────────────────────────────────────
@@ -437,8 +497,22 @@ OUTCOME_OPEN = "day_open"
 OUTCOME_NOT_ARCHIVED = "day_not_archived"
 OUTCOME_ERROR = "error"
 
+# ── anchor outcomes ─────────────────────────────────────────────────────────
+# TRANSIENT: no anchor on chain for this day (yet), or the chain could not be
+# read at all.  Retried at the next run; NEVER recorded as a refusal and never
+# blocking any other day.
+OUTCOME_ANCHOR_PENDING = "anchor_pending"
+# REFUSALS: the chain and the checker's own computation disagree, or the chain
+# carries two valid anchors that disagree.  Both need a human.
+OUTCOME_ANCHOR_MISMATCH = ANCHOR_MISMATCH          # "anchor_mismatch"
+OUTCOME_ANCHOR_CONFLICT = ANCHOR_CONFLICT          # "anchor_conflict"
+
 _ATTENTION = (OUTCOME_REFUSED, OUTCOME_REFUSED_CACHED,
-              OUTCOME_SIGNED_POST_FAILED, OUTCOME_ERROR)
+              OUTCOME_SIGNED_POST_FAILED, OUTCOME_ERROR,
+              OUTCOME_ANCHOR_MISMATCH, OUTCOME_ANCHOR_CONFLICT)
+
+# Outcomes that are retried on the next run and are not failures of the run.
+_TRANSIENT = (OUTCOME_ANCHOR_PENDING,)
 
 
 @dataclass
@@ -453,6 +527,7 @@ class DayOutcome:
     posted: bool | None = None
     entry_count: int | None = None
     detail: str | None = None
+    anchor: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"day": self.day, "date": self.date,
@@ -471,11 +546,18 @@ class DayOutcome:
             out["posted"] = self.posted
         if self.detail:
             out["detail"] = self.detail
+        if self.anchor:
+            out["anchor"] = self.anchor
         return out
 
     @property
     def needs_attention(self) -> bool:
         return self.outcome in _ATTENTION
+
+    @property
+    def transient(self) -> bool:
+        """Retried on the next run; not a refusal and not a run failure."""
+        return self.outcome in _TRANSIENT
 
 
 def chunk_fingerprint(chunks: list[dict[str, Any]]) -> str:
@@ -512,6 +594,9 @@ class PayoutCheckerService:
         Path(cfg.work_dir).mkdir(parents=True, exist_ok=True)
         cfg.signatures_dir.mkdir(parents=True, exist_ok=True)
         self.state = self._load_state()
+        # One chain scan per run, shared by every day (see chain_scan).
+        self._chain_scan = None
+        self._chain_rpc_error: str | None = None
 
     # ── logging ─────────────────────────────────────────────────────────────
     def log(self, msg: str) -> None:
@@ -584,6 +669,84 @@ class PayoutCheckerService:
                      f"archived); the checker will refuse any day that needs "
                      f"them")
         return anchors
+
+    # ── chain anchors: ONE scan per run, reused for every day ───────────────
+    def chain_scan(self, through_day: int | None = None):
+        """Scan the operator's on-chain history once per run.
+
+        Returns the ChainScan, or raises AnchorRpcUnavailable.  The result is
+        memoised for the whole run, so a 5-day scan is one pass over the
+        signature history, not five.
+
+        The range is ALWAYS the whole configured scan window
+        (genesis_day..last_day), never just the day that happened to ask
+        first — otherwise the memoised scan would drop every later day's
+        anchor.
+        """
+        if self._chain_scan is not None:
+            return self._chain_scan
+        if self._chain_rpc_error is not None:
+            raise AnchorRpcUnavailable(self._chain_rpc_error)
+        builder = _chain_builder(self.cfg, warn=self.log)
+        last = self.last_day() if through_day is None else max(
+            int(through_day), self.last_day())
+        days = range(int(self.cfg.genesis_day), int(last) + 1)
+        try:
+            scan = builder.collect(days)
+        except AnchorRpcUnavailable as exc:
+            self._chain_rpc_error = str(exc)
+            raise
+        self._chain_scan = scan
+        self.log(f"chain anchors: {len(scan.anchors)} accepted, "
+                 f"{scan.signatures_seen} signature(s) over {scan.pages} "
+                 f"page(s), {scan.transactions_fetched} fetched / "
+                 f"{scan.cache_hits} from cache, ignored="
+                 f"{json.dumps(scan.ignored, sort_keys=True)}")
+        for day, bucket in sorted(scan.conflicts.items()):
+            self.log(f"CONFLICT day {day}: {len(bucket)} valid anchors with "
+                     f"different hashes")
+        return scan
+
+    def chain_anchor_for(self, day: int) -> tuple[DayOutcome | None, Any]:
+        """(blocking_outcome, AnchorRecord) for one day.
+
+        A transient problem (RPC down / rate limited / no anchor yet) comes
+        back as OUTCOME_ANCHOR_PENDING; a conflict as the refusal
+        OUTCOME_ANCHOR_CONFLICT.  `anchor_mismatch` is NOT decided here: the
+        checker computes the log hash from the canonical log and compares.
+        """
+        iso = day_to_iso(day)
+        try:
+            scan = self.chain_scan(day)
+        except AnchorRpcUnavailable as exc:
+            self.log(f"day {day} ({iso}): anchor PENDING — the chain could "
+                     f"not be read ({exc}); retrying next run")
+            return DayOutcome(day, iso, OUTCOME_ANCHOR_PENDING,
+                              detail=f"RPC unavailable: {exc}"), None
+        if day in scan.conflicts:
+            bucket = scan.conflicts[day]
+            detail = ("two valid on-chain anchors for this day carry "
+                      "different log hashes: " + " vs ".join(
+                          f"{r.log_hash} (tx {r.signature})" for r in bucket))
+            self.log(f"day {day} ({iso}): ANCHOR CONFLICT — {detail}")
+            return DayOutcome(day, iso, OUTCOME_ANCHOR_CONFLICT, detail=detail,
+                              anchor={"conflicts": [r.as_dict()
+                                                    for r in bucket]}), None
+        record = scan.anchors.get(int(day))
+        if record is None:
+            self.log(f"day {day} ({iso}): anchor PENDING — no LIFE-ANCHOR/1 "
+                     f"memo on chain yet; retrying next run")
+            return DayOutcome(day, iso, OUTCOME_ANCHOR_PENDING,
+                              detail="no on-chain anchor for this day yet "
+                                     "(transient: retried next run)"), None
+        return None, record
+
+    def write_anchor_file(self, anchors: dict[int, str]) -> None:
+        """Hand the day -> hash map to the checker through PAYOUT_ANCHORS."""
+        p = Path(self.cfg.anchors_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(
+            {str(k): v for k, v in sorted(anchors.items())}))
 
     # ── posting ─────────────────────────────────────────────────────────────
     def _post_file(self, day: int, path: Path) -> tuple[bool, str]:
@@ -734,14 +897,29 @@ class PayoutCheckerService:
                               detail="batch unchanged since the refusal; not "
                                      "retried until its fingerprint changes")
 
-        # (6) anchors, then the checker itself.
-        try:
-            self.refresh_anchors(day)
-        except AnchorSourceRefused:
-            raise
-        except PayoutError as exc:
-            return DayOutcome(day, iso, OUTCOME_ERROR,
-                              detail=f"could not build anchors: {exc}")
+        # (6) the anchor for THIS day, then the checker itself.
+        anchor_info: dict[str, Any] | None = None
+        if self.cfg.anchor_source == "chain":
+            blocked, record = self.chain_anchor_for(day)
+            if blocked is not None:
+                # Transient (anchor_pending) or the anchor_conflict refusal.
+                # Either way this day is skipped WITHOUT touching the others.
+                blocked.batch_ids = batch_ids
+                blocked.entry_count = entry_count
+                return blocked
+            anchor_info = record.as_dict()
+            anchors = dict(self._chain_scan.anchors) if self._chain_scan else {}
+            self.write_anchor_file({d: a.log_hash for d, a in anchors.items()})
+            self.log(f"day {day} ({iso}): anchor from chain tx "
+                     f"{record.signature} log={record.log_hash}")
+        else:
+            try:
+                self.refresh_anchors(day)
+            except AnchorSourceRefused:
+                raise
+            except PayoutError as exc:
+                return DayOutcome(day, iso, OUTCOME_ERROR,
+                                  detail=f"could not build anchors: {exc}")
 
         seq_before = self._ledger_seq()
         rc, output = self._run_checker(day, sig_path)
@@ -754,16 +932,22 @@ class PayoutCheckerService:
                               if output.strip() else "checker refused to start")
         if rc != payout_cli.EXIT_OK:
             rule, reason = self._refusal_from(output, seq_before)
+            # The checker computed the log hash from the canonical log it
+            # downloaded and it disagrees with the hash read from the chain:
+            # that is the anchor_mismatch refusal, named as such.
+            outcome = (OUTCOME_ANCHOR_MISMATCH
+                       if rule == ANCHOR_HASH_MISMATCH else OUTCOME_REFUSED)
             st["refusal"] = {"rule": rule, "reason": reason,
                              "fingerprint": fingerprint,
                              "batchIds": batch_ids}
             st.pop("signatureFile", None)
             st.pop("posted", None)
             self._save_state()
-            self.log(f"day {day} ({iso}): REFUSED — rule={rule}")
-            return DayOutcome(day, iso, OUTCOME_REFUSED, batch_ids=batch_ids,
+            self.log(f"day {day} ({iso}): REFUSED — rule={rule} "
+                     f"outcome={outcome}")
+            return DayOutcome(day, iso, outcome, batch_ids=batch_ids,
                               entry_count=entry_count, rule=rule,
-                              reason=reason)
+                              reason=reason, anchor=anchor_info)
 
         if not sig_path.is_file():
             return DayOutcome(day, iso, OUTCOME_ERROR, batch_ids=batch_ids,
@@ -786,13 +970,13 @@ class PayoutCheckerService:
             return DayOutcome(day, iso, OUTCOME_SIGNED, batch_ids=batch_ids,
                               entry_count=entry_count,
                               signature_file=str(sig_path), posted=True,
-                              detail=detail)
+                              detail=detail, anchor=anchor_info)
         self.log(f"day {day} ({iso}): signed, but the POST failed — file kept "
                  f"at {sig_path} for the next run — {detail}")
         return DayOutcome(day, iso, OUTCOME_SIGNED_POST_FAILED,
                           batch_ids=batch_ids, entry_count=entry_count,
                           signature_file=str(sig_path), posted=False,
-                          detail=detail)
+                          detail=detail, anchor=anchor_info)
 
     # ── one run ─────────────────────────────────────────────────────────────
     def run_once(self) -> tuple[int, dict[str, Any]]:
@@ -801,6 +985,21 @@ class PayoutCheckerService:
                  f"programId={self.cfg.program_id} "
                  f"anchorSource={self.cfg.anchor_source} "
                  f"days={self.cfg.first_day}..{self.last_day()}")
+        if self.cfg.anchor_source == "chain":
+            self.log(f"anchors read from the CHAIN: rpc={self.cfg.anchor_rpc_url} "
+                     f"operator={self.cfg.anchor_operator_pubkey} "
+                     f"memoProgram={self.cfg.anchor_memo_program}")
+            # Scan ONCE up front, best effort, so status.json always carries
+            # the anchor evidence even on a run where every day short-circuits
+            # as already_signed / no_batch and never reaches the per-day
+            # anchor read.  A failure here is NOT fatal: it is memoised and
+            # each day that actually needs an anchor reports anchor_pending.
+            try:
+                self.chain_scan()
+            except AnchorRpcUnavailable as exc:
+                self.log(f"NOTE: the anchor RPC could not be read ({exc}); "
+                         f"any day that needs an anchor this run will be "
+                         f"reported as {OUTCOME_ANCHOR_PENDING}, not refused")
         if self.cfg.anchor_source == "worker":
             # Loud, every run, before anything else happens.
             self.log(ANCHOR_WARNING)
@@ -836,6 +1035,10 @@ class PayoutCheckerService:
                 outcomes.append(outcome)
 
         rc = EXIT_ATTENTION if any(o.needs_attention for o in outcomes) else EXIT_OK
+        pending = [o.day for o in outcomes if o.transient]
+        if pending:
+            self.log(f"transient: day(s) {pending} have no usable on-chain "
+                     f"anchor yet — retried at the next run, NOT a refusal")
         return self._finish(rc, outcomes, started)
 
     def _finish(self, rc: int, outcomes: list[DayOutcome], started: int,
@@ -851,6 +1054,10 @@ class PayoutCheckerService:
             "scan": {"firstDay": self.cfg.first_day, "lastDay": self.last_day()},
             "anchorWarning": (ANCHOR_WARNING
                               if self.cfg.anchor_source == "worker" else None),
+            "anchorScan": (self._chain_scan.as_dict()
+                           if self._chain_scan is not None else None),
+            "anchorRpcError": self._chain_rpc_error,
+            "anchorPendingDays": sorted(o.day for o in outcomes if o.transient),
             "counts": counts,
             "days": [o.as_dict() for o in outcomes],
         }

@@ -351,10 +351,300 @@ def test_worker_anchors_are_built_from_the_manifests(tmp_path, devnet_program):
         assert {int(k): v for k, v in on_disk.items()} == built
 
 
-def test_chain_anchor_source_is_a_clear_placeholder():
-    with pytest.raises(AnchorSourceRefused) as exc:
-        autorun.ChainAnchorBuilder().build([DAY])
-    assert "not implemented yet" in str(exc.value)
+# ── 6b. C44b: anchors come from the CHAIN by default ────────────────────────
+#
+# The on-chain anchor fixtures are REAL devnet LIFE-ANCHOR/1 transactions
+# (tests/fixtures/chain_anchors, see tools/fetch_anchor_fixtures.py).  The
+# mock coordinator serves days 20000+, so the memo text and the day/date pair
+# are re-stamped onto the real transaction structure here; everything else —
+# the account keys, the signer flags, the memo program id, the meta shape —
+# is exactly what devnet returned.
+from payout import chain_anchors as CA  # noqa: E402
+
+CHAIN_FIXTURES = (Path(__file__).resolve().parent / "fixtures"
+                  / "chain_anchors" / "transactions.json")
+REAL_OPERATOR = "CZbXxyCmUP4wdcumPXBx3w2RG2dVoWZQUrVw5YsmaNWk"
+
+
+def _real_anchor_template() -> dict:
+    txs = json.loads(CHAIN_FIXTURES.read_text())
+    return json.loads(json.dumps(txs[sorted(txs)[0]]))
+
+
+def anchor_tx_for(day: int, log_hash: str, program_id: str = PROGRAM_ID,
+                  operator: str = REAL_OPERATOR) -> dict:
+    """A real devnet anchor transaction re-stamped for a mock day."""
+    tx = _real_anchor_template()
+    for key in tx["transaction"]["message"]["accountKeys"]:
+        if key["pubkey"] == REAL_OPERATOR:
+            key["pubkey"] = operator
+    tx["transaction"]["message"]["instructions"][0]["parsed"] = (
+        f"LIFE-ANCHOR/1 day={day} date={iso_for_day(day)} "
+        f"log={log_hash} program={program_id}")
+    return tx
+
+
+class StubRpc:
+    """Serves a prepared signature page + transactions; counts the calls."""
+
+    def __init__(self, txs: dict[str, dict], *, raise_on_signatures=None):
+        self.txs = txs
+        self.raise_on_signatures = raise_on_signatures
+        self.tx_fetches: list[str] = []
+
+    def call(self, method, params):
+        if method == "getSignaturesForAddress":
+            if self.raise_on_signatures is not None:
+                raise self.raise_on_signatures
+            if (params[1] or {}).get("before"):
+                return []
+            return [{"signature": s, "slot": 1, "err": None,
+                     "blockTime": 1, "confirmationStatus": "finalized"}
+                    for s in self.txs]
+        if method == "getTransaction":
+            self.tx_fetches.append(params[0])
+            return self.txs.get(params[0])
+        raise AssertionError(method)
+
+
+def chain_cfg(tmp_path, mock, *, days=(DAY,), hashes=None, operator=REAL_OPERATOR,
+              program_id=PROGRAM_ID, **kw):
+    """A ServiceConfig in chain mode."""
+    cfg = build_cfg(tmp_path, mock, anchor_source="chain", program_id=program_id,
+                    **kw)
+    return ServiceConfig(**{**cfg.__dict__, "anchor_operator_pubkey": operator})
+
+
+def stub_chain(monkeypatch, txs: dict[str, dict]) -> StubRpc:
+    """Make every ChainAnchorBuilder in this test use `txs` as the chain."""
+    stub = StubRpc(txs)
+    monkeypatch.setattr(CA, "SolanaRpc", lambda *a, **k: stub)
+    return stub
+
+
+def test_the_default_anchor_source_is_the_chain():
+    env = {"COORDINATOR_URL": "https://c", "PROGRAM_ID": PROGRAM_ID,
+           "LIFE_MINT": LIFE_MINT, "TARGETS_TABLE": str(TARGETS_TABLE),
+           "PAYOUT_KEYPAIR": "", "VALIDATOR_KEYPAIR": "",
+           "ANCHOR_OPERATOR_PUBKEY": REAL_OPERATOR}
+    with pytest.raises(ServiceConfigError):
+        ServiceConfig.from_mapping(dict(env, PAYOUT_KEYPAIR=""))
+
+
+def test_chain_is_the_default_and_the_operator_pubkey_is_required(tmp_path):
+    key = tmp_path / "k.json"
+    write_throwaway_keypair(key)
+    base = {"COORDINATOR_URL": "https://c", "PROGRAM_ID": PROGRAM_ID,
+            "LIFE_MINT": LIFE_MINT, "TARGETS_TABLE": str(TARGETS_TABLE),
+            "PAYOUT_KEYPAIR": str(key), "VALIDATOR_KEYPAIR": str(key)}
+    with pytest.raises(ServiceConfigError) as exc:
+        ServiceConfig.from_mapping(dict(base))
+    assert "ANCHOR_OPERATOR_PUBKEY is required" in str(exc.value)
+
+    cfg = ServiceConfig.from_mapping(
+        dict(base, ANCHOR_OPERATOR_PUBKEY=REAL_OPERATOR))
+    assert cfg.anchor_source == "chain"
+    assert cfg.anchor_rpc_url == CA.DEFAULT_ANCHOR_RPC_URL
+    assert cfg.anchor_memo_program == CA.DEFAULT_MEMO_PROGRAM
+
+
+def test_anchors_from_worker_is_the_only_opt_in_and_is_off_by_default(tmp_path):
+    key = tmp_path / "k.json"
+    write_throwaway_keypair(key)
+    base = {"COORDINATOR_URL": "https://c", "PROGRAM_ID": PROGRAM_ID,
+            "LIFE_MINT": LIFE_MINT, "TARGETS_TABLE": str(TARGETS_TABLE),
+            "PAYOUT_KEYPAIR": str(key), "VALIDATOR_KEYPAIR": str(key),
+            "ANCHOR_OPERATOR_PUBKEY": REAL_OPERATOR}
+    assert ServiceConfig.from_mapping(dict(base)).anchor_source == "chain"
+    assert ServiceConfig.from_mapping(
+        dict(base, ANCHORS_FROM_WORKER="1")).anchor_source == "worker"
+    assert ServiceConfig.from_mapping(
+        dict(base, ANCHORS_FROM_WORKER="0")).anchor_source == "chain"
+    with pytest.raises(ServiceConfigError):
+        ServiceConfig.from_mapping(dict(base, ANCHORS_FROM_WORKER="maybe"))
+
+
+def test_opt_in_worker_anchors_are_still_refused_for_a_non_devnet_program(tmp_path):
+    """ANCHORS_FROM_WORKER=1 does NOT widen the devnet-only gate."""
+    with MockPayoutCoordinator() as mock:
+        assert not C.is_devnet_program_id(PROGRAM_ID)
+        cfg = build_cfg(tmp_path, mock, anchor_source="worker")
+        rc, status = PayoutCheckerService(cfg).run_once()
+        assert rc == autorun.EXIT_CONFIG
+        assert "not in the hard-coded devnet allow-list" in status["error"]
+        assert mock.posted() == []
+
+
+def test_a_day_anchored_on_chain_is_signed(tmp_path, monkeypatch):
+    """The happy path: the anchor comes from the chain, the day is signed."""
+    with MockPayoutCoordinator() as mock:
+        stub = stub_chain(monkeypatch, {
+            "SIG" + str(DAY): anchor_tx_for(DAY, anchored_hashes()[DAY])})
+        rc, status = PayoutCheckerService(chain_cfg(tmp_path, mock)).run_once()
+        day = outcomes_by_day(status)[DAY]
+        assert day["outcome"] == OUTCOME_SIGNED, day
+        assert day["anchor"]["logHash"] == anchored_hashes()[DAY]
+        assert day["anchor"]["signature"] == "SIG" + str(DAY)
+        assert status["anchorWarning"] is None
+        assert status["config"]["anchorSource"] == "chain"
+        assert status["config"]["anchorOperatorPubkey"] == REAL_OPERATOR
+        assert status["anchorScan"]["anchors"][str(DAY)]["logHash"] == \
+            anchored_hashes()[DAY]
+        assert stub.tx_fetches == ["SIG" + str(DAY)]
+
+
+def test_no_anchor_on_chain_is_transient_and_retried_next_run(tmp_path,
+                                                              monkeypatch):
+    """anchor_missing -> anchor_pending: no refusal, no record, retried."""
+    with MockPayoutCoordinator() as mock:
+        cfg = chain_cfg(tmp_path, mock)
+        stub_chain(monkeypatch, {})                     # nothing on chain yet
+        rc1, st1 = PayoutCheckerService(cfg).run_once()
+        day1 = outcomes_by_day(st1)[DAY]
+        assert day1["outcome"] == autorun.OUTCOME_ANCHOR_PENDING, day1
+        assert rc1 == autorun.EXIT_OK            # transient is NOT attention
+        assert st1["anchorPendingDays"] == [DAY]
+        assert mock.posted() == []
+        # nothing was recorded as a refusal (in fact nothing was persisted
+        # for the day at all — a transient outcome leaves no standing state)
+        state_path = Path(cfg.service_state_path)
+        state = json.loads(state_path.read_text()) if state_path.is_file() \
+            else {"days": {}}
+        assert "refusal" not in state["days"].get(str(DAY), {})
+
+        # the anchor appears; the very next run signs the day
+        stub_chain(monkeypatch, {
+            "SIGLATE": anchor_tx_for(DAY, anchored_hashes()[DAY])})
+        rc2, st2 = PayoutCheckerService(cfg).run_once()
+        day2 = outcomes_by_day(st2)[DAY]
+        assert day2["outcome"] == OUTCOME_SIGNED, day2
+        assert len(mock.posted()) == 1
+
+
+def test_a_pending_day_never_blocks_another_day(tmp_path, monkeypatch):
+    """One un-anchored day must not stop a day that IS anchored."""
+    first, second = VALID_DAYS[0], VALID_DAYS[1]
+    with MockPayoutCoordinator() as mock:
+        cfg = chain_cfg(tmp_path, mock, first_day=first, last_day=second,
+                        genesis_day=first)
+        stub_chain(monkeypatch, {           # only the SECOND day is anchored
+            "SIG2": anchor_tx_for(second, anchored_hashes()[second])})
+        rc, status = PayoutCheckerService(cfg).run_once()
+        by_day = outcomes_by_day(status)
+        assert by_day[first]["outcome"] == autorun.OUTCOME_ANCHOR_PENDING
+        assert by_day[second]["outcome"] in (OUTCOME_SIGNED, OUTCOME_REFUSED)
+        assert by_day[second]["outcome"] != autorun.OUTCOME_ANCHOR_PENDING
+        assert status["anchorPendingDays"] == [first]
+
+
+def test_an_rpc_rate_limit_is_transient_for_every_day_never_a_refusal(
+        tmp_path, monkeypatch):
+    with MockPayoutCoordinator() as mock:
+        cfg = chain_cfg(tmp_path, mock)
+        stub = StubRpc({}, raise_on_signatures=CA.AnchorRpcUnavailable(
+            "getSignaturesForAddress: RPC answered HTTP 429"))
+        monkeypatch.setattr(CA, "SolanaRpc", lambda *a, **k: stub)
+        rc, status = PayoutCheckerService(cfg).run_once()
+        day = outcomes_by_day(status)[DAY]
+        assert day["outcome"] == autorun.OUTCOME_ANCHOR_PENDING, day
+        assert "429" in day["detail"]
+        assert rc == autorun.EXIT_OK
+        assert status["anchorRpcError"] is not None
+        assert mock.posted() == []
+
+
+def test_a_hash_that_disagrees_with_the_computed_log_hash_is_anchor_mismatch(
+        tmp_path, monkeypatch):
+    """The checker computes the log hash itself; the chain value is checked."""
+    with MockPayoutCoordinator() as mock:
+        cfg = chain_cfg(tmp_path, mock)
+        stub_chain(monkeypatch, {"SIGBAD": anchor_tx_for(DAY, "ab" * 32)})
+        rc, status = PayoutCheckerService(cfg).run_once()
+        day = outcomes_by_day(status)[DAY]
+        assert day["outcome"] == autorun.OUTCOME_ANCHOR_MISMATCH, day
+        assert day["rule"] == "anchor_hash_mismatch"
+        assert rc == autorun.EXIT_ATTENTION
+        assert mock.posted() == []
+
+
+def test_two_conflicting_on_chain_anchors_are_the_anchor_conflict_refusal(
+        tmp_path, monkeypatch):
+    with MockPayoutCoordinator() as mock:
+        cfg = chain_cfg(tmp_path, mock)
+        stub_chain(monkeypatch, {
+            "SIGA": anchor_tx_for(DAY, anchored_hashes()[DAY]),
+            "SIGB": anchor_tx_for(DAY, "cd" * 32)})
+        rc, status = PayoutCheckerService(cfg).run_once()
+        day = outcomes_by_day(status)[DAY]
+        assert day["outcome"] == autorun.OUTCOME_ANCHOR_CONFLICT, day
+        assert rc == autorun.EXIT_ATTENTION
+        assert len(day["anchor"]["conflicts"]) == 2
+        assert mock.posted() == []
+
+
+def test_an_anchor_from_another_signer_leaves_the_day_pending(tmp_path,
+                                                              monkeypatch):
+    with MockPayoutCoordinator() as mock:
+        cfg = chain_cfg(tmp_path, mock)
+        stub_chain(monkeypatch, {
+            "SIGX": anchor_tx_for(DAY, anchored_hashes()[DAY],
+                                  operator="GLThbWgJQNHQpxuRVxyKystNxjMo47qhtgpe2sW4oGDq")})
+        rc, status = PayoutCheckerService(cfg).run_once()
+        assert outcomes_by_day(status)[DAY]["outcome"] == \
+            autorun.OUTCOME_ANCHOR_PENDING
+        assert rc == autorun.EXIT_OK
+        assert mock.posted() == []
+
+
+def test_the_anchor_evidence_is_in_status_even_when_every_day_short_circuits(
+        tmp_path, monkeypatch):
+    """A run where nothing needs signing still records what the chain said.
+
+    Reproduces the live case: every closed day is already_signed, so no day
+    reaches the per-day anchor read — status.json must still carry the scan.
+    """
+    with MockPayoutCoordinator() as mock:
+        cfg = chain_cfg(tmp_path, mock)
+        txs = {"SIGD": anchor_tx_for(DAY, anchored_hashes()[DAY])}
+        stub_chain(monkeypatch, txs)
+        PayoutCheckerService(cfg).run_once()          # signs it
+        stub_chain(monkeypatch, txs)
+        rc, status = PayoutCheckerService(cfg).run_once()   # already_signed
+        assert outcomes_by_day(status)[DAY]["outcome"] == OUTCOME_ALREADY
+        assert status["anchorScan"] is not None
+        assert status["anchorScan"]["anchors"][str(DAY)]["signature"] == "SIGD"
+        assert rc == autorun.EXIT_OK
+
+
+def test_an_rpc_outage_on_an_all_already_signed_run_is_not_an_error(
+        tmp_path, monkeypatch):
+    """The up-front scan is best effort: it must not fail a run on its own."""
+    with MockPayoutCoordinator() as mock:
+        cfg = chain_cfg(tmp_path, mock)
+        stub_chain(monkeypatch, {
+            "SIGE": anchor_tx_for(DAY, anchored_hashes()[DAY])})
+        PayoutCheckerService(cfg).run_once()
+        down = StubRpc({}, raise_on_signatures=CA.AnchorRpcUnavailable(
+            "getSignaturesForAddress: RPC answered HTTP 429"))
+        monkeypatch.setattr(CA, "SolanaRpc", lambda *a, **k: down)
+        rc, status = PayoutCheckerService(cfg).run_once()
+        assert outcomes_by_day(status)[DAY]["outcome"] == OUTCOME_ALREADY
+        assert rc == autorun.EXIT_OK
+        assert status["anchorRpcError"] is not None
+
+
+def test_the_signature_cache_lives_in_the_state_dir_and_is_reused(
+        tmp_path, monkeypatch):
+    with MockPayoutCoordinator() as mock:
+        cfg = chain_cfg(tmp_path, mock)
+        txs = {"SIGC": anchor_tx_for(DAY, anchored_hashes()[DAY])}
+        first = stub_chain(monkeypatch, txs)
+        PayoutCheckerService(cfg).run_once()
+        assert first.tx_fetches == ["SIGC"]
+        assert cfg.anchor_cache_path.is_file()
+        second = stub_chain(monkeypatch, txs)
+        PayoutCheckerService(cfg).run_once()
+        assert second.tx_fetches == [], "a finalized tx must be fetched once"
 
 
 def test_devnet_holdback_override_is_passed_to_the_checker(tmp_path,

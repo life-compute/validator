@@ -41,6 +41,19 @@ class DayNotClosed(CoordinatorUnreachable):
     """
 
 
+class AnchoredHashMismatch(CoordinatorUnreachable):
+    """The canonical log does not hash to the ANCHORED value (§9).
+
+    Split out from the generic "source could not be read" case so the refusal
+    is named `anchor_hash_mismatch` rather than the vaguer `log_inconsistent`:
+    with on-chain anchors (C44b) this is the one failure that means the chain
+    and the coordinator genuinely disagree, and it must be distinguishable
+    from a published-hash inconsistency inside the coordinator's own answer.
+    It stays a CoordinatorUnreachable subclass so every existing fail-closed
+    path still catches it.
+    """
+
+
 class PayoutKeyError(PayoutError):
     """Refuse-to-start condition for the payout signing key."""
 

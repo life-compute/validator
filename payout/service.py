@@ -27,6 +27,8 @@ from typing import Any, Sequence
 from .batch_hash import batch_hash_bytes
 from . import constants as C
 from .errors import (
+    ANCHOR_HASH_MISMATCH,
+    AnchoredHashMismatch,
     COORDINATOR_UNREACHABLE,
     CoordinatorUnreachable,
     DAY_NOT_CLOSED,
@@ -105,7 +107,7 @@ class PayoutSignerService:
                 f"canonical log for day {day} does not match the published "
                 f"log_hash: computed {computed}, published {published} (§15)")
         if anchored != computed:
-            raise CoordinatorUnreachable(
+            raise AnchoredHashMismatch(
                 f"canonical log for day {day} does not match the ANCHORED "
                 f"hash: computed {computed}, anchored {anchored} (§9)")
         return day_log, anchored
@@ -154,6 +156,11 @@ class PayoutSignerService:
                     f"({exc}); an open day's canonical log is not final and "
                     f"must never be used for a payout, so no signature is "
                     f"produced")
+            except AnchoredHashMismatch as exc:
+                # §9: the chain and the log the checker downloaded disagree.
+                # Named explicitly, for the batch day and for a replay day.
+                return self._refuse_hard(
+                    day, ANCHOR_HASH_MISMATCH, f"{exc}; producing no signature")
             except CoordinatorUnreachable as exc:
                 if d == day:
                     # The batch's own day: report the source/integrity failure.
