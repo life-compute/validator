@@ -14,6 +14,14 @@ Verdict handling follows §3.2: corrupted-score 422, sanity range, protein
 bias adjustment, rel_err, coord_decision, hit gate, disagree, attempt state
 machine.
 
+C47 / BATCH_SPEC §17.2: the verdict body may carry `molecule_hash`, `target`,
+`miner_wallet` and `claimed_score`.  Any one of them that disagrees with the
+stored result is `422` — always, whatever the activation day.  Presence is
+only REQUIRED from LOG_V2_FROM_DAY, modelled here by
+`MockState.require_v2_verdict_fields`.  §17.1: every request whose signature
+verified is recorded in `MockState.signed_requests` with the EXACT raw body
+bytes, so a test can prove the body that was signed is the body that arrived.
+
 Nothing here imports the client's signing code — the contract test is only
 meaningful if both sides were written independently from the document.
 """
@@ -79,6 +87,11 @@ class MockState:
         self.validators: set[str] = validators if validators is not None else set()
         self.unscorable: set[int] = set()
         self.request_log: list[tuple[str, str]] = []
+        # §17.1 signed_requests: one row per request whose signature verified.
+        # `body` holds the EXACT bytes the signature was computed over.
+        self.signed_requests: list[dict[str, Any]] = []
+        # §17.2: from LOG_V2_FROM_DAY the four identity fields are REQUIRED.
+        self.require_v2_verdict_fields: bool = False
         # Results the Worker already holds a verdict for: POST /verdicts
         # answers 409 Conflict for these (§2.5 "a verdict already exists").
         self.verdict_exists: set[int] = set()
@@ -165,6 +178,14 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             return None, "Invalid signature"
 
+        # §17.1 — record the verified request exactly as it was signed.
+        with self.state.lock:
+            self.state.signed_requests.append({
+                "wallet": wallet, "method": method, "path": path,
+                "body": bytes(body), "body_sha256": body_hash,
+                "nonce": nonce, "timestamp": ts,
+                "signature": str(auth["signature"]),
+            })
         return wallet, None
 
     def _read_body(self) -> bytes | None:
@@ -267,6 +288,29 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(vs, (int, float)) or isinstance(vs, bool):
             return self._err(400, "Missing or wrong-typed fields: result_id, validator_score")
         vs = float(vs)
+
+        # ── §17.2 identity cross-check ─────────────────────────────────────
+        # Present-but-wrong is 422 on every day; absent is 422 only from
+        # LOG_V2_FROM_DAY (require_v2_verdict_fields).
+        for field, stored in (("molecule_hash", row.get("molecule_hash")),
+                              ("target", row.get("target")),
+                              ("miner_wallet", row.get("wallet")),
+                              ("claimed_score", row.get("score"))):
+            if field not in payload:
+                if self.state.require_v2_verdict_fields:
+                    return self._err(422, f"{field} is required from LOG_V2_FROM_DAY")
+                continue
+            got = payload[field]
+            if field == "claimed_score":
+                ok = (isinstance(got, (int, float)) and not isinstance(got, bool)
+                      and isinstance(stored, (int, float))
+                      and float(got) == float(stored))
+            else:
+                ok = (got == stored)
+            if not ok:
+                return self._err(
+                    422, f"{field} does not match the stored result "
+                         f"(got {got!r}, stored {stored!r})")
 
         claimed = float(row["score"])
         if abs(claimed) > 50:

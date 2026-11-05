@@ -58,6 +58,21 @@ Chain outcomes:  a day with no anchor yet is TRANSIENT (`anchor_pending`) —
 retried next run, never a refusal, never blocking another day.  A hash that
 disagrees with the computed log hash is the refusal `anchor_mismatch`; two
 valid anchors that disagree are the refusal `anchor_conflict`.
+
+ACTIVATION FLAGS (C47 §17, C46 §6.3).  Two day numbers, both OFF (99999) by
+default and both printed in the start-up banner of EVERY run:
+
+  LOG_V2_FROM_DAY         from this day a day's log is v2: signed.ndjson is
+                          downloaded, every §17 rule runs, and the day's
+                          anchor must be LIFE-ANCHOR/2.
+  VALIDATOR_PAY_FROM_DAY  from this day validators are paid the full miner
+                          amount (§6.3-new); below it the 7.5% fee rule is
+                          unchanged.
+
+Either flag below the genesis day is refused at start-up, and
+VALIDATOR_PAY_FROM_DAY below LOG_V2_FROM_DAY is refused too (validator pay
+is verified from the v2 signed log, so it cannot start first).  When a flag
+is ACTIVE for any day in the scan window the run prints one loud line.
 """
 from __future__ import annotations
 
@@ -115,6 +130,18 @@ ANCHOR_WARNING = (
 
 # Set by the operator to go BACK to the old, non-independent behaviour.
 WORKER_ANCHORS_ENV = "ANCHORS_FROM_WORKER"
+
+LOG_V2_ACTIVE_WARNING = (
+    "*** LOG FORMAT V2 IS ACTIVE: from day {day} every closed day is checked "
+    "against its signed.ndjson (BATCH_SPEC §17) and MUST carry a "
+    "LIFE-ANCHOR/2 memo with log= and signed=. Days below {day} keep the v1 "
+    "rules unchanged. ***")
+
+VALIDATOR_PAY_ACTIVE_WARNING = (
+    "*** VALIDATOR PAY IS ACTIVE: from day {day} each of the first K=2 "
+    "validators of a confirmed result is paid the FULL miner amount and that "
+    "amount is part of totalRaw and of the batch hash (BATCH_SPEC §6.3-new). "
+    "Days below {day} keep the 7.5% fee rule unchanged. ***")
 
 _REFUSED_RE = re.compile(r"^REFUSED day (\d+): (\S+)", re.M)
 
@@ -212,6 +239,19 @@ class ServiceConfig:
     anchor_memo_program: str = DEFAULT_MEMO_PROGRAM
     holdback_override: str | None = None
     timeout: float = 20.0
+    # C47 §17 / C46 §6.3 activation days.  99999 = OFF.
+    log_v2_from_day: int = C.LOG_V2_FROM_DAY_DEFAULT
+    validator_pay_from_day: int = C.VALIDATOR_PAY_FROM_DAY_DEFAULT
+    scoring_config_path: str = ""
+
+    @property
+    def log_v2_enabled(self) -> bool:
+        """True when any day of the configured scan window is a v2 day."""
+        return int(self.log_v2_from_day) < C.FLAG_OFF_DAY
+
+    @property
+    def validator_pay_enabled(self) -> bool:
+        return int(self.validator_pay_from_day) < C.FLAG_OFF_DAY
 
     @property
     def signatures_dir(self) -> Path:
@@ -249,6 +289,40 @@ class ServiceConfig:
         genesis_day = int(genesis_raw) if genesis_raw else C.GENESIS_DAY
         first_raw = (env.get("PAYOUT_FIRST_DAY") or "").strip()
         last_raw = (env.get("PAYOUT_LAST_DAY") or "").strip()
+
+        # ── C47 §17 / C46 §6.3 activation flags ────────────────────────────
+        # Absent  -> OFF (99999).  Present but malformed, or ordered wrongly,
+        # -> refuse to start, on every network.  "OFF" and "misconfigured"
+        # must never look the same.
+        def flag(key: str, default: int) -> int:
+            raw = env.get(key)
+            if raw is None or str(raw).strip() == "":
+                return int(default)
+            try:
+                return C.parse_flag_day(raw, key)
+            except ValueError as exc:
+                raise ServiceConfigError(str(exc)) from None
+
+        log_v2_from_day = flag(C.LOG_V2_FROM_DAY_ENV,
+                               C.LOG_V2_FROM_DAY_DEFAULT)
+        validator_pay_from_day = flag(C.VALIDATOR_PAY_FROM_DAY_ENV,
+                                      C.VALIDATOR_PAY_FROM_DAY_DEFAULT)
+        try:
+            C.validate_flag_days(log_v2_from_day, validator_pay_from_day,
+                                 genesis_day)
+        except ValueError as exc:
+            raise ServiceConfigError(str(exc)) from None
+
+        scoring_config_path = (env.get("SCORING_CONFIG") or "").strip()
+        if scoring_config_path and not Path(scoring_config_path).is_file():
+            raise ServiceConfigError("SCORING_CONFIG does not name a file")
+        if log_v2_from_day < C.FLAG_OFF_DAY and not scoring_config_path:
+            raise ServiceConfigError(
+                f"{C.LOG_V2_FROM_DAY_ENV}={log_v2_from_day} activates log "
+                f"format v2, which recomputes every decision from the pinned "
+                f"scoring_config.json (§17.5); set SCORING_CONFIG to that "
+                f"file. Refusing to start.")
+
         # Chain anchors are the DEFAULT.  ANCHORS_FROM_WORKER=1 is the only
         # supported way back to the Worker-sourced map, and ANCHOR_SOURCE is
         # still honoured so an existing file-based test setup keeps working.
@@ -300,6 +374,9 @@ class ServiceConfig:
                                  or DEFAULT_MEMO_PROGRAM),
             holdback_override=(env.get("HOLDBACK_DAYS_OVERRIDE") or None),
             timeout=float((env.get("HTTP_TIMEOUT") or "20").strip()),
+            log_v2_from_day=log_v2_from_day,
+            validator_pay_from_day=validator_pay_from_day,
+            scoring_config_path=scoring_config_path,
         )
 
     def checker_env(self) -> dict[str, str]:
@@ -315,6 +392,12 @@ class ServiceConfig:
         }
         if self.holdback_override is not None:
             env["HOLDBACK_DAYS_OVERRIDE"] = str(self.holdback_override)
+        # The flags travel to the checker CLI by name, so the CLI prints the
+        # same values and decides the same days.
+        env[C.LOG_V2_FROM_DAY_ENV] = str(self.log_v2_from_day)
+        env[C.VALIDATOR_PAY_FROM_DAY_ENV] = str(self.validator_pay_from_day)
+        if self.scoring_config_path:
+            env["SCORING_CONFIG"] = self.scoring_config_path
         return env
 
     def redacted(self) -> dict[str, Any]:
@@ -337,6 +420,11 @@ class ServiceConfig:
             "stateDir": self.state_dir,
             "genesisDay": self.genesis_day,
             "holdbackDaysOverride": self.holdback_override,
+            "logV2FromDay": self.log_v2_from_day,
+            "validatorPayFromDay": self.validator_pay_from_day,
+            "logV2Enabled": self.log_v2_enabled,
+            "validatorPayEnabled": self.validator_pay_enabled,
+            "scoringConfig": self.scoring_config_path or None,
         }
 
 
@@ -472,7 +560,9 @@ def _chain_builder(cfg: ServiceConfig, warn=print) -> ChainAnchorBuilder:
         cache_path=cfg.anchor_cache_path,
         timeout=cfg.timeout,
         headers=ua_headers(),
-        warn=warn)
+        warn=warn,
+        # §17.4 — which anchor version each day must carry.
+        log_v2_from_day=cfg.log_v2_from_day)
 
 
 def _anchor_builder(cfg: ServiceConfig, client: WorkerClient,
@@ -985,6 +1075,21 @@ class PayoutCheckerService:
                  f"programId={self.cfg.program_id} "
                  f"anchorSource={self.cfg.anchor_source} "
                  f"days={self.cfg.first_day}..{self.last_day()}")
+        # ── activation banner: ALWAYS printed, active or not ───────────────
+        self.log(f"activation flags: "
+                 f"{C.LOG_V2_FROM_DAY_ENV}={self.cfg.log_v2_from_day}"
+                 f"{'' if self.cfg.log_v2_enabled else ' (OFF)'} "
+                 f"{C.VALIDATOR_PAY_FROM_DAY_ENV}="
+                 f"{self.cfg.validator_pay_from_day}"
+                 f"{'' if self.cfg.validator_pay_enabled else ' (OFF)'} "
+                 f"genesisDay={self.cfg.genesis_day} "
+                 f"scoringConfig={self.cfg.scoring_config_path or '(none)'}")
+        # …and one LOUD line per flag that is actually active.
+        if self.cfg.log_v2_enabled:
+            self.log(LOG_V2_ACTIVE_WARNING.format(day=self.cfg.log_v2_from_day))
+        if self.cfg.validator_pay_enabled:
+            self.log(VALIDATOR_PAY_ACTIVE_WARNING.format(
+                day=self.cfg.validator_pay_from_day))
         if self.cfg.anchor_source == "chain":
             self.log(f"anchors read from the CHAIN: rpc={self.cfg.anchor_rpc_url} "
                      f"operator={self.cfg.anchor_operator_pubkey} "

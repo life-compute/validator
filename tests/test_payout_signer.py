@@ -705,9 +705,22 @@ def test_rule_order_is_the_spec_numbered_list_verbatim():
         "reward_mismatch",            # 16
         "total_not_sum_of_entries",   # 17 total_mismatch
     )
+    # §6.3-new adds four codes AFTER rule 17, in the order that section lists
+    # them.  They are unreachable below VALIDATOR_PAY_FROM_DAY, so no day the
+    # checker already decided can change verdict because of them.
+    from payout.verifier import VALIDATOR_PAY_RULE_ORDER
+    assert VALIDATOR_PAY_RULE_ORDER == (
+        "validator_not_verified",
+        "validator_self_pay",
+        "validator_over_limit",
+        "validator_pay_mismatch",
+    )
     # Extra checks never pre-empt a spec-numbered reason.
-    assert RULE_PRECEDENCE == SPEC_RULE_ORDER + EXTRA_RULE_ORDER
+    assert RULE_PRECEDENCE == (SPEC_RULE_ORDER + VALIDATOR_PAY_RULE_ORDER
+                               + EXTRA_RULE_ORDER)
     assert not set(SPEC_RULE_ORDER) & set(EXTRA_RULE_ORDER)
+    assert not set(SPEC_RULE_ORDER) & set(VALIDATOR_PAY_RULE_ORDER)
+    assert not set(VALIDATOR_PAY_RULE_ORDER) & set(EXTRA_RULE_ORDER)
 
 
 def test_forfeited_outranks_held_because_the_spec_says_so():

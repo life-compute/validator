@@ -156,8 +156,12 @@ def test_the_real_memo_text_parses_exactly():
     tx = live_transactions()[sig_for_day(20757)]
     memo = tx["transaction"]["message"]["instructions"][0]["parsed"]
     parsed = parse_anchor_memo(memo)
+    # C47 §17.4: the parser now reports which anchor VERSION it read, and the
+    # `signed=` hash that only a /2 memo carries.  A /1 memo is version 1 with
+    # no signed hash — the live day 20757 anchor is exactly that.
     assert parsed == {"day": 20757, "date": "2026-10-31",
-                      "log_hash": LIVE_ANCHORS[20757], "program_id": PROGRAM_ID}
+                      "log_hash": LIVE_ANCHORS[20757], "signed_hash": None,
+                      "program_id": PROGRAM_ID, "version": 1}
 
 
 @pytest.mark.parametrize("memo", [

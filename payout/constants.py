@@ -152,6 +152,78 @@ TARGETS_TABLE_SHA256 = (
     "1c538a21eb276bfa4d1cce697d248231d9011aa4886464b7226885a0cd09128c"
 )
 
+# ── C47 / C46 activation flags (BATCH_SPEC §17, §6.3) ───────────────────────
+# Both are DAY NUMBERS and both default to 99999 = OFF, which is the devnet
+# deployment's setting.  They are never derived from a clock: a day number is
+# configuration, exactly like GENESIS_DAY.
+#
+#   LOG_V2_FROM_DAY        first day that uses log format v2 (signed.ndjson,
+#                          anchor /2, every §17 rule).
+#   VALIDATOR_PAY_FROM_DAY first day that pays validators the full miner
+#                          amount (§6.3-new).  Below it the legacy 7.5% fee
+#                          rule applies, byte for byte as before.
+FLAG_OFF_DAY = 99_999
+LOG_V2_FROM_DAY_DEFAULT = FLAG_OFF_DAY
+VALIDATOR_PAY_FROM_DAY_DEFAULT = FLAG_OFF_DAY
+
+LOG_V2_FROM_DAY_ENV = "LOG_V2_FROM_DAY"
+VALIDATOR_PAY_FROM_DAY_ENV = "VALIDATOR_PAY_FROM_DAY"
+
+
+def parse_flag_day(raw: object, name: str) -> int:
+    """Parse an activation flag day.  Raises ValueError on anything invalid.
+
+    A non-negative decimal integer only — no floats, no booleans, no empty
+    string.  A malformed value refuses start-up on every network rather than
+    silently falling back to OFF, because "OFF" and "misconfigured" must not
+    look the same.
+    """
+    if isinstance(raw, bool):
+        raise ValueError(f"{name}={raw!r} is not an integer")
+    if isinstance(raw, int):
+        value = int(raw)
+    else:
+        text = str(raw).strip()
+        if not text or not _INT_RE.match(text):
+            raise ValueError(f"{name}={str(raw)!r} is not an integer")
+        value = int(text)
+    if value < 0:
+        raise ValueError(f"{name}={value} is below 0")
+    return value
+
+
+def validate_flag_days(log_v2_from_day: int, validator_pay_from_day: int,
+                       genesis_day: int = GENESIS_DAY) -> None:
+    """§17/§6.3 ordering rules.  Raises ValueError with the exact reason.
+
+    Two invariants, both refusals at start-up:
+
+      1. Neither flag may name a day BELOW the genesis day.  A day before the
+         network existed has no canonical log at all, so a flag pointing
+         there could never be satisfied and would silently refuse every day.
+      2. VALIDATOR_PAY_FROM_DAY must not be below LOG_V2_FROM_DAY.  Validator
+         pay is verified from the signed verdict log (§6.3-new reads V(r) out
+         of the canonical log and the §17 signed lines prove who verified);
+         paying validators on a day whose log is still v1 would pay against
+         evidence the checker cannot verify.
+
+    The OFF value (99999) is above every real day and above GENESIS_DAY, so
+    the default configuration satisfies both automatically.
+    """
+    for name, day in ((LOG_V2_FROM_DAY_ENV, int(log_v2_from_day)),
+                      (VALIDATOR_PAY_FROM_DAY_ENV, int(validator_pay_from_day))):
+        if day < int(genesis_day):
+            raise ValueError(
+                f"{name}={day} is below GENESIS_DAY={genesis_day}: the "
+                f"network has no canonical log before its first day, so this "
+                f"flag could never be satisfied. Refusing to start.")
+    if int(validator_pay_from_day) < int(log_v2_from_day):
+        raise ValueError(
+            f"{VALIDATOR_PAY_FROM_DAY_ENV}={int(validator_pay_from_day)} is "
+            f"below {LOG_V2_FROM_DAY_ENV}={int(log_v2_from_day)}: validator "
+            f"pay (§6.3-new) is verified from the v2 signed verdict log, so "
+            f"it can never start before log format v2 does. Refusing to start.")
+
 
 def base_reward_for_tier(tier: str) -> int:
     """§12: tier -> base reward.  An unknown tier is a refusal, never a guess."""

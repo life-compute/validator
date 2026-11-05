@@ -18,8 +18,18 @@ Operating rules (all fail-closed):
 C5b4 (C5j, §2): this module reads NO clock.  `process_day` takes the batch day
 as its only date reference and `import time` is gone, so the same inputs
 decide identically whatever the system clock says.
+
+C47 (§17): for a day at or above LOG_V2_FROM_DAY the service additionally
+downloads `GET /log/{date}/signed`, assembles the logical v2 record from
+canonical.ndjson + signed.ndjson, and runs every §17 rule in the reference
+verifier's order (payout.log_v2.evaluate_day).  A v2 refusal is recorded as
+`log_v2_refused` carrying the specific lower_snake_case code.  With the flag
+at its default 99999 none of this runs and the day is decided exactly as
+before — no existing day can change verdict.
 """
 from __future__ import annotations
+
+import json
 
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -35,13 +45,16 @@ from .errors import (
     DayNotClosed,
     Finding,
     LOG_INCONSISTENT,
+    LOG_V2_REFUSED,
     MALFORMED_BATCH,
     MISSING_ARCHIVE_DAY,
     NO_PAYOUT_KEY,
 )
 from .ledger import DecisionLedger
+from . import log_v2 as V2
 from .recompute import compute_day, replay_days_required
 from .signer_key import PayoutSigner
+from .scoring_config import ScoringConfig
 from .sources import AnchorSource, DayLog, LogSource, Settings, TargetsTable
 from .summary import summarize_day, summary_record
 from .verifier import Batch, verify_day, VerifyResult
@@ -82,13 +95,93 @@ class DayDecision:
 class PayoutSignerService:
     def __init__(self, log_source: LogSource, anchors: AnchorSource,
                  settings: Settings, targets: TargetsTable,
-                 ledger: DecisionLedger, signer: PayoutSigner | None = None):
+                 ledger: DecisionLedger, signer: PayoutSigner | None = None,
+                 *,
+                 log_v2_from_day: int = C.LOG_V2_FROM_DAY_DEFAULT,
+                 validator_pay_from_day: int = C.VALIDATOR_PAY_FROM_DAY_DEFAULT,
+                 scoring_config: ScoringConfig | None = None,
+                 chain_registry=None,
+                 anchor_v2_memos: dict[int, str] | None = None,
+                 signed_request_ledger: V2.SignedRequestLedger | None = None):
         self.log = log_source
         self.anchors = anchors
         self.settings = settings
         self.targets = targets
         self.ledger = ledger
         self.signer = signer
+        # C47 §17 / C46 §6.3 — both OFF by default (99999).
+        self.log_v2_from_day = int(log_v2_from_day)
+        self.validator_pay_from_day = int(validator_pay_from_day)
+        self.scoring_config = scoring_config
+        self.chain_registry = chain_registry
+        self.anchor_v2_memos = dict(anchor_v2_memos or {})
+        self.signed_request_ledger = signed_request_ledger
+
+    # ── §17 activation ──────────────────────────────────────────────────────
+    def log_v2_active(self, day: int) -> bool:
+        """§17: v2 applies to a day at or above LOG_V2_FROM_DAY, never below."""
+        return int(day) >= self.log_v2_from_day
+
+    def validator_pay_active(self, day: int) -> bool:
+        return int(day) >= self.validator_pay_from_day
+
+    def _check_log_v2(self, day: int, day_log: DayLog) -> V2.V2Result:
+        """Run every §17 rule for one v2 day.  Never called below the flag."""
+        if self.scoring_config is None:
+            return V2.V2Result(
+                V2.SCORING_CONFIG_UNKNOWN, "SCORING_CONFIG_KNOWN",
+                "log format v2 is active but no pinned scoring_config.json "
+                "was loaded (§17.5)")
+        if self.chain_registry is None:
+            return V2.V2Result(
+                V2.WALLET_NOT_REGISTERED, "MINER_IS_REGISTERED",
+                "log format v2 is active but no on-chain registry was "
+                "configured, so miner registration and validator membership "
+                "cannot be read")
+        memo = self.anchor_v2_memos.get(int(day))
+        if not memo:
+            return V2.V2Result(
+                V2.ANCHOR_V2_MISMATCH, "ANCHOR_V2_MATCH",
+                f"day {day} is at or above LOG_V2_FROM_DAY="
+                f"{self.log_v2_from_day} but carries no LIFE-ANCHOR/2 memo")
+        try:
+            signed_raw = self.log.signed_log_bytes(day)
+        except CoordinatorUnreachable as exc:
+            return V2.V2Result(
+                V2.ANCHOR_V2_MISMATCH, "SIGNED_LOG_PRESENT",
+                f"GET /log/{{date}}/signed for day {day} could not be read "
+                f"({exc}); a v2 day must publish signed.ndjson")
+        try:
+            signed_lines = V2.parse_signed_ndjson(signed_raw)
+        except ValueError as exc:
+            return V2.V2Result(V2.ANCHOR_V2_MISMATCH, "SIGNED_LOG_PRESENT",
+                               str(exc))
+        canonical_lines = [json.loads(l) for l in
+                           day_log.raw_bytes.decode("utf-8").splitlines()
+                           if l.strip()]
+        memo_parsed = V2.parse_anchor_memo_v2(memo) or {}
+        result = V2.evaluate_day(
+            canonical_lines=canonical_lines,
+            signed_lines=signed_lines,
+            scoring_config=self.scoring_config,
+            registry=self.chain_registry,
+            expected_canonical_hash=day_log.computed_log_hash,
+            expected_signed_hash=str(memo_parsed.get("signed_hash") or ""),
+            anchor_v2_memo=memo,
+            modality_of_target=self._modality_of_target,
+            ledger=self.signed_request_ledger,
+        )
+        if result.accepted and self.signed_request_ledger is not None:
+            # Only an ACCEPTED day is recorded: a refused day must leave the
+            # duplicate ledger untouched or a re-run would refuse itself.
+            V2.commit_day_to_ledger(signed_lines, canonical_lines,
+                                    self.signed_request_ledger)
+        return result
+
+    def _modality_of_target(self, target: str) -> str | None:
+        """§12: modality comes from the SHA-verified targets table only."""
+        info = self.targets.get(target)
+        return info.modality if info is not None else None
 
     # ── log fetch + integrity gate (§9, §15, task 1e) ───────────────────────
     def _load_verified_day_log(self, day: int) -> tuple[DayLog, str]:
@@ -200,6 +293,17 @@ class PayoutSignerService:
             targets=self.targets, signed_batch_ids=self.ledger.signed_batch_ids,
             paid_result_ids=self.ledger.paid_result_ids,
         )
+
+        # ── §17 — the v2 signed-log check, only for a day at/above the flag ─
+        if self.log_v2_active(day):
+            v2 = self._check_log_v2(day, day_log)
+            if not v2.accepted:
+                for r in results:
+                    r.findings.append(Finding(
+                        LOG_V2_REFUSED,
+                        f"log format v2 (§17) refused day {day} with "
+                        f"{v2.code}: {v2.detail}"))
+                    r.signable = False
 
         previous = self.ledger.last_signed_day_summary(day)
         summary = summarize_day(day, results, computation.entries, previous)

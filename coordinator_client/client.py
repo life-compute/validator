@@ -301,7 +301,15 @@ class ValidatorService:
 
         body = contract.verdict_body(
             item.id, result.score, self.gpu_model or None, decision,
-            input_hashes=result.input_hashes.as_dict())
+            input_hashes=result.input_hashes.as_dict(),
+            # §17.2 (C47): the identity of the result being re-scored, taken
+            # VERBATIM from the pending item the Worker handed us.  Never a
+            # locally derived value: a mismatch with the stored result is a
+            # 422 and must surface as such, not be papered over.
+            molecule_hash=item.molecule_hash,
+            target=item.target,
+            miner_wallet=item.wallet,
+            claimed_score=item.score)
         try:
             resp = self.client.post_verdict(body)
         except HttpError as e:

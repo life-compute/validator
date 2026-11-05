@@ -267,8 +267,28 @@ _KNOWN_FIELDS = frozenset({
 
 def verdict_body(result_id: int, validator_score: float, gpu_model: str | None,
                  validator_verdict: str | None,
-                 input_hashes: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Normal verdict body (contract §2.5 A)."""
+                 input_hashes: dict[str, Any] | None = None,
+                 molecule_hash: str | None = None,
+                 target: str | None = None,
+                 miner_wallet: str | None = None,
+                 claimed_score: float | None = None) -> dict[str, Any]:
+    """Normal verdict body (contract §2.5 A; BATCH_SPEC §17.2 C47).
+
+    C47 / LOG_V2: the verdict body additionally carries four fields that
+    identify the result being re-scored — `molecule_hash`, `target`,
+    `miner_wallet` and `claimed_score`.  They are the values of the PENDING
+    ITEM the validator received, never anything the validator computed, so
+    the Worker can cross-check them against the stored result and answer 422
+    on any mismatch.  They are optional before LOG_V2_FROM_DAY and required
+    from it, so they are always sent.
+
+    These fields are part of the body that is hashed and signed: the signing
+    logic is UNCHANGED — `client._request` hashes whatever `canonical_body`
+    serialises, so adding fields here automatically means the signature
+    covers them.  BATCH_SPEC §17.3 relies on exactly that: the archived
+    `verdict.body_b64` is the signed material, and a checker decodes these
+    four fields out of it.
+    """
     body: dict[str, Any] = {"result_id": int(result_id),
                             "validator_score": float(validator_score)}
     if gpu_model:
@@ -277,6 +297,17 @@ def verdict_body(result_id: int, validator_score: float, gpu_model: str | None,
         if validator_verdict not in ("confirm", "reject"):
             raise ContractError(f"validator_verdict must be confirm|reject, got {validator_verdict!r}")
         body["validator_verdict"] = validator_verdict
+    # §17.2 — identity of the re-scored result.  Order matters only for
+    # readability: the signature is over the exact serialised bytes, so the
+    # body that is signed is byte-identical to the body that is sent.
+    if molecule_hash is not None:
+        body["molecule_hash"] = str(molecule_hash)
+    if target is not None:
+        body["target"] = str(target)
+    if miner_wallet is not None:
+        body["miner_wallet"] = str(miner_wallet)
+    if claimed_score is not None:
+        body["claimed_score"] = float(claimed_score)
     if input_hashes:
         body["input_hashes"] = input_hashes
     return body

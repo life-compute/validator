@@ -25,6 +25,12 @@ BATCH_SPEC §5.0, verbatim order:
   16 reward_mismatch          per-result amount != calcReward(base, hitsBefore)
   17 total_mismatch           totalRaw != sum of entry amountRaw values
 
+§6.3-new adds four more codes AFTER rule 17, in the order that section lists
+them (validator_not_verified, validator_self_pay, validator_over_limit,
+validator_pay_mismatch).  They are reachable ONLY for a day at or above
+VALIDATOR_PAY_FROM_DAY; below it the legacy 7.5% fee rule applies and this
+block is inert, so no existing day can change verdict.
+
 NOTE on 11/12 (changed again this revision — C5b4): §5.0 rule 11 is now
 `forfeited_wallet_paid` and rule 12 is `held_wallet_paid`, with the spec
 stating the reason outright: "A forfeited wallet is also necessarily in its
@@ -80,6 +86,7 @@ from .errors import (
     INFLATED_AMOUNT,
     LOG_HASH_MISMATCH,
     LOG_INCONSISTENT,
+    LOG_V2_REFUSED,
     MISSING_PAYABLE_ENTRY,
     MISSING_ARCHIVE_DAY,
     NO_CONFIRMED_RESULT,
@@ -94,12 +101,22 @@ from .errors import (
     TAPER_CACHE_MISMATCH,
     TOTAL_ABOVE_DAY_CAP,
     TOTAL_NOT_SUM_OF_ENTRIES,
+    VALIDATOR_NOT_VERIFIED,
+    VALIDATOR_OVER_LIMIT,
+    VALIDATOR_PAY_MISMATCH,
+    VALIDATOR_SELF_PAY,
     VALIDATOR_FEE_MISMATCH,
     WARN_FEE_RECIPIENTS_UNVERIFIABLE,
     WRONG_PROGRAM_ID_OR_MINT,
 )
 from .recompute import ComputedEntry, DayComputation
 from .sources import DayLog, Settings, TargetsTable, WalletFacts
+from .validator_pay import (
+    ROLE_MINER,
+    ROLE_VALIDATOR,
+    VALIDATORS_PER_RESULT,
+    ValidatorPayPlan,
+)
 
 # ── BATCH_SPEC §5.0, rules 1..17, transcribed in the spec's own order ───────
 SPEC_RULE_ORDER = (
@@ -122,6 +139,15 @@ SPEC_RULE_ORDER = (
     TOTAL_NOT_SUM_OF_ENTRIES,    # 17 total_mismatch
 )
 
+# §6.3-new — appended AFTER rule 17, in the spec's own order.  Inert for any
+# day below VALIDATOR_PAY_FROM_DAY.
+VALIDATOR_PAY_RULE_ORDER = (
+    VALIDATOR_NOT_VERIFIED,
+    VALIDATOR_SELF_PAY,
+    VALIDATOR_OVER_LIMIT,
+    VALIDATOR_PAY_MISMATCH,
+)
+
 # Checks this checker makes beyond §5.0's list.  Ranked strictly after every
 # numbered rule so they refuse a batch without ever pre-empting a spec reason.
 EXTRA_RULE_ORDER = (
@@ -142,9 +168,11 @@ EXTRA_RULE_ORDER = (
     BATCH_ID_MISMATCH,
     CHUNK_SEQUENCE_INVALID,
     LOG_INCONSISTENT,
+    # §17 — the v2 signed-log verdict for the day, behind LOG_V2_FROM_DAY.
+    LOG_V2_REFUSED,
 )
 
-RULE_PRECEDENCE = SPEC_RULE_ORDER + EXTRA_RULE_ORDER
+RULE_PRECEDENCE = SPEC_RULE_ORDER + VALIDATOR_PAY_RULE_ORDER + EXTRA_RULE_ORDER
 _RULE_RANK = {code: i for i, code in enumerate(RULE_PRECEDENCE)}
 
 
@@ -631,6 +659,103 @@ def verify_batch(
         expected_entries=expected, batch_hash_recomputed=recomputed_hash,
         total_raw=batch.total_raw,
     )
+
+
+# ── §6.3-new validator pay (behind VALIDATOR_PAY_FROM_DAY) ──────────────────
+def verify_validator_pay(
+    batch: Batch,
+    plan: ValidatorPayPlan,
+    *,
+    validators_per_result: int = VALIDATORS_PER_RESULT,
+) -> list[Finding]:
+    """Check a batch's validator entries against the recomputed §6.3-new plan.
+
+    Returns findings only; the caller merges them into the batch's own list
+    so the §5.0 precedence decides the primary rule.  Called ONLY for a day
+    at or above VALIDATOR_PAY_FROM_DAY: for an earlier day the legacy 7.5%
+    fee rule applies and this function is never invoked, so the old days
+    rebuild byte for byte.
+
+    The four codes are evaluated in the order §6.3-new lists them.
+    """
+    findings: list[Finding] = []
+
+    # Every `role: "validator"` breakdown row the batch claims.
+    claimed: list[tuple[str, int, int]] = []       # (wallet, result_id, amount)
+    for ent in batch.entries:
+        recipient = ent.get("recipient")
+        if not isinstance(recipient, str):
+            continue
+        for r in (ent.get("results") or []):
+            if not isinstance(r, dict) or r.get("role") != ROLE_VALIDATOR:
+                continue
+            rid = _as_int(r.get("resultId"))
+            amount = _as_int(r.get("amountRaw"))
+            if rid is None or amount is None:
+                findings.append(Finding(
+                    VALIDATOR_NOT_VERIFIED,
+                    f"entry {recipient[:8]}…: a validator result row carries "
+                    f"no usable resultId/amountRaw (§6.3-new)",
+                    wallet=recipient))
+                continue
+            claimed.append((recipient, rid, amount))
+
+    # ── validator_not_verified ─────────────────────────────────────────────
+    for wallet, rid, _amount in claimed:
+        if wallet not in plan.paid_validators.get(rid, []):
+            findings.append(Finding(
+                VALIDATOR_NOT_VERIFIED,
+                f"wallet {wallet[:8]}… is paid as a validator of result_id "
+                f"{rid}, but the canonical log of day {plan.day} records no "
+                f"confirm + confirmed_hit verdict from it for that result "
+                f"within the first K={validators_per_result} (§6.3-new)",
+                rid, wallet))
+
+    # ── validator_self_pay ─────────────────────────────────────────────────
+    # `plan.self_excluded[rid]` is exactly the set of wallets the log shows
+    # self-verifying result rid, which the plan refused to pay.  A batch that
+    # pays one of them is the self-pay case.
+    for wallet, rid, _amount in claimed:
+        if wallet in plan.self_excluded.get(rid, []):
+            findings.append(Finding(
+                VALIDATOR_SELF_PAY,
+                f"wallet {wallet[:8]}… is paid as a validator of result_id "
+                f"{rid} but is that result's miner; self-verification is "
+                f"never paid (§6.3-new)", rid, wallet))
+
+    # ── validator_over_limit ───────────────────────────────────────────────
+    per_result: dict[int, set[str]] = {}
+    for wallet, rid, _amount in claimed:
+        per_result.setdefault(rid, set()).add(wallet)
+    for rid, wallets in sorted(per_result.items()):
+        if len(wallets) > validators_per_result:
+            findings.append(Finding(
+                VALIDATOR_OVER_LIMIT,
+                f"result_id {rid} pays {len(wallets)} validators, above "
+                f"K=VALIDATORS_PER_RESULT={validators_per_result} (§6.3-new)",
+                rid))
+
+    # ── validator_pay_mismatch ─────────────────────────────────────────────
+    for wallet, rid, amount in claimed:
+        expected = plan.amount_for(rid, wallet)
+        if expected is not None and amount != expected:
+            findings.append(Finding(
+                VALIDATOR_PAY_MISMATCH,
+                f"wallet {wallet[:8]}… is paid {amount} raw as a validator of "
+                f"result_id {rid}, but §6.3-new pays the FULL miner amount "
+                f"{expected} raw for that result", rid, wallet))
+
+    # A validator the log says must be paid but the batch omits.
+    for rid, wallets in sorted(plan.paid_validators.items()):
+        for wallet in wallets:
+            if not any(w == wallet and r == rid for w, r, _ in claimed):
+                findings.append(Finding(
+                    MISSING_PAYABLE_ENTRY,
+                    f"wallet {wallet[:8]}… is owed the validator amount for "
+                    f"result_id {rid} per §6.3-new but the batch pays it "
+                    f"nothing for that result", rid, wallet))
+
+    return findings
 
 
 def verify_day(

@@ -409,6 +409,18 @@ class LogSource:
         """§2.16 GET /log/{day}/canonical — the exact bytes that are hashed."""
         return self._get(f"/log/{day_to_iso(day)}/canonical")
 
+    def signed_log_bytes(self, day: int) -> bytes:
+        """§17.3 GET /log/{date}/signed — the v2 signed request log.
+
+        Keyed by DATE (`YYYY-MM-DD`), not by day number: §17.3 says so
+        explicitly and the live Worker answers 400 for a day number.  A v1
+        day (or a day with no signed log) answers 404, which `_get` turns
+        into CoordinatorUnreachable — the caller decides whether that is a
+        refusal (a day at or above LOG_V2_FROM_DAY must have one) or simply
+        not applicable.
+        """
+        return self._get(f"/log/{day_to_iso(day)}/signed")
+
     def day_log(self, day: int) -> DayLog:
         """Fetch manifest + canonical body and parse both line classes (§13).
 

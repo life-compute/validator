@@ -34,6 +34,18 @@ Configuration:
                    network.  Unset => 7.  (HOLDBACK_DAYS itself stays ignored.)
   PAYOUT_STATE_DIR   ledger location (default ./payout_state).
   PAYOUT_ANCHORS     JSON file of day -> anchored logHash (§9).
+  LOG_V2_FROM_DAY          C47 §17.  First day that uses log format v2.
+                   Default 99999 = OFF.  Below the genesis day it is
+                   refused.  When set, SCORING_CONFIG must name the pinned
+                   scoring_config.json (§17.5).
+  VALIDATOR_PAY_FROM_DAY   C46 §6.3-new.  First day that pays validators the
+                   full miner amount.  Default 99999 = OFF.  Refused below
+                   the genesis day, and refused below LOG_V2_FROM_DAY.
+  SCORING_CONFIG     path to scoring_config.json; its SHA-256 must equal the
+                   pinned SCORING_CONFIG_SHA256 (§17.5).
+
+Both flags are printed in the start-up banner on every run, active or not,
+and each prints one LOUD line when it is active.
 
 `--post` additionally submits the file's EXACT bytes to
 `POST /payout/{day}/signature`.  Without it the command only writes the file.
@@ -70,6 +82,7 @@ from .keygen import generate_keypair_file, read_pubkey
 from .ledger import DecisionLedger
 from .recompute import replay_days_required
 from .routes import PayoutRoutes
+from .scoring_config import ScoringConfig
 from .service import PayoutSignerService
 from .sigfile import build_signature_file, serialize_signature_file
 from .signer_key import PayoutSigner
@@ -96,6 +109,53 @@ def _build_service(args, env: dict[str, str]) -> tuple[PayoutSignerService,
                                                        LogSource]:
     """Wire the checker up.  Any missing required setting raises."""
     settings = Settings.from_env(env, warn=_loud)
+
+    # ── C47 §17 / C46 §6.3 activation flags ────────────────────────────────
+    genesis_day = int(getattr(args, "genesis_day", C.GENESIS_DAY))
+
+    def _flag(key: str, default: int) -> int:
+        raw = env.get(key)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        try:
+            return C.parse_flag_day(raw, key)
+        except ValueError as exc:
+            raise PayoutError(str(exc)) from None
+
+    log_v2_from_day = _flag(C.LOG_V2_FROM_DAY_ENV, C.LOG_V2_FROM_DAY_DEFAULT)
+    validator_pay_from_day = _flag(C.VALIDATOR_PAY_FROM_DAY_ENV,
+                                   C.VALIDATOR_PAY_FROM_DAY_DEFAULT)
+    try:
+        C.validate_flag_days(log_v2_from_day, validator_pay_from_day,
+                             genesis_day)
+    except ValueError as exc:
+        raise PayoutError(str(exc)) from None
+
+    # The banner: ALWAYS, active or not, so a run's settings are on record.
+    print(f"activation flags: {C.LOG_V2_FROM_DAY_ENV}={log_v2_from_day}"
+          f"{'' if log_v2_from_day < C.FLAG_OFF_DAY else ' (OFF)'} "
+          f"{C.VALIDATOR_PAY_FROM_DAY_ENV}={validator_pay_from_day}"
+          f"{'' if validator_pay_from_day < C.FLAG_OFF_DAY else ' (OFF)'} "
+          f"genesisDay={genesis_day}")
+
+    scoring_config = None
+    scoring_path = (env.get("SCORING_CONFIG") or "").strip()
+    if scoring_path:
+        scoring_config = ScoringConfig.from_file(scoring_path)
+    if log_v2_from_day < C.FLAG_OFF_DAY:
+        if scoring_config is None:
+            raise PayoutError(
+                f"{C.LOG_V2_FROM_DAY_ENV}={log_v2_from_day} activates log "
+                f"format v2, which recomputes every decision from the pinned "
+                f"scoring_config.json (§17.5); set SCORING_CONFIG")
+        _loud(f"*** LOG FORMAT V2 ACTIVE from day {log_v2_from_day}: "
+              f"signed.ndjson + LIFE-ANCHOR/2 are REQUIRED for every day at "
+              f"or above it (scoring_config sha256 "
+              f"{scoring_config.sha256[:8]}…) ***")
+    if validator_pay_from_day < C.FLAG_OFF_DAY:
+        _loud(f"*** VALIDATOR PAY ACTIVE from day {validator_pay_from_day}: "
+              f"each of the first K=2 validators of a confirmed result is "
+              f"paid the FULL miner amount (§6.3-new) ***")
 
     # §devnet-only: one loud, unmissable start-up line when the hard-coded
     # devnet allow-list has let HOLDBACK_DAYS_OVERRIDE take effect.
@@ -131,7 +191,10 @@ def _build_service(args, env: dict[str, str]) -> tuple[PayoutSignerService,
     signer = PayoutSigner.from_env(env)
 
     service = PayoutSignerService(log_source, anchors, settings, targets,
-                                  ledger, signer)
+                                  ledger, signer,
+                                  log_v2_from_day=log_v2_from_day,
+                                  validator_pay_from_day=validator_pay_from_day,
+                                  scoring_config=scoring_config)
     return service, routes, signer, log_source
 
 

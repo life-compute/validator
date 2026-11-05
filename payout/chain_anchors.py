@@ -13,6 +13,10 @@ An anchor transaction is accepted only when ALL of these hold:
 
         LIFE-ANCHOR/1 day=<n> date=<yyyy-mm-dd> log=<64 hex> program=<id>
 
+    or, for a day at or above LOG_V2_FROM_DAY (BATCH_SPEC §17.4),
+
+        LIFE-ANCHOR/2 day=<n> date=<yyyy-mm-dd> log=<64 hex> signed=<64 hex> program=<id>
+
   * `program=` equals the configured PROGRAM_ID;
   * `date` is the calendar date of `day` (day_to_iso(day) == date);
   * ANCHOR_OPERATOR_PUBKEY is a SIGNER of the transaction.
@@ -20,6 +24,13 @@ An anchor transaction is accepted only when ALL of these hold:
 Anything else (another signer, a malformed memo, a failed transaction, the
 wrong program id) is IGNORED and counted — never a refusal on its own, and
 never silently treated as an anchor.
+
+ANCHOR VERSION PER DAY (§17.4).  `LOG_V2_FROM_DAY` selects which version a
+day REQUIRES: strictly below it a `/1` memo is required exactly as before,
+and at or above it a `/2` memo is required and a `/1` for that day is no
+longer sufficient (it commits to no `signed=` hash).  The accept rule, the
+ignore reasons and the transient/refusal outcomes are IDENTICAL for both
+versions — only the memo grammar and the required version differ.
 
 Outcomes this module reports (the caller maps them to run outcomes):
 
@@ -59,11 +70,23 @@ DEFAULT_ANCHOR_RPC_URL = "https://api.devnet.solana.com"
 DEFAULT_MEMO_PROGRAM = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
 
 ANCHOR_MEMO_VERSION = "LIFE-ANCHOR/1"
+ANCHOR_MEMO_VERSION_V2 = "LIFE-ANCHOR/2"
+
+# The day from which §17 log format v2 (and therefore the /2 anchor) applies.
+# 99999 = OFF, which is the devnet deployment's setting.  Never read from a
+# clock: it is a day NUMBER supplied by configuration.
+LOG_V2_OFF = 99_999
 
 # Exact shape, anchored at both ends: anything else is "malformed".
 _MEMO_RE = re.compile(
     r"^LIFE-ANCHOR/1 day=(?P<day>\d{1,9}) date=(?P<date>\d{4}-\d{2}-\d{2}) "
     r"log=(?P<log>[0-9a-fA-F]{64}) "
+    r"program=(?P<program>[1-9A-HJ-NP-Za-km-z]{32,44})$")
+
+# §17.4: same shape plus `signed=`, in that exact position.
+_MEMO_V2_RE = re.compile(
+    r"^LIFE-ANCHOR/2 day=(?P<day>\d{1,9}) date=(?P<date>\d{4}-\d{2}-\d{2}) "
+    r"log=(?P<log>[0-9a-fA-F]{64}) signed=(?P<signed>[0-9a-fA-F]{64}) "
     r"program=(?P<program>[1-9A-HJ-NP-Za-km-z]{32,44})$")
 
 # ── outcome names (shared with payout.autorun) ──────────────────────────────
@@ -78,6 +101,8 @@ IGNORED_MALFORMED = "malformed_memo"
 IGNORED_WRONG_PROGRAM = "wrong_program_id"
 IGNORED_NOT_OPERATOR = "operator_not_a_signer"
 IGNORED_DAY_DATE = "day_date_disagree"
+# §17.4: the memo parsed, but its version is not the one this day requires.
+IGNORED_WRONG_VERSION = "wrong_anchor_version"
 
 
 class AnchorRpcUnavailable(PayoutError):
@@ -97,11 +122,18 @@ class AnchorRecord:
     program_id: str
     signature: str
     slot: int
+    # §17.4: present only on a /2 anchor.  None on /1, where the signed log
+    # is not committed to at all.
+    signed_hash: str | None = None
+    version: int = 1
 
     def as_dict(self) -> dict[str, Any]:
-        return {"day": self.day, "date": self.date, "logHash": self.log_hash,
-                "programId": self.program_id, "signature": self.signature,
-                "slot": self.slot}
+        out = {"day": self.day, "date": self.date, "logHash": self.log_hash,
+               "programId": self.program_id, "signature": self.signature,
+               "slot": self.slot, "version": self.version}
+        if self.signed_hash is not None:
+            out["signedHash"] = self.signed_hash
+        return out
 
 
 @dataclass
@@ -239,7 +271,36 @@ def parse_anchor_memo(text: str) -> dict[str, Any] | None:
     if not m:
         return None
     return {"day": int(m.group("day")), "date": m.group("date"),
-            "log_hash": m.group("log").lower(), "program_id": m.group("program")}
+            "log_hash": m.group("log").lower(), "signed_hash": None,
+            "program_id": m.group("program"), "version": 1}
+
+
+def parse_anchor_memo_v2(text: str) -> dict[str, Any] | None:
+    """Parse a LIFE-ANCHOR/2 memo.  None for anything not EXACTLY §17.4."""
+    if not isinstance(text, str):
+        return None
+    m = _MEMO_V2_RE.match(text)
+    if not m:
+        return None
+    return {"day": int(m.group("day")), "date": m.group("date"),
+            "log_hash": m.group("log").lower(),
+            "signed_hash": m.group("signed").lower(),
+            "program_id": m.group("program"), "version": 2}
+
+
+def parse_any_anchor_memo(text: str) -> dict[str, Any] | None:
+    """Parse either version.  The version is reported in `version`."""
+    return parse_anchor_memo(text) or parse_anchor_memo_v2(text)
+
+
+def required_anchor_version(day: int, log_v2_from_day: int = LOG_V2_OFF) -> int:
+    """§17.4: which anchor version day `day` must carry.
+
+    Strictly below LOG_V2_FROM_DAY → 1 (unchanged).  At or above it → 2.
+    With the flag at its default 99999 every real day requires /1, which is
+    exactly the pre-C47 behaviour.
+    """
+    return 2 if int(day) >= int(log_v2_from_day) else 1
 
 
 def _memo_texts(tx: dict[str, Any], memo_program: str) -> list[str]:
@@ -303,7 +364,8 @@ class ChainAnchorBuilder:
                  headers: dict[str, str] | None = None,
                  page_size: int = 1000,
                  max_pages: int = 50,
-                 warn=print):
+                 warn=print,
+                 log_v2_from_day: int = LOG_V2_OFF):
         if not (program_id or "").strip():
             raise PayoutError("PROGRAM_ID is required to read on-chain anchors")
         if not (operator_pubkey or "").strip():
@@ -319,6 +381,8 @@ class ChainAnchorBuilder:
         self.page_size = int(page_size)
         self.max_pages = int(max_pages)
         self.warn = warn
+        # §17.4 — which anchor VERSION each day requires.  Default OFF.
+        self.log_v2_from_day = int(log_v2_from_day)
         self.last_scan: ChainScan | None = None
 
     # ── scanning ────────────────────────────────────────────────────────────
@@ -354,7 +418,10 @@ class ChainAnchorBuilder:
         slot = int(tx.get("slot") or 0)
         reason = IGNORED_MALFORMED
         for text in texts:
-            parsed = parse_anchor_memo(text)
+            # Both grammars are parsed; the per-day version requirement is
+            # applied below, so a /2 memo on a flag-off day is reported as
+            # the wrong VERSION rather than as a malformed memo.
+            parsed = parse_any_anchor_memo(text)
             if parsed is None:
                 reason = IGNORED_MALFORMED
                 continue
@@ -364,13 +431,19 @@ class ChainAnchorBuilder:
             if day_to_iso(parsed["day"]) != parsed["date"]:
                 reason = IGNORED_DAY_DATE
                 continue
+            want = required_anchor_version(parsed["day"], self.log_v2_from_day)
+            if parsed["version"] != want:
+                reason = IGNORED_WRONG_VERSION
+                continue
             if self.operator_pubkey not in _signers(tx):
                 reason = IGNORED_NOT_OPERATOR
                 continue
             return AnchorRecord(day=parsed["day"], date=parsed["date"],
                                 log_hash=parsed["log_hash"],
                                 program_id=parsed["program_id"],
-                                signature=signature, slot=slot), None
+                                signature=signature, slot=slot,
+                                signed_hash=parsed["signed_hash"],
+                                version=parsed["version"]), None
         return None, reason
 
     def collect(self, days: Iterable[int] | None = None) -> ChainScan:
@@ -407,7 +480,18 @@ class ChainAnchorBuilder:
                                       log_hash=str(cached["logHash"]),
                                       program_id=str(cached["programId"]),
                                       signature=str(cached["signature"]),
-                                      slot=int(cached["slot"]))
+                                      slot=int(cached["slot"]),
+                                      signed_hash=(str(cached["signedHash"])
+                                                   if cached.get("signedHash")
+                                                   else None),
+                                      version=int(cached.get("version") or 1))
+                # A cached record was parsed under whatever flag was in force
+                # when it was written; re-apply the CURRENT requirement so a
+                # flag change cannot be masked by the cache.
+                if record.version != required_anchor_version(
+                        record.day, self.log_v2_from_day):
+                    scan.ignore(IGNORED_WRONG_VERSION)
+                    continue
                 if wanted is not None and record.day not in wanted:
                     continue
                 self._merge(scan, record)

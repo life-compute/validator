@@ -1,0 +1,459 @@
+{
+ "source": "https://life-coordinator-devnet.lifecompute313.workers.dev",
+ "fetched": "read-only GET /log/{date}, /log/{date}/canonical, /payout/{date}",
+ "days": {
+  "20757": {
+   "iso": "2026-10-31",
+   "manifest_status": 200,
+   "manifest": {
+    "day": "2026-10-31",
+    "closed": true,
+    "closed_at": 1793624533469,
+    "log_hash": "60ce558188ee2abd32a62d139161b5fcabb6a31fd5f032d0acae319fd2970b25",
+    "results": null,
+    "verdicts": null
+   },
+   "canonical_status": 200,
+   "canonical": "{\"event\":\"wallet_first_seen\",\"wallet\":\"493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo\",\"time_ms\":1793483482960}\n{\"event\":\"wallet_first_seen\",\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"time_ms\":1793490075915}\n",
+   "canonical_sha256": "60ce558188ee2abd32a62d139161b5fcabb6a31fd5f032d0acae319fd2970b25",
+   "payout_status": 404,
+   "payout": null
+  },
+  "20758": {
+   "iso": "2026-11-01",
+   "manifest_status": 200,
+   "manifest": {
+    "day": "2026-11-01",
+    "closed": true,
+    "closed_at": 1793577765917,
+    "log_hash": "f31c505a4ac189878155798ab4509fa369ddae63850ba29d7fba186d435deda7",
+    "results": {
+     "ok": true,
+     "sha256": "e3a3337172771d78d0aba67d06fe99b4cb1c122dea7b22bfbc8c35ff7b44a0a8"
+    },
+    "verdicts": {
+     "ok": true,
+     "sha256": "2865dd902ded69ebfebe7fdbb7ef80905a1047ca936acf5cb6a63682528e6581"
+    }
+   },
+   "canonical_status": 200,
+   "canonical": "{\"result_id\":1,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"6ab53672dd54e2ba3c09e12d7dbd7b7d\",\"archived_at\":1793559843128,\"coord_score\":-0.055944186052102704}\n{\"result_id\":2,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"7a1b9abdb5009e22925e7e26c5149221\",\"archived_at\":1793559932000,\"coord_score\":-0.02464828280078269}\n{\"result_id\":3,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"af7144c8bb312b60d7f99683ccced5ff\",\"archived_at\":1793571732661,\"coord_score\":-6.515}\n",
+   "canonical_sha256": "f31c505a4ac189878155798ab4509fa369ddae63850ba29d7fba186d435deda7",
+   "payout_status": 200,
+   "payout": {
+    "day": "2026-11-01",
+    "chunks": [
+     {
+      "batchId": "20758000",
+      "batchHash": "aef82bd3634038e2bedb6f77a0cc7cab5a95748f1fe8dd9af501d53ca8d4e44a",
+      "batchState": "confirmed",
+      "builtAt": 1793628468618,
+      "totalRaw": "700000",
+      "entryCount": 1,
+      "day": 20758,
+      "entries": [
+       {
+        "recipient": "G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L",
+        "amountRaw": "700000",
+        "results": [
+         {
+          "resultId": 3,
+          "target": "ESR1",
+          "moleculeHash": "af7144c8bb312b60d7f99683ccced5ff",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         }
+        ],
+        "validatorFees": [
+         {
+          "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+          "amountRaw": "52500"
+         }
+        ]
+       }
+      ],
+      "logHash": "f31c505a4ac189878155798ab4509fa369ddae63850ba29d7fba186d435deda7",
+      "skippedIds": [],
+      "forfeitedIds": [],
+      "programId": "HhS2coMkjRc5SSPsJn4mTXcFYwWL9hz6cfAzoWKymadv",
+      "lifeMint": "FCwdMRVwxmrnftDgKC2qjkHThxRkYFUUEQieegUdKp3p"
+     }
+    ]
+   }
+  },
+  "20759": {
+   "iso": "2026-11-02",
+   "manifest_status": 200,
+   "manifest": {
+    "day": "2026-11-02",
+    "closed": true,
+    "closed_at": 1793664166383,
+    "log_hash": "126ee75bf8c8e37595392626cdd35ae0f8fe7d6d304baa7c917ea9471f197837",
+    "results": {
+     "ok": true,
+     "sha256": "fed1d9142fe3aaa3afd55386719bd50bbb78c9b308fff016bb90e7f7d9a25e8b"
+    },
+    "verdicts": {
+     "ok": true,
+     "sha256": "56446d5e21f77a5c97fba1de7b2f02c7b1dc8e6f1a9bcd88540224c10377d3eb"
+    }
+   },
+   "canonical_status": 200,
+   "canonical": "{\"result_id\":4,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"092a8b653bf04994f9b807ccdbdc163f\",\"archived_at\":1793586981675,\"coord_score\":-6.592}\n{\"result_id\":5,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"051baf6ffeb9f1ce03ea40b43d62c833\",\"archived_at\":1793602135622,\"coord_score\":-8.441}\n{\"result_id\":6,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"e1f558611618869ee79148c122ad78a3\",\"archived_at\":1793617375951,\"coord_score\":-7.018}\n{\"result_id\":7,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"3743fd2aaa6f42b912114743ee405abe\",\"archived_at\":1793632653759,\"coord_score\":-7.029}\n{\"result_id\":8,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"69419f12f681633ee7f0a7584126bab4\",\"archived_at\":1793647817657,\"coord_score\":-8.348}\n{\"result_id\":9,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"a37fd4f498e60d2d1227c4427fa05460\",\"archived_at\":1793663001931,\"coord_score\":-6.734}\n",
+   "canonical_sha256": "126ee75bf8c8e37595392626cdd35ae0f8fe7d6d304baa7c917ea9471f197837",
+   "payout_status": 200,
+   "payout": {
+    "day": "2026-11-02",
+    "chunks": [
+     {
+      "batchId": "20759000",
+      "batchHash": "f840f5f85df0bb9b6e7d908cb3aec5111f893a4f15f07ff33e5c1de889f6dba3",
+      "batchState": "confirmed",
+      "builtAt": 1793799634492,
+      "totalRaw": "4200000",
+      "entryCount": 1,
+      "day": 20759,
+      "entries": [
+       {
+        "recipient": "G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L",
+        "amountRaw": "4200000",
+        "results": [
+         {
+          "resultId": 4,
+          "target": "ESR1",
+          "moleculeHash": "092a8b653bf04994f9b807ccdbdc163f",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 5,
+          "target": "ESR1",
+          "moleculeHash": "051baf6ffeb9f1ce03ea40b43d62c833",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 6,
+          "target": "ESR1",
+          "moleculeHash": "e1f558611618869ee79148c122ad78a3",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 7,
+          "target": "ESR1",
+          "moleculeHash": "3743fd2aaa6f42b912114743ee405abe",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 8,
+          "target": "ESR1",
+          "moleculeHash": "69419f12f681633ee7f0a7584126bab4",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 9,
+          "target": "ESR1",
+          "moleculeHash": "a37fd4f498e60d2d1227c4427fa05460",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         }
+        ],
+        "validatorFees": [
+         {
+          "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+          "amountRaw": "315000"
+         }
+        ]
+       }
+      ],
+      "logHash": "126ee75bf8c8e37595392626cdd35ae0f8fe7d6d304baa7c917ea9471f197837",
+      "skippedIds": [],
+      "forfeitedIds": [],
+      "programId": "HhS2coMkjRc5SSPsJn4mTXcFYwWL9hz6cfAzoWKymadv",
+      "lifeMint": "FCwdMRVwxmrnftDgKC2qjkHThxRkYFUUEQieegUdKp3p"
+     }
+    ]
+   }
+  },
+  "20760": {
+   "iso": "2026-11-03",
+   "manifest_status": 200,
+   "manifest": {
+    "day": "2026-11-03",
+    "closed": true,
+    "closed_at": 1793750565277,
+    "log_hash": "43c4ca027e6b232ff9b20e0e7517c6d5aed2e90c6c7b2a828d18b8d022c57e9c",
+    "results": {
+     "ok": true,
+     "sha256": "d2c3b57d455b56f9b43d28ede1b8bc4eb285782de5ca1349ebd1a098531aa483"
+    },
+    "verdicts": {
+     "ok": true,
+     "sha256": "93dd3a6a9ab014fd96f885898845560605c57a445f3f379e77a98a902f99cbbe"
+    }
+   },
+   "canonical_status": 200,
+   "canonical": "{\"result_id\":10,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"6857cb22f1c1dadccc9fde495bca4d4b\",\"archived_at\":1793678276240,\"coord_score\":-6.214}\n{\"result_id\":11,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"c649e0744f3944d9614fd1ad9873bc0d\",\"archived_at\":1793693414681,\"coord_score\":-6.6}\n{\"result_id\":12,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"619ef431b4efcad68d857ae10ff0e7b1\",\"archived_at\":1793708593867,\"coord_score\":-6.756}\n{\"result_id\":13,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"c9809dd7d849a4f005953f1e392855b0\",\"archived_at\":1793723824793,\"coord_score\":-8.762}\n{\"result_id\":14,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"9252727f7de83b0f6ea1d6c4043e7b85\",\"archived_at\":1793739044050,\"coord_score\":-6.626}\n",
+   "canonical_sha256": "43c4ca027e6b232ff9b20e0e7517c6d5aed2e90c6c7b2a828d18b8d022c57e9c",
+   "payout_status": 200,
+   "payout": {
+    "day": "2026-11-03",
+    "chunks": [
+     {
+      "batchId": "20760000",
+      "batchHash": "40ac45a1f5bcbfda29bc54fd460a4e64e9f78e640c8e19cb08ed141212dfe9c1",
+      "batchState": "confirmed",
+      "builtAt": 1793799635522,
+      "totalRaw": "3500000",
+      "entryCount": 1,
+      "day": 20760,
+      "entries": [
+       {
+        "recipient": "G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L",
+        "amountRaw": "3500000",
+        "results": [
+         {
+          "resultId": 10,
+          "target": "ESR1",
+          "moleculeHash": "6857cb22f1c1dadccc9fde495bca4d4b",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 11,
+          "target": "ESR1",
+          "moleculeHash": "c649e0744f3944d9614fd1ad9873bc0d",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 12,
+          "target": "ESR1",
+          "moleculeHash": "619ef431b4efcad68d857ae10ff0e7b1",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 13,
+          "target": "ESR1",
+          "moleculeHash": "c9809dd7d849a4f005953f1e392855b0",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 14,
+          "target": "ESR1",
+          "moleculeHash": "9252727f7de83b0f6ea1d6c4043e7b85",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         }
+        ],
+        "validatorFees": [
+         {
+          "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+          "amountRaw": "262500"
+         }
+        ]
+       }
+      ],
+      "logHash": "43c4ca027e6b232ff9b20e0e7517c6d5aed2e90c6c7b2a828d18b8d022c57e9c",
+      "skippedIds": [],
+      "forfeitedIds": [],
+      "programId": "HhS2coMkjRc5SSPsJn4mTXcFYwWL9hz6cfAzoWKymadv",
+      "lifeMint": "FCwdMRVwxmrnftDgKC2qjkHThxRkYFUUEQieegUdKp3p"
+     }
+    ]
+   }
+  },
+  "20761": {
+   "iso": "2026-11-04",
+   "manifest_status": 200,
+   "manifest": {
+    "day": "2026-11-04",
+    "closed": true,
+    "closed_at": 1793836965109,
+    "log_hash": "b1986bbce26b14dc64523e8c07d00fd7d63a9b77d368d046779c9794fc6d5143",
+    "results": {
+     "ok": true,
+     "sha256": "0997816f05cd53d272aed7d67a25504170c0e429635107cfe6660ecd363b7753"
+    },
+    "verdicts": {
+     "ok": true,
+     "sha256": "b83721fbe460411375a8a5547f02997e7d16b6550fee35e71a797b90d18e519c"
+    }
+   },
+   "canonical_status": 200,
+   "canonical": "{\"result_id\":15,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"3c763bb5497fcec3448419ffa47b61a3\",\"archived_at\":1793754288300,\"coord_score\":-7.25}\n{\"result_id\":16,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"3671adf14877d7f4a038e91793aeadb4\",\"archived_at\":1793769505283,\"coord_score\":-7.629}\n{\"result_id\":17,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"5f6c81b3af554a32013a6ffab097d622\",\"archived_at\":1793784721092,\"coord_score\":-7.898}\n{\"result_id\":18,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"be8a7020328454c01c470d8ffa58ab6d\",\"archived_at\":1793799955553,\"coord_score\":-6.812}\n{\"result_id\":19,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"41ea798e0d9a51216165e9bf58498cf5\",\"archived_at\":1793815473508,\"coord_score\":-7.439}\n{\"result_id\":20,\"wallet\":\"G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L\",\"target\":\"ESR1\",\"molecule_hash\":\"dc5d4ca72f07d6e34650469dfc3ebb84\",\"archived_at\":1793830398370,\"coord_score\":-6.357}\n",
+   "canonical_sha256": "b1986bbce26b14dc64523e8c07d00fd7d63a9b77d368d046779c9794fc6d5143",
+   "payout_status": 200,
+   "payout": {
+    "day": "2026-11-04",
+    "chunks": [
+     {
+      "batchId": "20761000",
+      "batchHash": "10292a7a8dfe3349acce0f7305eb821a61c1d07276fedbf4d3b05ddf56523413",
+      "batchState": "confirmed",
+      "builtAt": 1793836965163,
+      "totalRaw": "4200000",
+      "entryCount": 1,
+      "day": 20761,
+      "entries": [
+       {
+        "recipient": "G8wkwTUC4nyQcaxDtRPPBeevS5pXque5hdExrNrhNa5L",
+        "amountRaw": "4200000",
+        "results": [
+         {
+          "resultId": 15,
+          "target": "ESR1",
+          "moleculeHash": "3c763bb5497fcec3448419ffa47b61a3",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 16,
+          "target": "ESR1",
+          "moleculeHash": "3671adf14877d7f4a038e91793aeadb4",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 17,
+          "target": "ESR1",
+          "moleculeHash": "5f6c81b3af554a32013a6ffab097d622",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 18,
+          "target": "ESR1",
+          "moleculeHash": "be8a7020328454c01c470d8ffa58ab6d",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 19,
+          "target": "ESR1",
+          "moleculeHash": "41ea798e0d9a51216165e9bf58498cf5",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         },
+         {
+          "resultId": 20,
+          "target": "ESR1",
+          "moleculeHash": "dc5d4ca72f07d6e34650469dfc3ebb84",
+          "amountRaw": "700000",
+          "validatorFees": [
+           {
+            "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+            "amountRaw": "52500"
+           }
+          ]
+         }
+        ],
+        "validatorFees": [
+         {
+          "validatorWallet": "493jnXXvyQyjaSxeWeRGBcoXnokoUvMmfiJxr1V5i1Uo",
+          "amountRaw": "315000"
+         }
+        ]
+       }
+      ],
+      "logHash": "b1986bbce26b14dc64523e8c07d00fd7d63a9b77d368d046779c9794fc6d5143",
+      "skippedIds": [],
+      "forfeitedIds": [],
+      "programId": "HhS2coMkjRc5SSPsJn4mTXcFYwWL9hz6cfAzoWKymadv",
+      "lifeMint": "FCwdMRVwxmrnftDgKC2qjkHThxRkYFUUEQieegUdKp3p"
+     }
+    ]
+   }
+  }
+ }
+}

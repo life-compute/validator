@@ -108,6 +108,21 @@ DAY_NOT_CLOSED = "day_not_closed"
 # payable through payout_batch at all, so a batch carrying either is refused.
 OUT_OF_SCOPE_REWARD_PAID = "out_of_scope_reward_paid"
 
+# ── §6.3-new (C46 validator pay, behind VALIDATOR_PAY_FROM_DAY) ────────────
+# Added to SPEC_RULE_ORDER *after* rule 17 (total_mismatch), in the order
+# §6.3-new lists them.  They can never fire for a day below the flag day,
+# where the legacy 7.5% fee rule applies unchanged.
+VALIDATOR_NOT_VERIFIED = "validator_not_verified"
+VALIDATOR_SELF_PAY = "validator_self_pay"
+VALIDATOR_OVER_LIMIT = "validator_over_limit"
+VALIDATOR_PAY_MISMATCH = "validator_pay_mismatch"
+
+# ── §17 (C47 log format v2, behind LOG_V2_FROM_DAY) ────────────────────────
+# The day's signed request log did not satisfy a v2 rule.  The specific
+# lower_snake_case code lives in payout.log_v2 and is carried in the
+# finding's message; this is the entry in the batch-level rule order.
+LOG_V2_REFUSED = "log_v2_refused"
+
 # ── Warning codes (recorded, never sufficient to sign or to refuse) ─────────
 WARN_FEE_RECIPIENTS_UNVERIFIABLE = "warn_fee_recipients_unverifiable"
 
